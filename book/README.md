@@ -27,6 +27,7 @@ A comprehensive guide to writing programs in Rorical (Rolang).
 19. [The Standard Library](ch19-stdlib.md)
 20. [The Rolang Toolchain](ch20-toolchain.md)
 21. [Testing](ch21-testing.md)
+22. [Benchmarks](ch22-benchmarks.md)
 
 ---
 

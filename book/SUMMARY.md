@@ -40,3 +40,4 @@
 * [The Standard Library](ch19-stdlib.md)
 * [The Rolang Toolchain](ch20-toolchain.md)
 * [Testing](ch21-testing.md)
+* [Benchmarks](ch22-benchmarks.md)
