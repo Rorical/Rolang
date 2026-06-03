@@ -1,0 +1,11 @@
+[book]
+title = "The Rorical Programming Language"
+authors = ["Rorical"]
+description = "A comprehensive guide to writing programs in Rolang"
+language = "en"
+src = "."
+
+[output.html]
+site-url = "/Rolang/"
+git-repository-url = "https://github.com/Rorical/Rolang"
+git-repository-icon = "fa-github"

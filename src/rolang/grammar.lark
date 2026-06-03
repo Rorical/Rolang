@@ -1,0 +1,367 @@
+// RoLang Grammar for Lark Parser
+// Swift-like, no class. v2 memory model: every struct/enum lives on the
+// heap with automatic reference counting (Ref<T>/Weak<T>/Unowned<T> from
+// v0.1 have been removed from the surface syntax).
+
+// ========================= Top Level =========================
+start: top_level_item*
+
+top_level_item: import_decl
+              | struct_decl
+              | enum_decl
+              | protocol_decl
+              | extension_decl
+              | func_decl
+              | extern_func_decl
+              | stmt
+
+// ========================= Visibility =========================
+visibility: PUB | PRIVATE | INTERNAL
+PUB.10: "pub"
+PRIVATE.10: "private"
+INTERNAL.10: "internal"
+
+// ========================= Imports =========================
+// `pub import "x.rl"` re-exports x.rl's pub symbols from the importing
+// module: anyone who imports this module also sees those symbols.
+import_decl: [visibility] "import" STRING ["as" IDENT] _TERM?
+           | [visibility] "import" module_path ["as" IDENT] _TERM?
+module_path: IDENT ("." IDENT)*
+
+// ========================= Type Declarations =========================
+// Magic methods recognised by the compiler (Python-style dunders):
+//   * `def __release__() -> Void`                          — runs as deinit
+//   * `static def __gc_trace__(payload, cb, ctx) -> Void`  — GC trace hook
+// They are normal methods syntactically; the compiler picks them up by
+// name during codegen and installs them in the type descriptor.
+struct_decl: [visibility] "struct" IDENT [generic_params] [type_constraints] "{" struct_member* "}"
+struct_member: property_decl
+             | func_decl
+
+enum_decl: [visibility] "enum" IDENT [generic_params] [type_constraints] "{" enum_member* "}"
+enum_member: enum_case_decl
+           | func_decl
+
+enum_case_decl: "case" enum_case ("," enum_case)* _TERM?
+enum_case: IDENT ["(" [enum_case_payload] ")"]
+enum_case_payload: enum_payload_item ("," enum_payload_item)*
+enum_payload_item: IDENT ":" type -> labeled_payload
+                 | type -> unlabeled_payload
+
+// ========================= Protocol =========================
+protocol_decl: [visibility] "protocol" IDENT [generic_params] [type_constraints] "{" protocol_member* "}"
+protocol_member: protocol_func_req
+               | protocol_prop_req
+               | associated_type_decl
+
+protocol_func_req: "def" IDENT [generic_params] param_clause [async_mark] [throws_mark] [return_clause] _TERM
+protocol_prop_req: VAR_KEYWORD IDENT ":" type accessor_req _TERM
+accessor_req: "{" accessor_kind+ "}"
+accessor_kind: ACCESSOR_KIND
+ACCESSOR_KIND: "get" | "set"
+associated_type_decl: "associatedtype" IDENT [type_constraints] _TERM
+
+// ========================= Extension =========================
+extension_decl: [visibility] "extension" type_name [conformance_clause] [type_constraints] "{" extension_member* "}"
+conformance_clause: ":" type_name ("," type_name)*
+extension_member: func_decl
+                | property_decl
+
+// ========================= Functions =========================
+// Note: In Rolang v2 every struct/enum lives on the heap behind an ARC ref,
+// so methods always mutate through that reference. There is no `mut` /
+// `mutating` modifier — all methods may freely mutate `self`. Use stdlib
+// locks (e.g. std/sync.rl) to coordinate concurrent mutation across tasks.
+// `unsafe def` marks a function as containing unsafe operations whose
+// safety obligations rise to the caller. Calling such a function from a
+// safe context is a compile error — wrap the call in `unsafe { ... }`.
+func_decl: [visibility] [unsafe_mark] [static_mark] "def" IDENT [generic_params] param_clause [async_mark] [throws_mark] [return_clause] [type_constraints] block
+
+extern_func_decl: [visibility] "extern" STRING "def" IDENT [generic_params] param_clause [async_mark] [throws_mark] [return_clause] [type_constraints] _TERM
+
+static_mark: "static"
+unsafe_mark: "unsafe"
+
+param_clause: "(" [param_list] ")"
+param_list: param ("," param)*
+param: IDENT IDENT ":" type ["=" expr] -> labeled_param
+     | IDENT ":" type ["=" expr] -> unlabeled_param
+
+// ========================= Properties =========================
+property_decl: [visibility] VAR_KEYWORD IDENT ":" type ["=" expr] _TERM?
+
+// ========================= Generics & Constraints =========================
+generic_params: "<" generic_param ("," generic_param)* ">"
+generic_param: IDENT [":" type_bound_list]
+type_bound_list: type_name ("&" type_name)*
+
+type_constraints: "where" constraint ("," constraint)*
+constraint: type_name ":" type_bound_list -> conformance_constraint
+          | type_name "==" type -> equality_constraint
+
+type_name: IDENT ("." IDENT)* [generic_args]
+generic_args: "<" type ("," type)* ">"
+
+// ========================= Types =========================
+type: function_type | primary_type
+
+function_type: "(" [func_type_params] ")" [async_mark] [throws_mark] "->" type
+func_type_params: type ("," type)*
+
+primary_type: non_optional_type QUESTION -> optional_type
+            | non_optional_type
+
+non_optional_type: builtin_type
+                 | any_type
+                 | pointer_type
+                 | array_type
+                 | dict_type
+                 | tuple_type
+                 | type_name
+                 | "(" type ")" -> paren_type
+
+builtin_type: BUILTIN_TYPE
+BUILTIN_TYPE: "i8" | "i16" | "i32" | "i64"
+            | "u8" | "u16" | "u32" | "u64"
+            | "f32" | "f64"
+            | "Bool"
+            | "Void"
+
+tuple_type: "(" tuple_type_elem "," tuple_type_elems ")"
+tuple_type_elems: tuple_type_elem ("," tuple_type_elem)*
+tuple_type_elem: IDENT ":" type -> labeled_tuple_type
+               | type -> unlabeled_tuple_type
+
+array_type: "[" type "]"
+dict_type: "[" type ":" type "]"
+
+any_type: "any" type_name
+pointer_type: POINTER_TYPE
+POINTER_TYPE: "RawPtr"
+
+async_mark: "async"
+throws_mark: "throws"
+return_clause: "->" type
+
+// ========================= Statements =========================
+block: "{" stmt* [trailing_expr] "}"
+trailing_expr: expr
+
+stmt: return_stmt
+    | break_stmt
+    | continue_stmt
+    | simple_stmt _TERM
+    | if_stmt
+    | guard_stmt
+    | while_stmt
+    | for_stmt
+    | switch_stmt
+    | defer_stmt
+    | unsafe_stmt
+    | block
+
+simple_stmt: var_decl | assign_stmt | expr_stmt
+
+var_decl: VAR_KEYWORD pattern [":" type] ["=" expr]
+VAR_KEYWORD: "let" | "var"
+assign_stmt: lvalue assign_op expr
+assign_op: ASSIGN_OP
+ASSIGN_OP: "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+
+expr_stmt: expr
+
+return_stmt: RETURN_KEYWORD expr _TERM
+           | RETURN_KEYWORD _TERM
+RETURN_KEYWORD.10: "return"
+BREAK_KEYWORD.10: "break"
+CONTINUE_KEYWORD.10: "continue"
+break_stmt: BREAK_KEYWORD _TERM?
+continue_stmt: CONTINUE_KEYWORD _TERM?
+defer_stmt: "defer" block
+unsafe_stmt: "unsafe" block
+
+if_stmt: "if" if_cond block ["else" (if_stmt | block)]
+if_cond: "let" pattern "=" expr -> if_let_cond
+       | expr -> if_expr_cond
+
+guard_stmt: "guard" expr "else" block
+
+while_stmt: "while" expr block
+
+for_stmt: "for" pattern "in" expr block
+
+switch_stmt: "switch" expr "{" switch_case* "}"
+switch_case: "case" case_item_list ":" stmt* -> case_branch
+           | "default" ":" stmt* -> default_branch
+case_item_list: case_item ("," case_item)*
+case_item: pattern ["where" expr]
+
+// ========================= Patterns =========================
+pattern: primary_pattern ("|" primary_pattern)* -> or_pattern
+
+primary_pattern: "_" -> wildcard_pattern
+               | literal -> literal_pattern
+               | "let" IDENT -> let_pattern
+               | "var" IDENT -> var_pattern
+               | IDENT -> ident_pattern
+               | "(" pattern_list ")" -> tuple_pattern
+               | "." IDENT ["(" [pattern_list] ")"] -> enum_case_pattern
+               | "(" pattern ")" -> paren_pattern
+
+pattern_list: pattern ("," pattern)*
+
+// ========================= Expressions =========================
+expr: ternary_expr
+ternary_expr: coalesce_expr [QUESTION expr ":" expr]
+coalesce_expr: logical_or_expr (COALESCE logical_or_expr)*
+
+logical_or_expr: logical_and_expr ("||" logical_and_expr)*
+logical_and_expr: compare_expr ("&&" compare_expr)*
+
+compare_expr: bit_or_expr (compare_op bit_or_expr | cast_suffix | type_check_suffix)*
+compare_op: COMPARE_OP
+COMPARE_OP: "==" | "!=" | "<=" | ">=" | "<" | ">"
+// `as?` (optional runtime downcast) and `as!` (force-unwrap downcast) are
+// lexed as dedicated tokens so they take precedence over `as` followed by
+// the QUESTION / BANG postfix operators. Whitespace between `as` and the
+// modifier is deliberately disallowed for the same reason Swift forbids
+// it: it keeps `x as ? T` from being ambiguous with the ternary operator.
+cast_suffix: AS_OPTIONAL type -> cast_optional_suffix
+           | AS_FORCED type -> cast_forced_suffix
+           | "as" type -> cast_safe_suffix
+AS_OPTIONAL.10: "as?"
+AS_FORCED.10: "as!"
+type_check_suffix: "is" type
+
+bit_or_expr: bit_xor_expr ("|" bit_xor_expr)*
+bit_xor_expr: bit_and_expr ("^" bit_and_expr)*
+bit_and_expr: shift_expr ("&" shift_expr)*
+
+shift_expr: additive_expr (shift_op additive_expr)*
+shift_op: SHIFT_OP
+SHIFT_OP: "<<" | ">>"
+
+additive_expr: multiplicative_expr (add_op multiplicative_expr)*
+add_op: ADD_OP
+ADD_OP: "+" | "-"
+
+multiplicative_expr: prefix_expr (mul_op prefix_expr)*
+mul_op: MUL_OP
+MUL_OP: "*" | "/" | "%"
+
+prefix_expr: "!" prefix_expr -> prefix_not_expr
+           | "-" prefix_expr -> prefix_neg_expr
+           | "+" prefix_expr -> prefix_pos_expr
+           | "~" prefix_expr -> prefix_bitnot_expr
+           | "await" prefix_expr -> prefix_await_expr
+           | "try" prefix_expr -> prefix_try_expr
+           | postfix_expr
+
+postfix_expr: primary_expr postfix_op*
+postfix_op: call_suffix
+          | member_suffix
+          | optional_chain_suffix
+          | subscript_suffix
+          | try_suffix
+
+try_suffix.1: QUESTION
+
+call_suffix: "(" [argument_list] ")"
+argument_list: argument ("," argument)*
+argument: IDENT ":" expr -> labeled_arg
+        | expr -> unlabeled_arg
+
+member_suffix: "." IDENT
+             | "." INT -> tuple_member_suffix
+optional_chain_suffix.3: OPTIONAL_CHAIN IDENT [call_suffix | subscript_suffix]
+subscript_suffix: "[" expr_list "]"
+expr_list: expr ("," expr)*
+
+lvalue: IDENT lvalue_suffix*
+lvalue_suffix: "." IDENT -> lvalue_member
+             | "." INT -> lvalue_tuple_member
+             | "[" expr_list "]" -> lvalue_subscript
+
+primary_expr: type_member_expr
+            | literal
+            | struct_literal
+            | IDENT -> ident_expr
+            | SIZE_OF "(" type ")" -> size_of_expr
+            | TYPE_ID "(" type ")" -> type_id_expr
+            | ALIGN_OF "(" type ")" -> align_of_expr
+            | DROP_OF "(" type ")" -> drop_of_expr
+            | CLONE_OF "(" type ")" -> clone_of_expr
+            | "(" expr ")" -> paren_expr
+            | "(" tuple_expr_elems ")" -> tuple_expr
+            | "[" [expr_list] "]" -> array_literal
+            | "[" ":" "]" -> empty_dict_literal
+            | "[" dict_entry ("," dict_entry)* "]" -> dict_literal
+            | "{" [lambda_params "in"] stmt* "}" -> lambda_expr
+
+type_member_expr: generic_type_name "." IDENT
+
+generic_type_name: IDENT ("." IDENT)* generic_args
+
+struct_literal: type_name "{" [struct_literal_fields] "}"
+struct_literal_fields: struct_literal_field ("," struct_literal_field)* [","]
+struct_literal_field: IDENT ":" expr -> labeled_arg
+
+tuple_expr_elems: tuple_expr_elem ("," tuple_expr_elem)+
+tuple_expr_elem: IDENT ":" expr -> labeled_tuple_elem
+               | expr -> unlabeled_tuple_elem
+
+dict_entry: expr ":" expr
+
+lambda_params: lambda_param ("," lambda_param)*
+lambda_param: pattern [":" type]
+
+// ========================= Literals =========================
+literal: INT -> int_literal
+       | FLOAT -> float_literal
+       | BOOL -> bool_literal
+       | STRING -> string_literal
+       | CHAR -> char_literal
+       | "nil" -> nil_literal
+
+BOOL: "true" | "false"
+
+SIZE_OF.10: "size_of"
+TYPE_ID.10: "type_id"
+ALIGN_OF.10: "align_of"
+DROP_OF.10: "drop_of"
+CLONE_OF.10: "clone_of"
+
+// ========================= Lexer Rules =========================
+IDENT: /[a-zA-Z_][a-zA-Z0-9_]*/
+
+INT: HEX_INT | BIN_INT | OCT_INT | DEC_INT
+DEC_INT: /[0-9][0-9_]*/
+HEX_INT: /0[xX][0-9a-fA-F][0-9a-fA-F_]*/
+BIN_INT: /0[bB][01][01_]*/
+OCT_INT: /0[oO][0-7][0-7_]*/
+
+// Priority bumped above INT so `3.14` tokenizes as FLOAT, not as
+// `INT "." INT` once tuple-member-access syntax accepts ".INT".
+FLOAT.2: /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?/
+       | /[0-9][0-9_]*[eE][+-]?[0-9]+/
+
+OPTIONAL_CHAIN.3: "?."
+COALESCE.3: "??"
+QUESTION.1: /\?(?![?.])/
+
+STRING: /\"([^\"\\]|\\.)*\"/
+CHAR: /'([^'\\]|\\.)'/
+
+// Statement terminator - semicolon required (newlines are ignored)
+_TERM: ";"
+
+// Comments
+LINE_COMMENT: /\/\/[^\n]*/
+BLOCK_COMMENT: /\/\*(\*(?!\/)|[^*])*\*\//
+
+// Whitespace (including newlines)
+WS: /[ \t\r\n]+/
+
+%ignore WS
+%ignore LINE_COMMENT
+%ignore BLOCK_COMMENT

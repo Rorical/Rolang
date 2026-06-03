@@ -1,0 +1,66 @@
+[project]
+name = "rolang"
+version = "0.1.0"
+description = "The Rorical programming language (Rolang) — statically typed, ARC memory management, LLVM codegen, built-in async/await"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Rorical", email = "46294886+Rorical@users.noreply.github.com" },
+]
+keywords = ["rolang", "rorical", "compiler", "programming-language", "llvm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+    "lark>=1.2.2",
+    "llvmlite>=0.41.0",
+]
+
+[project.urls]
+Homepage   = "https://github.com/Rorical/Rolang"
+Repository = "https://github.com/Rorical/Rolang"
+"Bug Tracker" = "https://github.com/Rorical/Rolang/issues"
+Documentation = "https://rorical.github.io/Rolang/"
+
+[project.optional-dependencies]
+langserver = [
+    "pygls>=1.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+rolangc = "rolang.cli:main"
+rolang = "rolang.toolchain_cli:main"
+rolang-langserver = "rolang.langserver:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rolang = ["grammar.lark"]
+"rolang.runtime" = ["rolang_rt.c"]
+"rolang.std" = ["*.rl"]
+"rolang.langserver" = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-xdist>=3.8.0",
+]

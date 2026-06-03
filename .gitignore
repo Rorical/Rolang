@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg
+
+# Rolang compiler outputs
+*.ll
+*.mir
+*.o
+*.out
+
+# Example executables are emitted beside their .rl source by default.
+examples/*
+!examples/*.rl
+!examples/*.md
+
+# Local tool state
+.claude/settings.local.json

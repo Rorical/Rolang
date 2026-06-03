@@ -1,0 +1,139 @@
+name: Publish VS Code Extension
+
+# Triggered by a version tag: git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (package only, do not publish)"
+        type: boolean
+        default: false
+
+jobs:
+  # ── 1. Sanity check: tag version must match package.json version ─────────────
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check package.json version matches tag
+        run: |
+          PKG_VER=$(node -p "require('./editors/vscode/package.json').version")
+          TAG_VER="${{ steps.ver.outputs.version }}"
+          if [ "$PKG_VER" != "$TAG_VER" ]; then
+            echo "::error::editors/vscode/package.json version ($PKG_VER) does not match tag ($TAG_VER)"
+            exit 1
+          fi
+          echo "Version $PKG_VER OK"
+
+  # ── 2. Build .vsix package ────────────────────────────────────────────────────
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Compile TypeScript
+        run: npm run compile
+        working-directory: editors/vscode
+
+      - name: Package extension (.vsix)
+        run: npx vsce package --no-dependencies
+        working-directory: editors/vscode
+
+      - name: Show built artifact
+        run: ls -lh editors/vscode/*.vsix
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+
+  # ── 3. Publish to VS Code Marketplace ────────────────────────────────────────
+  #
+  # One-time setup required:
+  #   1. Create a publisher at https://marketplace.visualstudio.com/manage
+  #      (use publisher ID "rorical" matching package.json)
+  #   2. Generate a Personal Access Token at https://dev.azure.com
+  #      Scopes required: Marketplace → Publish
+  #   3. Add the token as a GitHub secret named VSCE_PAT
+  #      (Settings → Secrets and variables → Actions → New secret)
+  #
+  publish-marketplace:
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download .vsix artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: editors/vscode/
+
+      - name: Publish to VS Code Marketplace
+        run: npx @vscode/vsce publish --packagePath *.vsix
+        working-directory: editors/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  # ── 4. Publish to Open VSX Registry ──────────────────────────────────────────
+  #
+  # Open VSX is the alternative marketplace used by Cursor, Gitpod, Theia,
+  # VSCodium, and other VS Code-compatible editors.
+  #
+  # One-time setup required:
+  #   1. Create an account at https://open-vsx.org
+  #   2. Create a namespace matching your publisher ID ("rorical")
+  #   3. Generate an access token in your account settings
+  #   4. Add the token as a GitHub secret named OVSX_PAT
+  #
+  publish-openvsx:
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download .vsix artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: vsix/
+
+      - name: Publish to Open VSX
+        run: |
+          npm install -g ovsx
+          ovsx publish vsix/*.vsix
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}

@@ -1,0 +1,80 @@
+{
+  "name": "rolang",
+  "displayName": "Rolang",
+  "description": "Rolang language support: syntax highlighting and language server integration",
+  "version": "0.1.0",
+  "publisher": "rorical",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rorical/Rolang"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "rolang",
+    "rorical"
+  ],
+  "activationEvents": [
+    "onLanguage:rolang"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "rolang",
+        "aliases": ["Rolang", "rolang", "rl"],
+        "extensions": [".rl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rolang",
+        "scopeName": "source.rolang",
+        "path": "./syntaxes/rolang.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Rolang",
+      "properties": {
+        "rolang.serverPath": {
+          "type": "string",
+          "default": "rolang-langserver",
+          "description": "Path to the rolang-langserver executable. Defaults to searching PATH."
+        },
+        "rolang.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional command-line arguments passed to rolang-langserver."
+        },
+        "rolang.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP communication between VS Code and rolang-langserver."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.24.0"
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  }
+}
