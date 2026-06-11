@@ -31,13 +31,36 @@ class OpsAggregateMixin:
         desc = self.type_table.get_descriptor(op.struct_type)
         payload_size = desc.payload_size if desc else self.type_cache._get_type_size(op.struct_type)
 
-        # Allocate heap object: rt_obj_alloc(payload_size, align, type_id)
+        # Evaluate every field operand BEFORE allocating. Operand emission can
+        # itself allocate (string/array constants), and an allocation between
+        # the noinit alloc below and the field stores is a GC-observable point
+        # where this object's payload would still be garbage.
+        field_vals = []
+        for field_name, field_op in op.fields:
+            field_val = self.emit_operand(field_op)
+            field_index = self.type_cache.get_struct_field_index_any(op.struct_type, field_name)
+            if hasattr(inner_type, 'elements') and field_index < len(inner_type.elements):
+                field_type = inner_type.elements[field_index]
+                field_val = self._coerce_int(field_val, field_type,
+                                             signed=self._operand_is_signed(field_op))
+            field_vals.append((field_name, field_index, field_val))
+
+        # Allocate heap object WITHOUT the payload zero-fill when the literal
+        # provably stores every LLVM field immediately below with no
+        # allocation/release in between (the language requires every field in
+        # a struct literal, so this is the common case). Fall back to the
+        # zero-filling alloc if the store list does not cover the layout.
+        covers_all_fields = (
+            hasattr(inner_type, 'elements')
+            and len({fi for _, fi, _ in field_vals}) == len(inner_type.elements)
+        )
         type_id = self.type_cache.get_or_assign_descriptor_id(op.struct_type)
         ptr = self.runtime.emit_obj_alloc(
             self.builder,
             ir.Constant(self.type_cache.i64, payload_size),
             ir.Constant(self.type_cache.i64, 8),
             ir.Constant(self.type_cache.i64, type_id),
+            zero_init=not covers_all_fields,
         )
 
         # v2: payload starts after the 32-byte header
@@ -50,13 +73,7 @@ class OpsAggregateMixin:
         struct_ptr = self.builder.bitcast(payload_byte_ptr, ir.PointerType(inner_type), name="struct.typed")
 
         # Store each field
-        for field_name, field_op in op.fields:
-            field_val = self.emit_operand(field_op)
-            field_index = self.type_cache.get_struct_field_index_any(op.struct_type, field_name)
-            if hasattr(inner_type, 'elements') and field_index < len(inner_type.elements):
-                field_type = inner_type.elements[field_index]
-                field_val = self._coerce_int(field_val, field_type,
-                                             signed=self._operand_is_signed(field_op))
+        for field_name, field_index, field_val in field_vals:
             field_ptr = self.builder.gep(
                 struct_ptr,
                 [ir.Constant(self.type_cache.i32, 0), ir.Constant(self.type_cache.i32, field_index)],
@@ -84,6 +101,37 @@ class OpsAggregateMixin:
         if inner_type is None:
             inner_type = llvm_type
 
+        # Evaluate payload operands BEFORE allocating (operand emission can
+        # allocate — see _emit_make_struct) and decide whether every declared
+        # payload slot of the active case gets stored.
+        layout = self.type_cache.get_enum_case_payload_layout(
+            enum_data.symbol_id, op.case_name
+        ) if info and info.kind == TypeKind.ENUM else []
+        payload_vals = []
+        for i, payload_op in enumerate(op.payload):
+            payload_val = self.emit_operand(payload_op)
+            offset = layout[i][0] if i < len(layout) else 0
+            # Coerce integer payloads to the *declared* field width so the
+            # store covers exactly the slot the layout reserved and matches
+            # the width used when the payload is later extracted. Storing at
+            # the value's own (possibly narrower) width leaves the high bytes
+            # of the slot uninitialised and reads back as garbage.
+            if i < len(layout) and isinstance(payload_val.type, ir.IntType):
+                declared_llvm = self.type_cache.get_llvm_type(layout[i][1])
+                if isinstance(declared_llvm, ir.IntType) and \
+                        declared_llvm.width != payload_val.type.width:
+                    payload_val = self._coerce_int(
+                        payload_val, declared_llvm,
+                        signed=self._operand_is_signed(payload_op))
+            payload_vals.append((offset, payload_val))
+
+        # Skip the payload zero-fill when the tag and the active case's whole
+        # payload are stored immediately below: every descriptor walk
+        # (release_fields, GC trace, clone) is tag-filtered, so the inactive
+        # union bytes are never read. Fall back to zeroing if the operand list
+        # does not cover the case's declared layout.
+        covers_case = len(op.payload) == len(layout)
+
         # Allocate heap object
         payload_size = self.type_cache._get_type_size(op.enum_type)
         ptr = self.runtime.emit_obj_alloc(
@@ -91,6 +139,7 @@ class OpsAggregateMixin:
             ir.Constant(self.type_cache.i64, payload_size),
             ir.Constant(self.type_cache.i64, 8),
             ir.Constant(self.type_cache.i64, self.type_cache.get_or_assign_descriptor_id(op.enum_type)),
+            zero_init=not covers_case,
         )
 
         # GEP past 32-byte header to payload
@@ -109,31 +158,14 @@ class OpsAggregateMixin:
         )
         self.builder.store(ir.Constant(tag_type, op.tag), tag_ptr)
 
-        if op.payload:
+        if payload_vals:
             # Pack payload values
             payload_byte_ptr2 = self.builder.gep(
                 enum_ptr,
                 [ir.Constant(self.type_cache.i32, 0), ir.Constant(self.type_cache.i32, 1)],
                 name="enum.payload.bytes",
             )
-            layout = self.type_cache.get_enum_case_payload_layout(
-                enum_data.symbol_id, op.case_name
-            ) if info and info.kind == TypeKind.ENUM else []
-            for i, payload_op in enumerate(op.payload):
-                payload_val = self.emit_operand(payload_op)
-                offset = layout[i][0] if i < len(layout) else 0
-                # Coerce integer payloads to the *declared* field width so the
-                # store covers exactly the slot the layout reserved and matches
-                # the width used when the payload is later extracted. Storing at
-                # the value's own (possibly narrower) width leaves the high bytes
-                # of the slot uninitialised and reads back as garbage.
-                if i < len(layout) and isinstance(payload_val.type, ir.IntType):
-                    declared_llvm = self.type_cache.get_llvm_type(layout[i][1])
-                    if isinstance(declared_llvm, ir.IntType) and \
-                            declared_llvm.width != payload_val.type.width:
-                        payload_val = self._coerce_int(
-                            payload_val, declared_llvm,
-                            signed=self._operand_is_signed(payload_op))
+            for offset, payload_val in payload_vals:
                 byte_ptr = self.builder.gep(
                     payload_byte_ptr2,
                     [ir.Constant(self.type_cache.i32, 0), ir.Constant(self.type_cache.i32, offset)],

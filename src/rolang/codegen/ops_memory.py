@@ -304,7 +304,9 @@ class OpsMemoryMixin:
             f"_emit_string_constant: unexpected type context {self.type_table.format_type(type_id)}"
         )
         handle = self.runtime.emit_string_from_rodata(self.builder, str_ptr, length)
-        payload_size = ir.Constant(self.type_cache.i64, 16)  # StringPayload {data*, len}
+        # StringPayload {data*, len, hash_cache} — hash_cache stays 0 (the
+        # rt_obj_alloc memset) until the runtime memoizes a key hash into it.
+        payload_size = ir.Constant(self.type_cache.i64, 24)
 
         obj = self.runtime.emit_obj_alloc(
             self.builder,

@@ -333,6 +333,21 @@ output across all seven languages; timings are the **minimum** wall-clock over
 repeated runs (the most stable estimator), measured on the same machine with
 Rolang built at `-O3`.
 
+**Fairness contract.** This is a *same-program* suite, not an idiomatic
+ceiling contest: every language implements the identical algorithm with the
+same memory shape (a heap node per tree node, the same 20-iteration Newton
+sqrt, the same LCG), the sources are frozen, and the output must match
+byte-for-byte. What is unrestricted is the *language implementation* —
+compiler, runtime, allocator, GC/ARC — because that is the thing under test.
+Java's TLAB bump allocator, Go's garbage collector, and Rolang's pooled
+free-list all fall on the same side of this line; rewriting a benchmark
+source to dodge work (e.g. an arena instead of per-node allocation in
+`binary_trees`) falls on the other side and is not allowed. Known, documented
+asymmetries currently favor the baselines: C/Rust compile with
+`-march=native` while Rolang targets the generic host triple, and C's
+`word_freq` uses a flat array where every other language pays for a real
+hash map.
+
 ```bash
 python benchmarks/runner.py                  # run all, all languages
 python benchmarks/runner.py --langs C,Rolang # subset
@@ -340,21 +355,26 @@ python benchmarks/runner.py --out results.md # append a markdown report
 ```
 
 Min wall-clock in milliseconds (lower is better); **×C** is Rolang relative to C.
+Measured 2026-06-11 on an Apple Silicon Mac (full tables with mean/median/stddev
+in `benchmarks/results/optimized-2026-06-11.md`).
 
-| Benchmark    |     C | Rolang |   ×C |  Rust |    Go |   Java | Node.js |   Python |
-|--------------|------:|-------:|-----:|------:|------:|-------:|--------:|---------:|
-| fib          | 22.7  |  34.0  | 1.50 |  35.6 |  55.6 |   77.3 |   306.6 |   1518.0 |
-| mandelbrot   | 178.9 | 189.7  | 1.06 | 185.4 | 193.0 |  219.6 |   368.4 |   5484.3 |
-| json_parse   | 31.7  |  44.8  | 1.41 |  31.2 |  61.8 |  166.9 |   361.5 |    609.6 |
-| nbody        | 809.1 | 930.0  | 1.15 | 865.9 | 901.7 |  977.1 |  1748.6 |  14182.1 |
-| word_freq    | 42.8  |  78.3  | 1.83 |  66.4 |  55.0 |  159.4 |   463.7 |    814.4 |
-| binary_trees | 66.3  | 193.9  | 2.93 |  84.6 | 125.7 |  103.9 |   275.0 |   1345.2 |
+| Benchmark    |     C | Rolang |   ×C |  Rust |    Go |  Java | Node.js |  Python |
+|--------------|------:|-------:|-----:|------:|------:|------:|--------:|--------:|
+| fib          |  26.7 |   25.8 | 0.97 |  28.0 |  30.9 |  57.3 |    87.2 |   689.2 |
+| mandelbrot   | 113.4 |  113.7 | 1.00 | 119.3 | 128.8 | 150.7 |   141.2 |  2000.5 |
+| json_parse   |  25.9 |   26.1 | 1.01 |  31.0 |  46.0 |  81.1 |    89.6 |   248.4 |
+| nbody        | 244.9 |  253.3 | 1.03 | 271.4 | 262.2 | 324.4 |   445.8 |  5926.4 |
+| word_freq    |  30.0 |   29.1 | 0.97 |  37.6 |  31.0 |  70.2 |   143.1 |   319.9 |
+| binary_trees |  55.9 |   42.1 | 0.75 |  55.6 |  53.2 |  51.9 |    53.3 |   533.4 |
 
 Execution models: C/Rust = native (no GC), Go/Java/Node = managed (GC/JIT),
 Python = interpreted, Rolang = native with automatic reference counting + a
-generational cycle collector. On compute-bound workloads Rolang runs within
-~1.1–1.5× of C and ahead of Rust on `fib`; the allocation-heavy `binary_trees`
-is the current outlier and an active optimization target.
+generational cycle collector. Rolang beats Go, Java, and Rust on every
+benchmark in the suite, runs within ~1.03× of C on the compute-bound
+workloads, and is the fastest language overall — ahead of C — on `fib`, the
+dict-heavy `word_freq` (tagged-bucket hash table with memoized string hashes),
+and the allocation-heavy `binary_trees` (pooled allocation with an inline
+fast path, 0.75× C).
 
 ## Development
 

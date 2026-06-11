@@ -173,10 +173,51 @@ class OpsCallsMixin:
 
     _GVEC_HEADER_BYTES = 16  # {i32 len, i32 capacity, i32 elem_size, i32 elem_type_id}
 
-    def _gvec_scalar_elem(self, ptr_operand: Operand):
-        """If `ptr_operand` is `&local` for a primitive scalar local, return
-        (src_local, elem_llvm_type); otherwise None (caller falls back to the
-        opaque call)."""
+    # ---- TBAA for inline collection access -----------------------------------
+    #
+    # The inline Vec/Dict accessors load header fields (len, key_size, ...)
+    # and load/store element slots. Without aliasing info LLVM must assume an
+    # element store may overwrite any header, so loop-invariant header loads
+    # (e.g. `len` for the bounds check) are re-loaded on every iteration of
+    # numeric loops. Headers and element data are disjoint by construction —
+    # the runtime never overlays them — so we publish that as two TBAA
+    # branches. C-side accesses carry no TBAA and conservatively alias both.
+
+    def _tbaa_tags(self):
+        tags = getattr(self.module, "_rolang_tbaa", None)
+        if tags is None:
+            i64 = self.type_cache.i64
+            root = self.module.add_metadata(["Rolang TBAA"])
+            header_ty = self.module.add_metadata(
+                ["rolang collection header", root, ir.Constant(i64, 0)])
+            elem_ty = self.module.add_metadata(
+                ["rolang collection element", root, ir.Constant(i64, 0)])
+            tags = {
+                "header": self.module.add_metadata(
+                    [header_ty, header_ty, ir.Constant(i64, 0)]),
+                "element": self.module.add_metadata(
+                    [elem_ty, elem_ty, ir.Constant(i64, 0)]),
+            }
+            self.module._rolang_tbaa = tags
+        return tags
+
+    def _tag_header(self, instr):
+        instr.set_metadata("tbaa", self._tbaa_tags()["header"])
+        return instr
+
+    def _tag_element(self, instr):
+        instr.set_metadata("tbaa", self._tbaa_tags()["element"])
+        return instr
+
+    def _gvec_scalar_elem(self, ptr_operand: Operand, allow_heap: bool = False):
+        """If `ptr_operand` is `&local` for a scalar local, return
+        (src_local, elem_llvm_type, is_heap); otherwise None (caller falls
+        back to the opaque call).
+
+        Heap-managed elements are only returned when ``allow_heap`` is set —
+        the caller must then emit the element retain itself (read accessors).
+        Mutating accessors keep the C call, which also releases the
+        overwritten element."""
         if not isinstance(ptr_operand, (CopyOperand, MoveOperand)):
             return None
         place = ptr_operand.place
@@ -188,14 +229,14 @@ class OpsCallsMixin:
         elem_type_id = self.local_types.get(src)
         if elem_type_id is None:
             return None
-        # Heap-managed elements need the runtime's retain/release — keep the call.
-        if self.type_table.is_heap_type(elem_type_id):
+        is_heap = self.type_table.is_heap_type(elem_type_id)
+        if is_heap and not allow_heap:
             return None
         elem_llvm = self.type_cache.get_llvm_type(elem_type_id)
         if not isinstance(elem_llvm, (ir.IntType, ir.FloatType, ir.DoubleType,
                                       ir.HalfType, ir.PointerType)):
             return None
-        return src, elem_llvm
+        return src, elem_llvm, is_heap
 
     def _gvec_panic_index_fn(self) -> ir.Function:
         f = self.func_map.get("rt_panic_index_out_of_bounds")
@@ -221,7 +262,7 @@ class OpsCallsMixin:
 
         # len lives at offset 0 of the GVecHeader.
         len_ptr = self.builder.bitcast(vec_ptr, ir.PointerType(i32), name="gvec.len.ptr")
-        length = self.builder.load(len_ptr, name="gvec.len")
+        length = self._tag_header(self.builder.load(len_ptr, name="gvec.len"))
         # Unsigned compare folds the `index < 0` and `index >= len` checks into one.
         oob = self.builder.icmp_unsigned(">=", index_val, length, name="gvec.oob")
 
@@ -240,7 +281,10 @@ class OpsCallsMixin:
         data_i8 = self.builder.gep(vec_ptr, [ir.Constant(i64, self._GVEC_HEADER_BYTES)],
                                    name="gvec.data")
         data = self.builder.bitcast(data_i8, ir.PointerType(elem_llvm), name="gvec.data.t")
-        slot = self.builder.gep(data, [self.builder.sext(index_val, i64)], name="gvec.slot")
+        # zext, not sext: the bounds check just proved index ∈ [0, len), so the
+        # offset is provably non-negative — alias analysis can then prove the
+        # slot never reaches back into this vector's own header.
+        slot = self.builder.gep(data, [self.builder.zext(index_val, i64)], name="gvec.slot")
         return slot
 
     def _emit_inline_gvec_len(self, op: CallStatic) -> bool:
@@ -250,21 +294,25 @@ class OpsCallsMixin:
                                        self.type_cache.ptr, name="gvec.h")
         len_ptr = self.builder.bitcast(vec_ptr, ir.PointerType(self.type_cache.i32),
                                        name="gvec.len.ptr")
-        length = self.builder.load(len_ptr, name="gvec.len")
+        length = self._tag_header(self.builder.load(len_ptr, name="gvec.len"))
         self._store_local(op.result, length)
         return True
 
     def _emit_inline_gvec_get(self, op: CallStatic) -> bool:
         if len(op.args) < 3:
             return False
-        info = self._gvec_scalar_elem(op.args[2])
+        info = self._gvec_scalar_elem(op.args[2], allow_heap=True)
         if info is None:
             return False
-        src, elem_llvm = info
+        src, elem_llvm, is_heap = info
         vec_ptr = self.emit_operand(op.args[0])
         index_val = self.emit_operand(op.args[1])
         slot = self._gvec_bounds_check_then_slot(vec_ptr, index_val, elem_llvm)
-        value = self.builder.load(slot, name="gvec.elem")
+        value = self._tag_element(self.builder.load(slot, name="gvec.elem"))
+        if is_heap:
+            # rt_gvec_get retains heap elements for the caller; mirror that
+            # with the inline retain (null-safe rc++) so ownership matches.
+            self.runtime.emit_obj_retain(self.builder, value)
         self._store_local(src, value)
         return True
 
@@ -274,12 +322,12 @@ class OpsCallsMixin:
         info = self._gvec_scalar_elem(op.args[2])
         if info is None:
             return False
-        src, elem_llvm = info
+        src, elem_llvm, _ = info
         vec_ptr = self.emit_operand(op.args[0])
         index_val = self.emit_operand(op.args[1])
         value = self.builder.load(self.local_storage[src], name="gvec.val")
         slot = self._gvec_bounds_check_then_slot(vec_ptr, index_val, elem_llvm)
-        self.builder.store(value, slot)
+        self._tag_element(self.builder.store(value, slot))
         return True
 
     # ---- Inline primitive Dict<K,V> value access by entry index -------------
@@ -303,8 +351,9 @@ class OpsCallsMixin:
     def _dict_load_i64_field(self, dict_ptr, byte_off):
         i64 = self.type_cache.i64
         p = self.builder.gep(dict_ptr, [ir.Constant(i64, byte_off)], name="dict.f")
-        return self.builder.load(self.builder.bitcast(p, ir.PointerType(i64)),
-                                 name="dict.fv")
+        return self._tag_header(
+            self.builder.load(self.builder.bitcast(p, ir.PointerType(i64)),
+                              name="dict.fv"))
 
     def _dict_value_slot(self, dict_ptr, index_i64, elem_llvm):
         """Typed pointer to the value of entry `index_i64` (assumes in-bounds)."""
@@ -340,7 +389,7 @@ class OpsCallsMixin:
         info = self._gvec_scalar_elem(op.args[2])
         if info is None:
             return False
-        src, elem_llvm = info
+        src, elem_llvm, _ = info
         dict_ptr = self.builder.bitcast(self.emit_operand(op.args[0]),
                                         self.type_cache.ptr, name="dict.h")
         index = self._dict_index_arg(op.args[1])
@@ -359,7 +408,8 @@ class OpsCallsMixin:
 
         self.builder.position_at_end(ok_bb)
         slot = self._dict_value_slot(dict_ptr, index, elem_llvm)
-        self._store_local(src, self.builder.load(slot, name="dict.val"))
+        self._store_local(src, self._tag_element(
+            self.builder.load(slot, name="dict.val")))
         self.builder.branch(cont_bb)
 
         self.builder.position_at_end(cont_bb)
@@ -371,7 +421,7 @@ class OpsCallsMixin:
         info = self._gvec_scalar_elem(op.args[2])
         if info is None:
             return False
-        src, elem_llvm = info
+        src, elem_llvm, _ = info
         dict_ptr = self.builder.bitcast(self.emit_operand(op.args[0]),
                                         self.type_cache.ptr, name="dict.h")
         index = self._dict_index_arg(op.args[1])
@@ -386,7 +436,7 @@ class OpsCallsMixin:
 
         self.builder.position_at_end(store_bb)
         slot = self._dict_value_slot(dict_ptr, index, elem_llvm)
-        self.builder.store(value, slot)
+        self._tag_element(self.builder.store(value, slot))
         self.builder.branch(cont_bb)
 
         self.builder.position_at_end(cont_bb)

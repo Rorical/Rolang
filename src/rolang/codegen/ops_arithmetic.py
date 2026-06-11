@@ -29,27 +29,35 @@ class OpsArithmeticMixin:
         is_signed = self.type_cache.is_signed_integer(left_type)
 
         match op.op:
+            # Float ops carry the `contract` fast-math flag (and ONLY that
+            # flag): it licenses fmul+fadd fusion into fma, matching what C
+            # compilers do by default (-ffp-contract=on), without any of the
+            # value-unsafe reassociation the other fast-math flags allow.
             case BinOpKind.ADD:
                 if is_float:
-                    result = self.builder.fadd(left, right, name="fadd")
+                    result = self.builder.fadd(left, right, name="fadd",
+                                               flags=("contract",))
                 else:
                     result = self.builder.add(left, right, name="add")
 
             case BinOpKind.SUB:
                 if is_float:
-                    result = self.builder.fsub(left, right, name="fsub")
+                    result = self.builder.fsub(left, right, name="fsub",
+                                               flags=("contract",))
                 else:
                     result = self.builder.sub(left, right, name="sub")
 
             case BinOpKind.MUL:
                 if is_float:
-                    result = self.builder.fmul(left, right, name="fmul")
+                    result = self.builder.fmul(left, right, name="fmul",
+                                               flags=("contract",))
                 else:
                     result = self.builder.mul(left, right, name="mul")
 
             case BinOpKind.DIV:
                 if is_float:
-                    result = self.builder.fdiv(left, right, name="fdiv")
+                    result = self.builder.fdiv(left, right, name="fdiv",
+                                               flags=("contract",))
                 else:
                     self._emit_div_zero_guard(right, is_remainder=False)
                     if is_signed:

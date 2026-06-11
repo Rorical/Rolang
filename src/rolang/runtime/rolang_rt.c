@@ -74,7 +74,10 @@ void* rt_gvec_push(void* vec, const void* value);
 static const size_t pool_bin_sizes[POOL_BIN_COUNT] = {48, 64, 96, 128, 192, 256};
 
 typedef struct PoolNode { struct PoolNode* __volatile next; } PoolNode;
-static PoolNode* volatile pool_free_lists[POOL_BIN_COUNT];
+/* NOT static: the codegen-emitted inline allocation fast path (see
+ * _declare_inline_obj_alloc_fast in codegen/runtime.py) links directly
+ * against these. Hidden visibility keeps them out of the dylib ABI. */
+PoolNode* volatile pool_free_lists[POOL_BIN_COUNT];
 
 static int pool_bin_for_size(size_t total_size) {
     for (int i = 0; i < POOL_BIN_COUNT; i++) {
@@ -205,31 +208,23 @@ void* rt_alloc(int64_t size, int64_t align) {
         return NULL;
     }
 
-    // Use aligned_alloc if available, otherwise fall back to malloc
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-    // Ensure alignment is at least sizeof(void*) and size is multiple of alignment.
-    // Cast sizeof(void*) to int64_t since `align` is signed and an unsigned
-    // comparison would treat negative values as huge positives.
+    // aligned_alloc is C11 and present on every supported platform (glibc,
+    // musl, macOS 10.15+). Using it unconditionally keeps rt_free a plain
+    // free() everywhere, so pointers from rt_alloc AND from plain malloc
+    // (e.g. runtime StringVal handles) can both be released through rt_free.
+    // The old _POSIX_C_SOURCE-guarded fallback stashed the raw pointer at
+    // ptr[-1]; on platforms that took it (macOS), rt_free then read garbage
+    // when handed a plain-malloc'd pointer and aborted in libmalloc.
+    // Ensure alignment is at least sizeof(void*) and size is a multiple of
+    // alignment (C11 requires it). Cast sizeof(void*) to int64_t since
+    // `align` is signed and an unsigned comparison would treat negative
+    // values as huge positives.
     if (align < (int64_t)sizeof(void*)) {
         align = (int64_t)sizeof(void*);
     }
     // Round up size to be a multiple of alignment
     int64_t aligned_size = (size + align - 1) & ~(align - 1);
     return aligned_alloc((size_t)align, (size_t)aligned_size);
-#else
-    // Fallback: over-allocate and align manually
-    void* raw = malloc((size_t)(size + align - 1 + sizeof(void*)));
-    if (!raw) return NULL;
-
-    // Align the pointer
-    uintptr_t raw_addr = (uintptr_t)raw + sizeof(void*);
-    uintptr_t aligned_addr = (raw_addr + align - 1) & ~((uintptr_t)align - 1);
-
-    // Store the original pointer just before the aligned address
-    ((void**)aligned_addr)[-1] = raw;
-
-    return (void*)aligned_addr;
-#endif
 }
 
 /**
@@ -242,13 +237,7 @@ void rt_free(void* ptr) {
         return;
     }
 
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     free(ptr);
-#else
-    // If we used the fallback allocation, retrieve the original pointer
-    void* raw = ((void**)ptr)[-1];
-    free(raw);
-#endif
 }
 
 /* ============================================================================
@@ -455,7 +444,7 @@ int32_t RT_TYPE_FIELD_DESCRIPTOR_COUNT = 0;
  * Singly-linked list of all live typed objects.  Protected by a spinlock.
  * ============================================================================ */
 
-static ObjHeader* gc_object_list = NULL;
+ObjHeader* gc_object_list = NULL;  /* non-static: see inline alloc fast path */
 static atomic_flag gc_list_lock = ATOMIC_FLAG_INIT;
 
 /* Generational boundary into gc_object_list (youngest at head):
@@ -471,8 +460,8 @@ static ObjHeader* gc_old_head = NULL;
 static int        gc_minor_count = 0;
 #define GC_MAJOR_EVERY 8
 
-static int64_t gc_alloc_counter = 0;
-static int64_t gc_last_collect_count = 0;
+int64_t gc_alloc_counter = 0;          /* non-static: inline alloc fast path */
+int64_t gc_last_collect_count = 0;     /* non-static: inline alloc fast path */
 static int64_t gc_cycle_count = 0;
 
 /* Adaptive cycle-GC threshold. Instead of a fixed gap between collections,
@@ -483,7 +472,7 @@ static int64_t gc_cycle_count = 0;
 #define GC_MIN_GAP   10000
 #define GC_MAX_GAP   2000000
 #define GC_GROWTH    2
-static int64_t gc_next_gap = GC_MIN_GAP;
+int64_t gc_next_gap = GC_MIN_GAP;      /* non-static: inline alloc fast path */
 
 /* ---- GC list lock helpers ---- */
 
@@ -506,7 +495,8 @@ static inline FieldDescriptor* rt_get_field_descriptors(const TypeDescriptor* de
     return &RT_TYPE_FIELD_DESCRIPTORS[desc->fields_start];
 }
 
-static volatile int gc_running = 0;  /* Set to 1 during rt_gc_collect */
+volatile int gc_running = 0;  /* Set to 1 during rt_gc_collect; non-static:
+                               * inline alloc fast path reads it */
 
 /* Defined below. rt_obj_alloc polls it once the alloc counter crosses the gap,
  * so the GC trigger lives at the one site allocations happen rather than being
@@ -576,7 +566,8 @@ static void gc_list_remove(ObjHeader* obj) {
  * @param type_id      Index into RT_TYPE_DESCRIPTORS table
  * @return Pointer to the ObjHeader (start of the object), or NULL on failure
  */
-void* rt_obj_alloc(int64_t payload_size, int64_t align, uint64_t type_id) {
+static inline void* _obj_alloc_impl(int64_t payload_size, int64_t align,
+                                    uint64_t type_id, int zero_payload) {
     int64_t total_size = OBJ_HEADER_SIZE + payload_size;
 
 #ifdef ROLANG_POOL_PROFILE
@@ -610,8 +601,19 @@ void* rt_obj_alloc(int64_t payload_size, int64_t align, uint64_t type_id) {
     ObjHeader* h = (ObjHeader*)raw;
     h->rc = 1;
     h->type_id = type_id;
-    if (payload_size > 0) {
-        memset(OBJ_PAYLOAD(h), 0, (size_t)payload_size);
+    if (zero_payload && payload_size > 0) {
+        if (payload_size <= 64) {
+            /* Inline word stores instead of a memset libcall. Both the pool
+             * (bin sizes) and rt_alloc (size rounded up to align) guarantee
+             * the allocation extends to an 8-byte boundary past the payload,
+             * so rounding the zero-fill up to a multiple of 8 stays in
+             * bounds. */
+            int64_t* p = (int64_t*)OBJ_PAYLOAD(h);
+            int64_t words = (payload_size + 7) >> 3;
+            for (int64_t i = 0; i < words; i++) p[i] = 0;
+        } else {
+            memset(OBJ_PAYLOAD(h), 0, (size_t)payload_size);
+        }
     }
 
     gc_list_add(h);   /* sets h->prev and h->next */
@@ -621,15 +623,34 @@ void* rt_obj_alloc(int64_t payload_size, int64_t align, uint64_t type_id) {
      * can only be created by allocating a new heap object, so this is the only
      * point a check could ever fire — which lets non-allocating hot loops run
      * with zero GC overhead. The new object is fully initialized (rc=1, pointer
-     * fields zeroed) and gc_list_add has released the list lock, so this is a
-     * safe collection point. Inline the threshold test so the common
-     * (no-collect) case stays a load+compare, not a call; skip entirely while a
-     * collection is already running (a deinit-triggered allocation). */
+     * fields zeroed — or about to be fully stored by a noinit caller before
+     * any allocation or release can run) and gc_list_add has released the list
+     * lock, so this is a safe collection point. Inline the threshold test so
+     * the common (no-collect) case stays a load+compare, not a call; skip
+     * entirely while a collection is already running (a deinit-triggered
+     * allocation). */
     if (!gc_running && gc_alloc_counter - gc_last_collect_count >= gc_next_gap) {
         rt_gc_collect();
     }
 
     return raw;
+}
+
+void* rt_obj_alloc(int64_t payload_size, int64_t align, uint64_t type_id) {
+    return _obj_alloc_impl(payload_size, align, type_id, /*zero_payload=*/1);
+}
+
+/* Allocation WITHOUT the payload zero-fill, for construction sites that
+ * provably store every live field before the next allocation, release, or
+ * GC-observable point: MakeStruct (all fields required by the language) and
+ * MakeEnum (tag + the active case's payload; every descriptor walk —
+ * release_fields, GC trace, clone — is tag-filtered, so the inactive union
+ * bytes are never read). The zero-fill is a meaningful fraction of
+ * alloc-churn workloads (binary_trees); for fully-stored payloads it is
+ * pure waste. Callers that leave any live field unwritten MUST use
+ * rt_obj_alloc instead. */
+void* rt_obj_alloc_noinit(int64_t payload_size, int64_t align, uint64_t type_id) {
+    return _obj_alloc_impl(payload_size, align, type_id, /*zero_payload=*/0);
 }
 
 /* ============================================================================
@@ -1523,10 +1544,16 @@ int64_t rt_gc_cycle_count(void) {
 typedef struct { char* data; int64_t len; } StringVal;
 
 /* Inline payload of an ARC-managed String object.
- * Must match the Rolang struct `String { var data: RawPtr; var len: i64 }`. */
+ * Must match the Rolang struct
+ * `String { var data: RawPtr; var length: i64; var hash_cache: i64 }`
+ * in std/string.rl AND the payload_size baked into the string-literal
+ * emission in codegen/ops_memory.py.
+ * `hash` is the lazily memoized key hash (0 = not computed yet); string
+ * contents are immutable after construction so it never goes stale. */
 typedef struct {
     char* data;
     int64_t len;
+    int64_t hash;
 } StringPayload;
 
 static inline StringVal rt_string_empty_val(void) {
@@ -1595,6 +1622,31 @@ typedef struct RolangDict {
 
 #define RT_DICT_BUCKET_EMPTY (-1)
 
+/* Bucket slot: entry index + 32-bit hash tag. The tag is the HIGH half of the
+ * 64-bit key hash (the bucket position uses the low bits, so the two are
+ * decorrelated). Probing compares tags first and only dereferences/compares
+ * the actual keys on a tag match, which removes nearly every key memcmp from
+ * the probe loop — the dominant cost in string-keyed hot loops (word_freq). */
+typedef struct {
+    int32_t  idx;   /* index into entries[], or RT_DICT_BUCKET_EMPTY */
+    uint32_t tag;   /* high 32 bits of the key hash; undefined when empty */
+} DictBucket;
+
+/* memcpy with the common tiny sizes peeled into constant-size copies the
+ * compiler lowers to single load/store pairs. Collection elements are almost
+ * always 1/2/4/8/16 bytes (primitives, object pointers, StringVal pairs);
+ * a variable-length memcpy is a libcall on every get/set. */
+static inline void _rt_copy_small(void* dst, const void* src, size_t n) {
+    switch (n) {
+    case 1:  memcpy(dst, src, 1);  return;
+    case 2:  memcpy(dst, src, 2);  return;
+    case 4:  memcpy(dst, src, 4);  return;
+    case 8:  memcpy(dst, src, 8);  return;
+    case 16: memcpy(dst, src, 16); return;
+    default: memcpy(dst, src, n);  return;
+    }
+}
+
 static inline size_t _dict_stride(const RolangDict* dict) {
     return (size_t)dict->key_size + (size_t)dict->value_size;
 }
@@ -1607,11 +1659,43 @@ static unsigned char* rt_dict_value_at(RolangDict* dict, int64_t index) {
     return rt_dict_key_at(dict, index) + (size_t)dict->key_size;
 }
 
-static int32_t* _dict_buckets(RolangDict* dict) {
-    return (int32_t*)(dict->data + (size_t)dict->buckets_offset);
+static DictBucket* _dict_buckets(RolangDict* dict) {
+    return (DictBucket*)(dict->data + (size_t)dict->buckets_offset);
 }
 
-static int rt_dict_keys_equal(RolangDict* dict, const void* lhs, const void* rhs) {
+/* Byte equality without the memcmp libcall for short runs. Keys in hash-table
+ * hot loops are typically a handful of bytes; the call overhead of memcmp
+ * dwarfs the comparison itself. Overlapping word loads cover 4..16 bytes in
+ * two compares; memcpy compiles to plain loads at -O1+. */
+static inline int _dict_bytes_equal(const unsigned char* a,
+                                    const unsigned char* b, size_t n) {
+    if (n >= 16) {
+        return memcmp(a, b, n) == 0;
+    }
+    if (n >= 8) {
+        uint64_t x0, y0, x1, y1;
+        memcpy(&x0, a, 8);
+        memcpy(&y0, b, 8);
+        memcpy(&x1, a + n - 8, 8);
+        memcpy(&y1, b + n - 8, 8);
+        return ((x0 ^ y0) | (x1 ^ y1)) == 0;
+    }
+    if (n >= 4) {
+        uint32_t x0, y0, x1, y1;
+        memcpy(&x0, a, 4);
+        memcpy(&y0, b, 4);
+        memcpy(&x1, a + n - 4, 4);
+        memcpy(&y1, b + n - 4, 4);
+        return ((x0 ^ y0) | (x1 ^ y1)) == 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+__attribute__((always_inline))
+static inline int rt_dict_keys_equal(RolangDict* dict, const void* lhs, const void* rhs) {
     if (dict->key_kind == RT_DICT_KEY_STRING) {
         StringVal a_val;
         StringVal b_val;
@@ -1634,34 +1718,94 @@ static int rt_dict_keys_equal(RolangDict* dict, const void* lhs, const void* rhs
         if (a->data == NULL || b->data == NULL) {
             return a->data == b->data;
         }
-        return memcmp(a->data, b->data, (size_t)a->len) == 0;
+        return _dict_bytes_equal((const unsigned char*)a->data,
+                                 (const unsigned char*)b->data, (size_t)a->len);
     }
 
-    return memcmp(lhs, rhs, (size_t)dict->key_size) == 0;
+    return _dict_bytes_equal((const unsigned char*)lhs,
+                             (const unsigned char*)rhs, (size_t)dict->key_size);
 }
 
-/* FNV-1a-64 for primitive byte keys and string contents. */
-static uint64_t _dict_hash_key(RolangDict* dict, const void* key) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    if (dict->key_kind == RT_DICT_KEY_STRING) {
-        StringVal s_val = dict->key_type_id != 0
-            ? rt_string_obj_value(*(void* const*)key)
-            : *(const StringVal*)key;
-        const StringVal* s = &s_val;
-        if (s->data != NULL && s->len > 0) {
-            for (int64_t i = 0; i < s->len; i++) {
-                h ^= (uint64_t)(unsigned char)s->data[i];
-                h *= 0x100000001b3ULL;
-            }
+/* Word-at-a-time multiply-xor hash.
+ * Replaces byte-at-a-time FNV-1a: same interface, ~8x fewer multiplies on
+ * long keys and a single data multiply for the <=8-byte keys that dominate
+ * dict-as-counter workloads. The multiply pushes entropy into the HIGH bits;
+ * the closing `h ^= h >> 32` folds those well-mixed bits back into the low
+ * bits that feed the pow2 bucket mask. The tag (high 32 bits) is mixed by
+ * the multiply alone. Kept deliberately short: hash latency sits on the
+ * critical path of every dict lookup, and a full splitmix finalizer costs
+ * more than it buys at hash-table quality levels. */
+static inline uint64_t _dict_hash_bytes(const unsigned char* p, size_t n) {
+    const uint64_t K = 0x9e3779b97f4a7c15ULL;
+    uint64_t h = 0xcbf29ce484222325ULL ^ ((uint64_t)n * K);
+    if (n > 8) {
+        do {
+            uint64_t w;
+            memcpy(&w, p, 8);
+            h = (h ^ w) * K;
+            p += 8;
+            n -= 8;
+        } while (n >= 8);
+        if (n > 0) {
+            /* Overlapping tail load: total length > 8, so p+n-8 is valid. */
+            uint64_t w;
+            memcpy(&w, p + n - 8, 8);
+            h = (h ^ w) * K;
         }
-        return h;
+    } else if (n > 0) {
+        uint64_t w;
+        if (n == 8) {
+            memcpy(&w, p, 8);
+        } else if (n >= 4) {
+            /* Two overlapping 4-byte loads cover 4..7 bytes. */
+            uint32_t lo, hi;
+            memcpy(&lo, p, 4);
+            memcpy(&hi, p + n - 4, 4);
+            w = (uint64_t)lo | ((uint64_t)hi << 32);
+        } else {
+            /* 1..3 bytes: independent loads, no carried dependency. */
+            w = (uint64_t)p[0]
+              | ((uint64_t)p[n >> 1] << 8)
+              | ((uint64_t)p[n - 1] << 16);
+        }
+        h = (h ^ w) * K;
     }
-    const unsigned char* p = (const unsigned char*)key;
-    for (int64_t i = 0; i < dict->key_size; i++) {
-        h ^= (uint64_t)p[i];
-        h *= 0x100000001b3ULL;
-    }
+    h ^= h >> 32;
     return h;
+}
+
+__attribute__((always_inline))
+static inline uint64_t _dict_hash_key(RolangDict* dict, const void* key) {
+    if (dict->key_kind == RT_DICT_KEY_STRING) {
+        if (dict->key_type_id != 0) {
+            /* Heap String object: memoize the hash in the object itself.
+             * Hot dict workloads look the same few key objects up millions
+             * of times (e.g. a pre-built key vector); after the first probe
+             * the hash is a single load instead of a recompute. 0 means
+             * "not computed" — a computed hash is forced non-zero. */
+            void* obj = *(void* const*)key;
+            StringPayload* sp = rt_string_payload(obj);
+            if (sp == NULL) {
+                return _dict_hash_bytes(NULL, 0);
+            }
+            uint64_t cached = (uint64_t)sp->hash;
+            if (cached != 0) {
+                return cached;
+            }
+            uint64_t h = (sp->data == NULL || sp->len <= 0)
+                ? _dict_hash_bytes(NULL, 0)
+                : _dict_hash_bytes((const unsigned char*)sp->data, (size_t)sp->len);
+            if (h == 0) h = 0x9e3779b97f4a7c15ULL;
+            sp->hash = (int64_t)h;
+            return h;
+        }
+        StringVal s_val = *(const StringVal*)key;
+        if (s_val.data == NULL || s_val.len <= 0) {
+            return _dict_hash_bytes(NULL, 0);
+        }
+        return _dict_hash_bytes((const unsigned char*)s_val.data, (size_t)s_val.len);
+    }
+    return _dict_hash_bytes((const unsigned char*)key, (size_t)dict->key_size);
 }
 
 static int64_t _next_pow2_at_least(int64_t v) {
@@ -1697,16 +1841,17 @@ static void _dict_release_all(RolangDict* dict) {
 static size_t _dict_alloc_size(int64_t capacity, int64_t key_size, int64_t value_size,
                                 int64_t bucket_count) {
     size_t entries = (size_t)capacity * ((size_t)key_size + (size_t)value_size);
-    /* Align bucket table to 4 bytes. */
+    /* Align bucket table to 4 bytes (DictBucket is two 4-byte fields). */
     entries = (entries + 3u) & ~(size_t)3u;
-    return sizeof(RolangDict) + entries + (size_t)bucket_count * sizeof(int32_t);
+    return sizeof(RolangDict) + entries + (size_t)bucket_count * sizeof(DictBucket);
 }
 
 static void _dict_clear_buckets(RolangDict* dict) {
     if (dict->bucket_count <= 0) return;
-    int32_t* buckets = _dict_buckets(dict);
+    DictBucket* buckets = _dict_buckets(dict);
     for (int64_t i = 0; i < dict->bucket_count; i++) {
-        buckets[i] = RT_DICT_BUCKET_EMPTY;
+        buckets[i].idx = RT_DICT_BUCKET_EMPTY;
+        buckets[i].tag = 0;
     }
 }
 
@@ -1714,14 +1859,16 @@ static void _dict_clear_buckets(RolangDict* dict) {
 static void _dict_rehash(RolangDict* dict) {
     _dict_clear_buckets(dict);
     if (dict->bucket_count <= 0) return;
-    int32_t* buckets = _dict_buckets(dict);
+    DictBucket* buckets = _dict_buckets(dict);
     uint64_t mask = (uint64_t)(dict->bucket_count - 1);
     for (int64_t i = 0; i < dict->len; i++) {
-        uint64_t h = _dict_hash_key(dict, rt_dict_key_at(dict, i)) & mask;
-        while (buckets[h] != RT_DICT_BUCKET_EMPTY) {
+        uint64_t hash = _dict_hash_key(dict, rt_dict_key_at(dict, i));
+        uint64_t h = hash & mask;
+        while (buckets[h].idx != RT_DICT_BUCKET_EMPTY) {
             h = (h + 1) & mask;
         }
-        buckets[h] = (int32_t)i;
+        buckets[h].idx = (int32_t)i;
+        buckets[h].tag = (uint32_t)(hash >> 32);
     }
 }
 
@@ -1734,7 +1881,7 @@ void* rt_dict_new(int64_t capacity, int64_t key_size, int64_t value_size,
     }
 
     if (capacity < 8) capacity = 8;
-    int64_t bucket_count = _next_pow2_at_least(capacity * 2);
+    int64_t bucket_count = _next_pow2_at_least(capacity * 4);
 
     size_t total = _dict_alloc_size(capacity, key_size, value_size, bucket_count);
     RolangDict* dict = (RolangDict*)malloc(total);
@@ -1767,7 +1914,7 @@ void* rt_dict_resize(void* dict_ptr, int64_t new_capacity) {
     RolangDict* dict = (RolangDict*)dict_ptr;
     if (new_capacity <= dict->capacity) return dict_ptr;
 
-    int64_t new_bucket_count = _next_pow2_at_least(new_capacity * 2);
+    int64_t new_bucket_count = _next_pow2_at_least(new_capacity * 4);
     size_t total = _dict_alloc_size(new_capacity, dict->key_size, dict->value_size,
                                     new_bucket_count);
     RolangDict* new_dict = (RolangDict*)malloc(total);
@@ -1799,21 +1946,30 @@ void* rt_dict_resize(void* dict_ptr, int64_t new_capacity) {
 
 /* Look up an entry index for ``key`` and return -1 on miss.
  * On hit, ``*out_bucket`` is the bucket slot that holds the index;
- * on miss, ``*out_bucket`` is the slot where a fresh entry should land. */
-static int32_t _dict_probe(RolangDict* dict, const void* key, uint64_t* out_bucket) {
-    int32_t* buckets = _dict_buckets(dict);
+ * on miss, ``*out_bucket`` is the slot where a fresh entry should land.
+ * ``*out_tag`` is always set to the key's bucket tag so insert paths can
+ * record it without rehashing. */
+__attribute__((always_inline))
+static inline int32_t _dict_probe(RolangDict* dict, const void* key,
+                                  uint64_t* out_bucket, uint32_t* out_tag) {
+    DictBucket* buckets = _dict_buckets(dict);
     uint64_t mask = (uint64_t)(dict->bucket_count - 1);
-    uint64_t h = _dict_hash_key(dict, key) & mask;
+    uint64_t hash = _dict_hash_key(dict, key);
+    uint32_t tag = (uint32_t)(hash >> 32);
+    uint64_t h = hash & mask;
+    *out_tag = tag;
     for (;;) {
-        int32_t idx = buckets[h];
-        if (idx == RT_DICT_BUCKET_EMPTY) {
+        DictBucket b = buckets[h];
+        if (b.idx == RT_DICT_BUCKET_EMPTY) {
             *out_bucket = h;
             return -1;
         }
-        unsigned char* existing_key = rt_dict_key_at(dict, idx);
-        if (rt_dict_keys_equal(dict, existing_key, key)) {
-            *out_bucket = h;
-            return idx;
+        if (b.tag == tag) {
+            unsigned char* existing_key = rt_dict_key_at(dict, b.idx);
+            if (rt_dict_keys_equal(dict, existing_key, key)) {
+                *out_bucket = h;
+                return b.idx;
+            }
         }
         h = (h + 1) & mask;
     }
@@ -1826,7 +1982,8 @@ void* rt_dict_set(void* dict_ptr, const void* key, const void* value) {
 
     RolangDict* dict = (RolangDict*)dict_ptr;
     uint64_t bucket;
-    int32_t idx = _dict_probe(dict, key, &bucket);
+    uint32_t tag;
+    int32_t idx = _dict_probe(dict, key, &bucket, &tag);
     if (idx >= 0) {
         /* Update existing value: release old, copy new, retain new. */
         unsigned char* slot = rt_dict_value_at(dict, idx);
@@ -1848,7 +2005,7 @@ void* rt_dict_set(void* dict_ptr, const void* key, const void* value) {
         }
         dict = (RolangDict*)new_ptr;
         dict_ptr = new_ptr;
-        idx = _dict_probe(dict, key, &bucket);
+        idx = _dict_probe(dict, key, &bucket, &tag);
         if (idx >= 0) {
             unsigned char* slot = rt_dict_value_at(dict, idx);
             _dict_release_element(dict->value_type_id, slot);
@@ -1867,8 +2024,9 @@ void* rt_dict_set(void* dict_ptr, const void* key, const void* value) {
     _dict_retain_element(dict->key_type_id, dest_key);
     _dict_retain_element(dict->value_type_id, dest_value);
 
-    int32_t* buckets = _dict_buckets(dict);
-    buckets[bucket] = (int32_t)new_idx;
+    DictBucket* buckets = _dict_buckets(dict);
+    buckets[bucket].idx = (int32_t)new_idx;
+    buckets[bucket].tag = tag;
     dict->len++;
     return dict_ptr;
 }
@@ -1884,9 +2042,10 @@ int32_t rt_dict_get(void* dict_ptr, const void* key, void* out) {
         return 0;
     }
     uint64_t bucket;
-    int32_t idx = _dict_probe(dict, key, &bucket);
+    uint32_t tag;
+    int32_t idx = _dict_probe(dict, key, &bucket, &tag);
     if (idx >= 0) {
-        memcpy(out, rt_dict_value_at(dict, idx), (size_t)dict->value_size);
+        _rt_copy_small(out, rt_dict_value_at(dict, idx), (size_t)dict->value_size);
         /* Retain heap-typed values for the caller. Without this the dict
          * still owns the slot but the caller's `out` would drop without
          * having been retained, causing a UAF the next time the dict is
@@ -1918,7 +2077,8 @@ void* rt_dict_entry_index(void* dict_ptr, const void* key,
 
     RolangDict* dict = (RolangDict*)dict_ptr;
     uint64_t bucket;
-    int32_t idx = _dict_probe(dict, key, &bucket);
+    uint32_t tag;
+    int32_t idx = _dict_probe(dict, key, &bucket, &tag);
     if (idx >= 0) {
         *(int64_t*)out_index = idx;
         return dict_ptr;
@@ -1937,7 +2097,7 @@ void* rt_dict_entry_index(void* dict_ptr, const void* key,
         }
         dict = (RolangDict*)new_ptr;
         dict_ptr = new_ptr;
-        idx = _dict_probe(dict, key, &bucket);
+        idx = _dict_probe(dict, key, &bucket, &tag);
         if (idx >= 0) {
             *(int64_t*)out_index = idx;  /* defensive; was absent pre-resize */
             return dict_ptr;
@@ -1956,8 +2116,9 @@ void* rt_dict_entry_index(void* dict_ptr, const void* key,
     _dict_retain_element(dict->key_type_id, dest_key);
     _dict_retain_element(dict->value_type_id, dest_value);
 
-    int32_t* buckets = _dict_buckets(dict);
-    buckets[bucket] = (int32_t)new_idx;
+    DictBucket* buckets = _dict_buckets(dict);
+    buckets[bucket].idx = (int32_t)new_idx;
+    buckets[bucket].tag = tag;
     dict->len++;
     *(int64_t*)out_index = new_idx;
     return dict_ptr;
@@ -1975,7 +2136,7 @@ void rt_dict_get_at(void* dict_ptr, int64_t index, void* out) {
         memset(out, 0, (size_t)dict->value_size);
         return;
     }
-    memcpy(out, rt_dict_value_at(dict, index), (size_t)dict->value_size);
+    _rt_copy_small(out, rt_dict_value_at(dict, index), (size_t)dict->value_size);
     _dict_retain_element(dict->value_type_id, out);
 }
 
@@ -1991,7 +2152,7 @@ void rt_dict_set_at(void* dict_ptr, int64_t index, const void* value) {
     }
     unsigned char* slot = rt_dict_value_at(dict, index);
     _dict_release_element(dict->value_type_id, slot);
-    memcpy(slot, value, (size_t)dict->value_size);
+    _rt_copy_small(slot, value, (size_t)dict->value_size);
     _dict_retain_element(dict->value_type_id, slot);
 }
 
@@ -2337,30 +2498,22 @@ void rt_task_destroy(TaskHandle* handle) {
  */
 void rt_task_yield(void) {
     /*
-     * Cooperative yield:
-     *   1. Push the currently-running task back onto the queue (if it's
-     *      still alive — a yield right before completion shouldn't requeue
-     *      the corpse).
-     *   2. Pop the next ready task and run one slice of it.
-     *   3. If that task did not complete in its slice, push it back so it
-     *      gets another turn next time. Without this, child tasks spawned
-     *      by a parent get dropped after their first resume slice and
-     *      whoever was waiting on `handle->result` reads garbage.
+     * Cooperative yield point. Generated state machines call this right
+     * before saving their state and RETURNING to whatever driver loop is
+     * running them (rt_task_join, rt_scheduler_run, or rt_scheduler_run's
+     * push-back path). EVERY driver re-queues a popped task whose resume
+     * returned incomplete, so the task is always rescheduled by its driver.
+     *
+     * This function must therefore NOT push the current task itself: doing
+     * so double-queues the task (once here, once by the driver). The second
+     * queue entry outlives the task — after the awaiter joins, takes the
+     * result, and destroys the handle, the stale entry is popped and its
+     * freed memory is interpreted as a TaskHandle, calling a garbage
+     * resume_fn (observed as SIGBUS in nested-async programs on macOS).
+     * It must not run a nested slice of another task either, for the same
+     * reason: the driver loop right above is about to do exactly that.
      */
-    if (current_task != NULL && !current_task->completed) {
-        task_queue_push(current_task);
-    }
-
-    TaskHandle* next = task_queue_pop();
-    if (next != NULL && !next->completed) {
-        TaskHandle* prev = current_task;
-        current_task = next;
-        next->resume_fn(next->frame);
-        current_task = prev;
-        if (!next->completed) {
-            task_queue_push(next);
-        }
-    }
+    (void)current_task;
 }
 
 /**
@@ -3067,7 +3220,7 @@ void rt_gvec_get(void* vec, int32_t index, void* out) {
     }
     unsigned char* data = (unsigned char*)(h + 1);
     void* slot = data + (size_t)index * (size_t)h->elem_size;
-    memcpy(out, slot, (size_t)h->elem_size);
+    _rt_copy_small(out, slot, (size_t)h->elem_size);
     /* Retain heap-typed elements for the caller. The vec still owns the
      * slot, so the caller's `out` becomes a fresh strong reference. Without
      * this, dropping `out` would call rt_obj_release on a slot the vec

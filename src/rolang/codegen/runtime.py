@@ -23,6 +23,7 @@ class RuntimeABI:
 
         # Common types
         self.i8 = ir.IntType(8)
+        self.i32 = ir.IntType(32)
         self.i64 = ir.IntType(64)
         self.void = ir.VoidType()
         self.ptr = ir.PointerType(self.i8)
@@ -198,6 +199,13 @@ class RuntimeABI:
         obj_alloc_type = ir.FunctionType(self.ptr, [self.i64, self.i64, self.i64])
         self.rt_obj_alloc = ir.Function(self.module, obj_alloc_type, name="rt_obj_alloc")
 
+        # void* rt_obj_alloc_noinit(...) — same, but skips the payload
+        # zero-fill. Only for construction sites that store every live field
+        # immediately (MakeStruct / MakeEnum); see rolang_rt.c.
+        self.rt_obj_alloc_noinit = ir.Function(
+            self.module, obj_alloc_type, name="rt_obj_alloc_noinit"
+        )
+
         # Inlinable retain/release (replaces the extern C calls). The C
         # functions of the same name still exist for the runtime's own
         # internal use; `internal` linkage keeps these module-private.
@@ -215,6 +223,135 @@ class RuntimeABI:
         # int64_t rt_obj_alloc_count(void)
         alloc_count_type = ir.FunctionType(self.i64, [])
         self.rt_obj_alloc_count = ir.Function(self.module, alloc_count_type, name="rt_obj_alloc_count")
+
+        # Inline pool-pop allocation fast path (needs rt_gc_collect above).
+        self._declare_inline_obj_alloc_fast()
+
+    # Pool size classes (TOTAL bytes: 32B header + payload). MUST match
+    # pool_bin_sizes in runtime/rolang_rt.c — the inline fast path pops from
+    # the same free lists the C slow path pushes to, so a drifted table would
+    # mix size classes and corrupt the heap.
+    POOL_BIN_SIZES = (48, 64, 96, 128, 192, 256)
+    OBJ_HEADER_SIZE = 32
+
+    def _declare_inline_obj_alloc_fast(self) -> None:
+        """Inline pool-allocation fast path for the no-init alloc.
+
+        rt_obj_alloc_fast(payload_size, align, type_id, bin) — `bin` is a
+        compile-time constant the call site derives from POOL_BIN_SIZES.
+        Fast path (free list non-empty): pop node, write header (rc=1,
+        type_id), link into gc_object_list, bump the allocation counter, and
+        poll the cycle-GC gap — exactly what _obj_alloc_impl + gc_list_add do
+        in rolang_rt.c for a pooled, non-zeroing allocation. Falls back to
+        rt_obj_alloc_noinit when the free list is empty (OS allocation).
+
+        Links against the runtime's exported globals: pool_free_lists,
+        gc_object_list, gc_alloc_counter, gc_last_collect_count, gc_next_gap,
+        gc_running. Header offsets: rc=0, type_id=8, prev=16, next=24
+        (guarded C-side by _Static_asserts on ObjHeader).
+        """
+        # External globals from rolang_rt.c
+        pool_lists_ty = ir.ArrayType(self.ptr, len(self.POOL_BIN_SIZES))
+        self.g_pool_free_lists = ir.GlobalVariable(
+            self.module, pool_lists_ty, name="pool_free_lists")
+        self.g_gc_object_list = ir.GlobalVariable(
+            self.module, self.ptr, name="gc_object_list")
+        self.g_gc_alloc_counter = ir.GlobalVariable(
+            self.module, self.i64, name="gc_alloc_counter")
+        self.g_gc_last_collect_count = ir.GlobalVariable(
+            self.module, self.i64, name="gc_last_collect_count")
+        self.g_gc_next_gap = ir.GlobalVariable(
+            self.module, self.i64, name="gc_next_gap")
+        self.g_gc_running = ir.GlobalVariable(
+            self.module, self.i32, name="gc_running")
+
+        fnty = ir.FunctionType(self.ptr, [self.i64, self.i64, self.i64, self.i64])
+        func = ir.Function(self.module, fnty, name="rt_obj_alloc_fast")
+        func.linkage = "internal"
+        func.attributes.add("alwaysinline")
+        self.rt_obj_alloc_fast = func
+
+        payload_size, align, type_id, bin_idx = func.args
+
+        entry = func.append_basic_block(name="entry")
+        fast = func.append_basic_block(name="fast")
+        set_head_prev = func.append_basic_block(name="set_head_prev")
+        after_link = func.append_basic_block(name="after_link")
+        gc_poll = func.append_basic_block(name="gc_poll")
+        gc_run = func.append_basic_block(name="gc_run")
+        done = func.append_basic_block(name="done")
+        slow = func.append_basic_block(name="slow")
+
+        b = ir.IRBuilder(entry)
+        slot = b.gep(self.g_pool_free_lists,
+                     [ir.Constant(self.i32, 0), b.trunc(bin_idx, self.i32)],
+                     name="pool.slot")
+        node = b.load(slot, name="pool.node")
+        is_empty = b.icmp_signed(
+            "==", b.ptrtoint(node, self.i64), ir.Constant(self.i64, 0))
+        b.cbranch(is_empty, slow, fast)
+
+        # --- fast: pop free list, init header, link into GC list ---
+        b.position_at_end(fast)
+        next_slot = b.bitcast(node, ir.PointerType(self.ptr), name="pool.next.slot")
+        nxt = b.load(next_slot, name="pool.next")
+        b.store(nxt, slot)
+        # header: rc=1 (offset 0; overwrites the free-list link), type_id at 8
+        rc_ptr = b.bitcast(node, ir.PointerType(self.i64), name="hdr.rc")
+        b.store(ir.Constant(self.i64, 1), rc_ptr)
+        tid_ptr = b.bitcast(
+            b.gep(node, [ir.Constant(self.i64, 8)]), ir.PointerType(self.i64),
+            name="hdr.tid")
+        b.store(type_id, tid_ptr)
+        # gc_list_add: prev=NULL, next=head, head->prev=node, head=node
+        prev_ptr = b.bitcast(
+            b.gep(node, [ir.Constant(self.i64, 16)]), ir.PointerType(self.ptr),
+            name="hdr.prev")
+        b.store(ir.Constant(self.ptr, None), prev_ptr)
+        head = b.load(self.g_gc_object_list, name="gc.head")
+        hdr_next_ptr = b.bitcast(
+            b.gep(node, [ir.Constant(self.i64, 24)]), ir.PointerType(self.ptr),
+            name="hdr.next")
+        b.store(head, hdr_next_ptr)
+        head_null = b.icmp_signed(
+            "==", b.ptrtoint(head, self.i64), ir.Constant(self.i64, 0))
+        b.cbranch(head_null, after_link, set_head_prev)
+
+        b.position_at_end(set_head_prev)
+        head_prev_ptr = b.bitcast(
+            b.gep(head, [ir.Constant(self.i64, 16)]), ir.PointerType(self.ptr),
+            name="gc.head.prev")
+        b.store(node, head_prev_ptr)
+        b.branch(after_link)
+
+        b.position_at_end(after_link)
+        b.store(node, self.g_gc_object_list)
+        cnt = b.load(self.g_gc_alloc_counter, name="gc.cnt")
+        cnt1 = b.add(cnt, ir.Constant(self.i64, 1), name="gc.cnt1")
+        b.store(cnt1, self.g_gc_alloc_counter)
+        last = b.load(self.g_gc_last_collect_count, name="gc.last")
+        gap = b.load(self.g_gc_next_gap, name="gc.gap")
+        due = b.icmp_signed(">=", b.sub(cnt1, last), gap, name="gc.due")
+        b.cbranch(due, gc_poll, done)
+
+        # --- threshold crossed: skip while a collection is already running ---
+        b.position_at_end(gc_poll)
+        running = b.load(self.g_gc_running, name="gc.running")
+        is_running = b.icmp_signed("!=", running, ir.Constant(self.i32, 0))
+        b.cbranch(is_running, done, gc_run)
+
+        b.position_at_end(gc_run)
+        b.call(self.rt_gc_collect, [])
+        b.branch(done)
+
+        b.position_at_end(done)
+        b.ret(node)
+
+        # --- slow: pool empty (or first use) — full C path ---
+        b.position_at_end(slow)
+        result = b.call(self.rt_obj_alloc_noinit, [payload_size, align, type_id],
+                        name="obj_alloc.slow")
+        b.ret(result)
 
     def _declare_inline_obj_retain(self) -> None:
         """rc is the first header field (offset 0). retain = null-check + rc++.
@@ -322,9 +459,30 @@ class RuntimeABI:
         payload_size: ir.Value,
         align: ir.Value,
         type_id: ir.Value,
+        zero_init: bool = True,
     ) -> ir.Value:
-        """Emit a call to rt_obj_alloc."""
-        return builder.call(self.rt_obj_alloc, [payload_size, align, type_id], name="obj_alloc")
+        """Emit a call to rt_obj_alloc (or rt_obj_alloc_noinit).
+
+        Pass zero_init=False ONLY when the caller stores every live payload
+        field before the next allocation/release (MakeStruct, MakeEnum, and
+        the string-literal emission, which fills all three String fields).
+
+        No-init allocations of a compile-time-known pooled size go through
+        the inline rt_obj_alloc_fast pool pop instead of a C call.
+        """
+        if not zero_init and isinstance(payload_size, ir.Constant):
+            total = int(payload_size.constant) + self.OBJ_HEADER_SIZE
+            if total <= self.POOL_BIN_SIZES[-1]:
+                bin_idx = next(i for i, s in enumerate(self.POOL_BIN_SIZES)
+                               if total <= s)
+                return builder.call(
+                    self.rt_obj_alloc_fast,
+                    [payload_size, align, type_id,
+                     ir.Constant(self.i64, bin_idx)],
+                    name="obj_alloc",
+                )
+        fn = self.rt_obj_alloc if zero_init else self.rt_obj_alloc_noinit
+        return builder.call(fn, [payload_size, align, type_id], name="obj_alloc")
 
     def emit_obj_retain(self, builder: ir.IRBuilder, ptr: ir.Value) -> None:
         """Emit a call to rt_obj_retain. Accepts any pointer type, bitcasts to i8*."""

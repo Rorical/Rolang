@@ -33,13 +33,20 @@ pub extern "C" def rt_string_to_f64(s: String) -> f64;
 pub struct String {
     var data: RawPtr;
     var length: i64;
+    // Lazily memoized content hash, written by the runtime dict the first
+    // time this string is used as a key (0 = not yet computed). String
+    // contents are immutable after construction, so the cache never goes
+    // stale. Field order matters: the C runtime reads {data, length, hash}
+    // at payload offsets 0/8/16 (StringPayload in rolang_rt.c), and the
+    // string-literal emission in codegen/ops_memory.py bakes the same layout.
+    var hash_cache: i64;
 
     pub unsafe static def from_handle(handle: RawPtr) -> String {
         unsafe {
             let data = rt_string_handle_data(handle);
             let len = rt_string_handle_len(handle);
             rt_string_free_handle_only(handle);
-            return String { data: data, length: len };
+            return String { data: data, length: len, hash_cache: 0 };
         }
     }
 

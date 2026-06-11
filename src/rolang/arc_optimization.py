@@ -268,49 +268,80 @@ class ArcOptimizer:
             self.stats.total_retains_after = retains
             self.stats.total_releases_after = releases
 
+    # Ops that can sit between a Retain(x) and Release(x) without invalidating
+    # pair cancellation. The requirement is "cannot decrement ANY refcount and
+    # cannot free memory": plain data movement and arithmetic qualify; calls
+    # (the callee may release aliases of x), Release of any local (its teardown
+    # may transitively release x), Retain (overlapping pairs), and allocating
+    # ops (cycle-GC trigger point) do not. A raw Store never releases — ARC
+    # emits explicit Release ops for overwritten heap slots.
+    _PAIR_WINDOW_SAFE_OPS = (Assign, Load, Store, BinOp, CmpOp, UnaryOp,
+                             CastOp, GetTag)
+    _PAIR_WINDOW_LIMIT = 8
+
     def _eliminate_adjacent_pairs(
         self,
         func: MirFunction,
         ref_locals: Dict[LocalId, LocalInfo],
     ) -> MirFunction:
         """
-        Eliminate adjacent retain/release pairs on the same local.
+        Eliminate retain/release pairs on the same local separated only by
+        ops that cannot change any reference count.
 
-        Pattern:
-            retain _5
-            release _5
+        Pattern (ownership transfer through a temp — every `let y = f()`
+        binding lowers to it):
+            _t = call f()
+            retain _t          ; +1 for the copy into y
+            y = _t
+            release _t         ; temp dies
         ->
-            (removed)
+            _t = call f()
+            y = _t             ; the call's +1 transfers to y
+
+        The window between the pair must not contain calls, other ARC ops,
+        allocations, or a redefinition of the local (locals are mutable
+        slots, so a redefined local names a different value).
         """
         new_blocks: Dict[BlockId, Block] = {}
 
         for block_id, block in func.blocks.items():
-            new_ops: List[Op] = []
-            skip_next = False
+            ops = block.ops
+            to_remove: Set[int] = set()
 
-            for i, op in enumerate(block.ops):
-                if skip_next:
-                    skip_next = False
+            for i, op in enumerate(ops):
+                if i in to_remove or not isinstance(op, Retain):
+                    continue
+                local = self._get_operand_local(op.operand)
+                if local is None:
                     continue
 
-                # Check for adjacent retain/release pair
-                if isinstance(op, Retain) and i + 1 < len(block.ops):
-                    next_op = block.ops[i + 1]
-                    if isinstance(next_op, Release):
-                        retain_local = self._get_operand_local(op.operand)
-                        release_local = self._get_operand_local(next_op.operand)
-                        if retain_local is not None and retain_local == release_local:
-                            # Skip both operations
-                            skip_next = True
+                j = i + 1
+                scanned = 0
+                while j < len(ops) and scanned <= self._PAIR_WINDOW_LIMIT:
+                    nxt = ops[j]
+                    if j in to_remove:
+                        # Already-cancelled ARC op: it will not execute, so it
+                        # is transparent for this window.
+                        j += 1
+                        continue
+                    if isinstance(nxt, Release):
+                        if self._get_operand_local(nxt.operand) == local:
+                            to_remove.add(i)
+                            to_remove.add(j)
                             self.stats.adjacent_pairs_removed += 1
-                            continue
+                        # Any other Release could transitively free `local`'s
+                        # object once the pair is gone — stop either way.
+                        break
+                    if isinstance(nxt, Retain):
+                        break
+                    if not isinstance(nxt, self._PAIR_WINDOW_SAFE_OPS):
+                        break
+                    if self._def_in_op(nxt) == local:
+                        break
+                    j += 1
+                    scanned += 1
 
-                # NOTE: Release(X); Retain(X) is NOT safe to cancel: if the
-                # release is the final reference, it frees the object; the
-                # immediately following retain would then read a freed pointer.
-                # Only Retain(X); Release(X) is safe to cancel.
-
-                new_ops.append(op)
+            new_ops = [op for k, op in enumerate(ops) if k not in to_remove]
 
             new_blocks[block_id] = Block(
                 id=block.id,
