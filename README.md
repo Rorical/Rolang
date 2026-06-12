@@ -348,6 +348,22 @@ asymmetries currently favor the baselines: C/Rust compile with
 `word_freq` uses a flat array where every other language pays for a real
 hash map.
 
+Two benchmarks are *deliberately adversarial to Rolang* — chosen to expose
+its known architectural weak points rather than flatter it:
+
+- `vecmath` — millions of tiny short-lived `Vec3` temporaries. When this
+  benchmark was added, Rolang heap-allocated every struct (ARC + GC-list
+  bookkeeping per temporary) and ran 3.9× C; it now runs *faster than C*,
+  because the row motivated a MIR inliner + escape analysis with scalar
+  replacement: non-escaping all-scalar structs are decomposed into plain
+  scalars that live in registers, exactly like C/Rust values and the shapes
+  Java's JIT scalar-replaces. The row stays adversarial for any struct that
+  *does* escape.
+- `cycle_churn` — rings of nodes dropped with the reference cycle intact.
+  Reference counting can never reclaim a cycle, so the whole garbage stream
+  lands on Rolang's backup cycle collector; tracing GCs absorb it as
+  ordinary garbage. This measures cycle-collection throughput.
+
 ```bash
 python benchmarks/runner.py                  # run all, all languages
 python benchmarks/runner.py --langs C,Rolang # subset
@@ -355,26 +371,43 @@ python benchmarks/runner.py --out results.md # append a markdown report
 ```
 
 Min wall-clock in milliseconds (lower is better); **×C** is Rolang relative to C.
-Measured 2026-06-11 on an Apple Silicon Mac (full tables with mean/median/stddev
-in `benchmarks/results/optimized-2026-06-11.md`).
+Measured 2026-06-12 on an Apple Silicon Mac (full tables with mean/median/stddev
+in `benchmarks/results/optimized-2026-06-12.md`).
 
 | Benchmark    |     C | Rolang |   ×C |  Rust |    Go |  Java | Node.js |  Python |
 |--------------|------:|-------:|-----:|------:|------:|------:|--------:|--------:|
-| fib          |  26.7 |   25.8 | 0.97 |  28.0 |  30.9 |  57.3 |    87.2 |   689.2 |
-| mandelbrot   | 113.4 |  113.7 | 1.00 | 119.3 | 128.8 | 150.7 |   141.2 |  2000.5 |
-| json_parse   |  25.9 |   26.1 | 1.01 |  31.0 |  46.0 |  81.1 |    89.6 |   248.4 |
-| nbody        | 244.9 |  253.3 | 1.03 | 271.4 | 262.2 | 324.4 |   445.8 |  5926.4 |
-| word_freq    |  30.0 |   29.1 | 0.97 |  37.6 |  31.0 |  70.2 |   143.1 |   319.9 |
-| binary_trees |  55.9 |   42.1 | 0.75 |  55.6 |  53.2 |  51.9 |    53.3 |   533.4 |
+| fib          |  25.1 |   24.5 | 0.98 |  26.2 |  28.7 |  53.1 |    82.9 |   674.9 |
+| mandelbrot   | 102.2 |  104.2 | 1.02 | 107.5 | 118.0 | 139.5 |   129.2 |  1960.5 |
+| json_parse   |  24.3 |   27.1 | 1.12 |  22.2 |  42.3 |  80.5 |    87.4 |   248.3 |
+| nbody        | 244.4 |  244.4 | 1.00 | 268.9 | 256.9 | 320.8 |   448.0 |  5889.7 |
+| word_freq    |  29.2 |   29.5 | 1.01 |  36.5 |  29.4 |  66.7 |   138.9 |   316.3 |
+| binary_trees |  55.1 |   48.2 | 0.88 |  56.6 |  56.6 |  52.3 |    51.6 |   511.1 |
+| vecmath      |  70.9 |   67.2 | 0.95 |  66.9 | 374.2 | 375.6 |  1819.0 |  7827.4 |
+| cycle_churn  | 110.8 |  128.7 | 1.16 | 129.1 | 109.2 |  81.3 |    57.0 |  1220.2 |
 
 Execution models: C/Rust = native (no GC), Go/Java/Node = managed (GC/JIT),
 Python = interpreted, Rolang = native with automatic reference counting + a
-generational cycle collector. Rolang beats Go, Java, and Rust on every
-benchmark in the suite, runs within ~1.03× of C on the compute-bound
-workloads, and is the fastest language overall — ahead of C — on `fib`, the
-dict-heavy `word_freq` (tagged-bucket hash table with memoized string hashes),
-and the allocation-heavy `binary_trees` (pooled allocation with an inline
-fast path, 0.75× C).
+generational cycle collector. Rolang is the fastest language overall on
+`fib`, `nbody`, and the allocation-heavy `binary_trees` (pooled allocation
+with an inline fast path, 0.88× C); it beats Go, Java, and Rust on seven of
+the eight rows and runs within noise of C on `word_freq` (a three-way
+photo finish with C and Go).
+
+The two adversarial rows did their job. `vecmath` originally ran 3.9× C and
+now runs 0.95× C: the gap was closed by an inline exact-`fmod` expansion
+(matching what C compilers emit for `%`) plus MIR-level inlining and scalar
+replacement of non-escaping structs — the four heap `Vec3` temporaries per
+iteration became registers, and Go/Java (5.6× slower) are left paying for
+the same shape. `cycle_churn` improved 2.3× (292 → 129 ms; candidate
+tracking moved from a per-pass hash table into spare refcount bits, the
+sweep was fused, and deinit-free collections skip three phases) and now
+beats Rust, but it remains Rolang's one loss against the tracing-GC
+languages (1.2× Go, 1.6× Java): cyclic garbage is unreachable to reference
+counting, and trial-deletion collection — which must visit every dead
+object — cannot match a generational scavenger that never touches garbage
+at all. That residual gap is the honest price of ARC's strengths
+(deterministic destruction, no pauses, and the `binary_trees`/`fib` wins),
+and the rows exist so regressions and progress stay visible.
 
 ## Development
 

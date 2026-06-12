@@ -32,6 +32,8 @@ TIMEOUT_JSON = 120
 TIMEOUT_BINARY_TREES = 120
 TIMEOUT_NBODY = 120
 TIMEOUT_WORD_FREQ = 60
+TIMEOUT_VECMATH = 300
+TIMEOUT_CYCLE_CHURN = 300
 
 EXPECTED_FIB = "9227465"
 # Memory/compute-heavy benchmarks (added Batch 2). Expected values are tied to the
@@ -40,6 +42,12 @@ EXPECTED_FIB = "9227465"
 EXPECTED_BINARY_TREES = "3222190"
 EXPECTED_NBODY = "2446731634"
 EXPECTED_WORD_FREQ = "5308871524000000"
+# Adversarial variants (see the fairness contract in the README): vecmath
+# stresses small-object temporaries (T=8M, all-integer-valued f64 so the
+# output is exact and FMA-insensitive); cycle_churn stresses cyclic-garbage
+# reclamation (R=150000 rings of K=64 nodes; closed form K*R*(R-1)/2 + R*K*(K-1)/2).
+EXPECTED_VECMATH = "5619712"
+EXPECTED_CYCLE_CHURN = "720297600000"
 
 
 @dataclass
@@ -233,6 +241,8 @@ BENCH_SOURCE_NAMES = {
     ("binary_trees", "Java"): "BinaryTrees",
     ("nbody", "Java"): "Nbody",
     ("word_freq", "Java"): "WordFreq",
+    ("vecmath", "Java"): "VecMath",
+    ("cycle_churn", "Java"): "CycleChurn",
 }
 
 
@@ -250,6 +260,7 @@ def run_benchmark(
     timeout = {
         "fib": TIMEOUT_FIB, "mandelbrot": TIMEOUT_MANDEL, "json_parse": TIMEOUT_JSON,
         "binary_trees": TIMEOUT_BINARY_TREES, "nbody": TIMEOUT_NBODY, "word_freq": TIMEOUT_WORD_FREQ,
+        "vecmath": TIMEOUT_VECMATH, "cycle_churn": TIMEOUT_CYCLE_CHURN,
     }[bench_name]
     results: list[BenchmarkResult] = []
     active_langs = langs if langs is not None else LANGS
@@ -407,6 +418,7 @@ def main():
         ("fib", EXPECTED_FIB), ("mandelbrot", None), ("json_parse", None),
         ("binary_trees", EXPECTED_BINARY_TREES), ("nbody", EXPECTED_NBODY),
         ("word_freq", EXPECTED_WORD_FREQ),
+        ("vecmath", EXPECTED_VECMATH), ("cycle_churn", EXPECTED_CYCLE_CHURN),
     ]:
         results = run_benchmark(bench_name, verify, langs=active_langs, warmup=effective_warmup, runs=effective_runs)
         all_results[bench_name] = results

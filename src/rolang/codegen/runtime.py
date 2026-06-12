@@ -34,6 +34,7 @@ class RuntimeABI:
         self._declare_obj_functions()        # typed object system
         self._declare_collection_functions()
         self._declare_string_functions()
+        self._declare_inline_frem_f64()
 
     def _declare_string_functions(self) -> None:
         """Declare runtime helpers used by compiler-emitted string literals."""
@@ -145,6 +146,89 @@ class RuntimeABI:
             result = builder.zext(cond, self.i32, name="result")
             builder.ret(result)
 
+    def _declare_inline_frem_f64(self) -> None:
+        """Emit an internal alwaysinline exact-fmod fast path for f64 `%`.
+
+        A plain `frem` lowers to a libm `fmod` call on AArch64/x86-64. The
+        fast path computes r = fma(-trunc(a/b), b, a): when trunc(a/b) is the
+        true integral quotient, a - t*b is the exactly-representable fmod
+        value and the fused multiply-add returns it exactly. The guards
+        reject every case where that does not hold — |a/b| >= 2^52 (trunc(q)
+        may differ from the true quotient by more than one), zero results
+        (libm fmod preserves the sign of `a`), wrong-sign or out-of-range
+        results (off-by-one rounded quotient), and NaN/inf operands — and
+        fall back to libm, so the operator stays bit-exact IEEE fmod on
+        every input.
+        """
+        f64 = ir.DoubleType()
+        fnty = ir.FunctionType(f64, [f64, f64])
+
+        def get_fn(name: str, ty: ir.FunctionType) -> ir.Function:
+            fn = self.module.globals.get(name)
+            if fn is None:
+                fn = ir.Function(self.module, ty, name=name)
+            return fn
+
+        fmod_lib = get_fn("fmod", fnty)
+        fabs = get_fn("llvm.fabs.f64", ir.FunctionType(f64, [f64]))
+        ftrunc = get_fn("llvm.trunc.f64", ir.FunctionType(f64, [f64]))
+        fma = get_fn("llvm.fma.f64", ir.FunctionType(f64, [f64, f64, f64]))
+
+        func = ir.Function(self.module, fnty, name="rt_frem_f64")
+        func.linkage = "internal"
+        func.attributes.add("alwaysinline")
+
+        entry = func.append_basic_block(name="entry")
+        fast = func.append_basic_block(name="fast")
+        slow = func.append_basic_block(name="slow")
+        join = func.append_basic_block(name="join")
+
+        builder = ir.IRBuilder(entry)
+        a, b = func.args
+        q = builder.fdiv(a, b, name="q")
+        qabs = builder.call(fabs, [q], name="qabs")
+        # Ordered < is false when q is NaN (NaN/inf operands, b == 0),
+        # routing those to libm too.
+        small = builder.fcmp_ordered(
+            "<", qabs, ir.Constant(f64, 2.0 ** 52), name="q.small"
+        )
+        builder.cbranch(small, fast, slow)
+
+        builder.position_at_end(fast)
+        t = builder.call(ftrunc, [q], name="t")
+        nt = builder.fneg(t, name="nt")
+        r = builder.call(fma, [nt, b, a], name="r")
+        rabs = builder.call(fabs, [r], name="rabs")
+        babs = builder.call(fabs, [b], name="babs")
+        in_range = builder.fcmp_ordered("<", rabs, babs, name="r.inrange")
+        nonzero = builder.fcmp_ordered(
+            "!=", r, ir.Constant(f64, 0.0), name="r.nonzero"
+        )
+        r_bits = builder.bitcast(r, self.i64, name="r.bits")
+        a_bits = builder.bitcast(a, self.i64, name="a.bits")
+        sign_xor = builder.xor(r_bits, a_bits, name="sign.xor")
+        same_sign = builder.icmp_signed(
+            ">=", sign_xor, ir.Constant(self.i64, 0), name="r.samesign"
+        )
+        ok = builder.and_(
+            builder.and_(in_range, nonzero), same_sign, name="r.ok"
+        )
+        fast_end = builder.block
+        builder.cbranch(ok, join, slow)
+
+        builder.position_at_end(slow)
+        lr = builder.call(fmod_lib, [a, b], name="r.libm")
+        slow_end = builder.block
+        builder.branch(join)
+
+        builder.position_at_end(join)
+        phi = builder.phi(f64, name="fmod")
+        phi.add_incoming(r, fast_end)
+        phi.add_incoming(lr, slow_end)
+        builder.ret(phi)
+
+        self.rt_frem_f64 = func
+
     def _declare_panic_functions(self) -> None:
         """Declare runtime panic / trap helpers used by codegen-emitted checks."""
         # void rt_panic_divide_by_zero(void) — noreturn
@@ -241,9 +325,10 @@ class RuntimeABI:
         compile-time constant the call site derives from POOL_BIN_SIZES.
         Fast path (free list non-empty): pop node, write header (rc=1,
         type_id), link into gc_object_list, bump the allocation counter, and
-        poll the cycle-GC gap — exactly what _obj_alloc_impl + gc_list_add do
-        in rolang_rt.c for a pooled, non-zeroing allocation. Falls back to
-        rt_obj_alloc_noinit when the free list is empty (OS allocation).
+        poll the cycle-GC threshold — exactly what _obj_alloc_impl +
+        gc_list_add do in rolang_rt.c for a pooled, non-zeroing allocation.
+        The collector skips the list head (= this not-yet-stored object).
+        Falls back to rt_obj_alloc_noinit when the free list is empty.
 
         Links against the runtime's exported globals: pool_free_lists,
         gc_object_list, gc_alloc_counter, gc_last_collect_count, gc_next_gap,
@@ -258,10 +343,8 @@ class RuntimeABI:
             self.module, self.ptr, name="gc_object_list")
         self.g_gc_alloc_counter = ir.GlobalVariable(
             self.module, self.i64, name="gc_alloc_counter")
-        self.g_gc_last_collect_count = ir.GlobalVariable(
-            self.module, self.i64, name="gc_last_collect_count")
-        self.g_gc_next_gap = ir.GlobalVariable(
-            self.module, self.i64, name="gc_next_gap")
+        self.g_gc_trigger_at = ir.GlobalVariable(
+            self.module, self.i64, name="gc_trigger_at")
         self.g_gc_running = ir.GlobalVariable(
             self.module, self.i32, name="gc_running")
 
@@ -329,9 +412,11 @@ class RuntimeABI:
         cnt = b.load(self.g_gc_alloc_counter, name="gc.cnt")
         cnt1 = b.add(cnt, ir.Constant(self.i64, 1), name="gc.cnt1")
         b.store(cnt1, self.g_gc_alloc_counter)
-        last = b.load(self.g_gc_last_collect_count, name="gc.last")
-        gap = b.load(self.g_gc_next_gap, name="gc.gap")
-        due = b.icmp_signed(">=", b.sub(cnt1, last), gap, name="gc.due")
+        # Post-link GC poll. The just-linked `node` is the list head; the
+        # collector skips the head so its stale (noinit) payload is never
+        # walked — mirrors _obj_alloc_impl in rolang_rt.c.
+        trigger_at = b.load(self.g_gc_trigger_at, name="gc.trigger_at")
+        due = b.icmp_signed(">=", cnt1, trigger_at, name="gc.due")
         b.cbranch(due, gc_poll, done)
 
         # --- threshold crossed: skip while a collection is already running ---
@@ -347,7 +432,8 @@ class RuntimeABI:
         b.position_at_end(done)
         b.ret(node)
 
-        # --- slow: pool empty (or first use) — full C path ---
+        # --- slow: pool empty (or first use) — full C path. Its own GC poll
+        # re-checks a freshly reset clock, so no double collection occurs. ---
         b.position_at_end(slow)
         result = b.call(self.rt_obj_alloc_noinit, [payload_size, align, type_id],
                         name="obj_alloc.slow")

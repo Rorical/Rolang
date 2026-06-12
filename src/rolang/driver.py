@@ -26,6 +26,7 @@ from .mir_builder import build_mir
 from .mir_outparam_init import elide_outparam_default_init
 from .async_lowering import lower_async
 from .arc_insertion import insert_arc
+from .mir_optimize import optimize_mir
 from .codegen import compile_to_llvm, compile_to_object
 from .mir import format_program as format_mir
 from .diagnostics import DiagnosticCollector
@@ -733,6 +734,14 @@ class CompilationDriver:
                 frame_structs=async_result.frame_structs,
                 errors=[],
             )
+
+        # MIR-level optimizations: inline small straight-line functions, then
+        # scalar-replace non-escaping all-scalar structs (SROA). Must run
+        # BEFORE ARC insertion — scalarized struct locals then simply never
+        # receive retain/release ops or a heap allocation.
+        if self.options.opt_level.value >= 2:
+            r.run("Optimizing MIR", optimize_mir,
+                  mir_result.program, mir_result.type_table)
 
         # Insert ARC operations
         # Enable optimization for -O1 and above

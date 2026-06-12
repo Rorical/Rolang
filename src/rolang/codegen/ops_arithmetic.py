@@ -67,7 +67,14 @@ class OpsArithmeticMixin:
 
             case BinOpKind.MOD:
                 if is_float:
-                    result = self.builder.frem(left, right, name="fmod")
+                    if isinstance(left.type, ir.DoubleType):
+                        # Inline guarded fmod expansion (exact; falls back to
+                        # libm for the cases the fast path cannot prove).
+                        result = self.builder.call(
+                            self.runtime.rt_frem_f64, [left, right], name="fmod"
+                        )
+                    else:
+                        result = self.builder.frem(left, right, name="fmod")
                 else:
                     self._emit_div_zero_guard(right, is_remainder=True)
                     if is_signed:

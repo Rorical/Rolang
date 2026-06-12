@@ -473,6 +473,10 @@ static int64_t gc_cycle_count = 0;
 #define GC_MAX_GAP   2000000
 #define GC_GROWTH    2
 int64_t gc_next_gap = GC_MIN_GAP;      /* non-static: inline alloc fast path */
+/* Precomputed trigger threshold: gc_last_collect_count + gc_next_gap. The
+ * per-allocation poll is then one load + one compare against the counter.
+ * Every site that updates the clock or the gap must refresh it. */
+int64_t gc_trigger_at = GC_MIN_GAP;    /* non-static: inline alloc fast path */
 
 /* ---- GC list lock helpers ---- */
 
@@ -622,14 +626,19 @@ static inline void* _obj_alloc_impl(int64_t payload_size, int64_t align,
      * instead of polling before every statement in codegen. A reference cycle
      * can only be created by allocating a new heap object, so this is the only
      * point a check could ever fire — which lets non-allocating hot loops run
-     * with zero GC overhead. The new object is fully initialized (rc=1, pointer
-     * fields zeroed — or about to be fully stored by a noinit caller before
-     * any allocation or release can run) and gc_list_add has released the list
-     * lock, so this is a safe collection point. Inline the threshold test so
-     * the common (no-collect) case stays a load+compare, not a call; skip
-     * entirely while a collection is already running (a deinit-triggered
-     * allocation). */
-    if (!gc_running && gc_alloc_counter - gc_last_collect_count >= gc_next_gap) {
+     * with zero GC overhead.
+     *
+     * The new object `h` is at this point the GC-list HEAD and, for a noinit
+     * allocation, its payload still holds stale pool bytes — the caller's
+     * field stores run only after we return. rt_gc_collect therefore SKIPS
+     * the list head (see Step 1 there): the collector must never interpret
+     * those stale bytes as pointer fields. Every OTHER listed object is
+     * fully constructed (field stores are straight-line code right after
+     * their allocation; there is no allocation, release, or suspension
+     * point in between). The threshold test is inlined so the common case
+     * stays a load+compare; skip entirely while a collection is already
+     * running (a deinit-triggered allocation). */
+    if (!gc_running && gc_alloc_counter >= gc_trigger_at) {
         rt_gc_collect();
     }
 
@@ -942,42 +951,40 @@ void* rt_obj_clone(void* ptr) {
 typedef struct {
     ObjHeader* obj;
     int64_t   saved_rc;       /* Original rc before trial deletion */
-    int32_t   reachable;      /* Reachable from an externally-referenced candidate */
     int32_t   collected;      /* 1 if marked for collection */
+    int32_t   _pad;
 } GCCandidate;
+
+/* During a collection, candidate membership and reachability are tracked as
+ * high bits stashed directly in each candidate's rc field, replacing the
+ * previous pointer->index hash table: a membership test becomes one load+mask
+ * on memory the collector touches anyway (no hashing, no probe chain, and no
+ * table to memset every pass). The low 61 bits remain the trial refcount —
+ * real refcounts can never approach 2^61, so the bits are unambiguous.
+ * Survivors get their exact rc restored from saved_rc (clearing both bits);
+ * collected objects carry their bits until pinned (deinit path) or freed. */
+#define GC_CAND_BIT      ((int64_t)1 << 62)
+#define GC_REACH_BIT     ((int64_t)1 << 61)
+#define GC_RC_VALUE_MASK (GC_REACH_BIT - 1)
 
 #define GC_INITIAL_CAPACITY 4096
 
 static GCCandidate* gc_candidates = NULL;
 static int32_t gc_candidates_capacity = 0;
 static int32_t gc_candidate_count = 0;
-static int32_t* gc_worklist = NULL;
+static ObjHeader** gc_worklist = NULL;
 static int32_t gc_worklist_capacity = 0;
 
-/*
- * Open-addressing pointer->index hash table for GC. Sized at 2 * candidate
- * capacity (power of two) so load factor stays under 0.5.
- */
-static int32_t* gc_index_table = NULL;
-static int32_t gc_index_capacity = 0;
-
-static size_t gc_next_pow2(size_t v) {
-    if (v < 2) return 2;
-    v--;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-#if SIZE_MAX > 0xFFFFFFFFULL
-    v |= v >> 32;
-#endif
-    return v + 1;
-}
+/* Survivor count at the end of the previous pass. Approximates the live
+ * count of the old (tenured) region so a minor pass can derive a total live
+ * figure for gap adaptation without walking the old region. Old objects
+ * freed by refcounting between passes make this stale-high, which only
+ * inflates the next gap slightly; every major pass recomputes it exactly. */
+static int64_t gc_old_live_count = 0;
 
 static int gc_buffers_ensure(int32_t needed) {
-    /* Ensure the candidate / worklist / hash-table buffers can hold at
-     * least `needed` candidates. Returns 0 on success, -1 on alloc fail. */
+    /* Ensure the candidate / worklist buffers can hold at least `needed`
+     * candidates. Returns 0 on success, -1 on alloc fail. */
     if (gc_candidates_capacity >= needed && gc_candidates != NULL) {
         return 0;
     }
@@ -994,60 +1001,12 @@ static int gc_buffers_ensure(int32_t needed) {
     if (nc == NULL) return -1;
     gc_candidates = nc;
 
-    int32_t* nw = (int32_t*)realloc(gc_worklist, (size_t)new_cap * sizeof(int32_t));
+    ObjHeader** nw = (ObjHeader**)realloc(gc_worklist, (size_t)new_cap * sizeof(ObjHeader*));
     if (nw == NULL) return -1;
     gc_worklist = nw;
     gc_worklist_capacity = new_cap;
-
-    size_t idx_cap_sz = gc_next_pow2((size_t)new_cap * 2);
-    if (idx_cap_sz > (size_t)INT32_MAX) idx_cap_sz = (size_t)INT32_MAX;
-    int32_t idx_cap = (int32_t)idx_cap_sz;
-    int32_t* nidx = (int32_t*)realloc(gc_index_table, (size_t)idx_cap * sizeof(int32_t));
-    if (nidx == NULL) return -1;
-    gc_index_table = nidx;
-    gc_index_capacity = idx_cap;
     gc_candidates_capacity = new_cap;
     return 0;
-}
-
-static void gc_index_reset(void) {
-    /* memset to all-ones gives -1 for every int32_t slot. */
-    if (gc_index_table != NULL && gc_index_capacity > 0) {
-        memset(gc_index_table, 0xFF, (size_t)gc_index_capacity * sizeof(int32_t));
-    }
-}
-
-static inline size_t gc_index_hash(const void* p) {
-    /* Cheap mixer; pointers are usually 8-byte aligned, so shift first. */
-    uintptr_t x = (uintptr_t)p >> 3;
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    return (size_t)x & (size_t)(gc_index_capacity - 1);
-}
-
-static void gc_index_insert(ObjHeader* obj, int32_t idx) {
-    size_t h = gc_index_hash(obj);
-    size_t mask = (size_t)(gc_index_capacity - 1);
-    for (;;) {
-        if (gc_index_table[h] == -1) {
-            gc_index_table[h] = idx;
-            return;
-        }
-        h = (h + 1) & mask;
-    }
-}
-
-static int32_t gc_index_lookup(const void* p) {
-    if (p == NULL || gc_index_table == NULL) return -1;
-    size_t h = gc_index_hash(p);
-    size_t mask = (size_t)(gc_index_capacity - 1);
-    for (;;) {
-        int32_t idx = gc_index_table[h];
-        if (idx == -1) return -1;
-        if ((void*)gc_candidates[idx].obj == p) return idx;
-        h = (h + 1) & mask;
-    }
 }
 
 /* ---- GC trace callbacks ----
@@ -1061,19 +1020,20 @@ static int32_t gc_index_lookup(const void* p) {
  */
 static void gc_subtract_cb(void* target, void* ctx) {
     (void)ctx;
-    int32_t target_idx = gc_index_lookup(target);
-    if (target_idx >= 0 && !gc_candidates[target_idx].collected) {
-        gc_candidates[target_idx].obj->rc--;
+    if (target == NULL) return;
+    ObjHeader* th = OBJ_HEADER(target);
+    if (th->rc & GC_CAND_BIT) {
+        th->rc--;
     }
 }
 
 static void gc_mark_cb(void* target, void* ctx) {
     int32_t* work_count_p = (int32_t*)ctx;
-    if (work_count_p == NULL) return;
-    int32_t target_idx = gc_index_lookup(target);
-    if (target_idx >= 0 && !gc_candidates[target_idx].reachable) {
-        gc_candidates[target_idx].reachable = 1;
-        gc_worklist[(*work_count_p)++] = target_idx;
+    if (work_count_p == NULL || target == NULL) return;
+    ObjHeader* th = OBJ_HEADER(target);
+    if ((th->rc & GC_CAND_BIT) && !(th->rc & GC_REACH_BIT)) {
+        th->rc |= GC_REACH_BIT;
+        gc_worklist[(*work_count_p)++] = th;
     }
 }
 
@@ -1148,37 +1108,53 @@ void rt_gc_collect(void) {
     ObjHeader* scan_end = is_major ? NULL : gc_old_head;
     gc_old_head = NULL;
 
-    /* Step 1: Build candidate set from the scanned region (young for a minor,
-     * all for a major) plus the object-pointer -> candidate-index hash table so
-     * step 2 and step 5b do O(1) lookups. Buffers grow dynamically.
-     * live_count counts the WHOLE live set (cheap rc>0 walk) so buffer sizing
-     * and the adaptive-gap cadence are unchanged; only the expensive
-     * candidate-building below is bounded to the young region for a minor. */
-    int32_t live_count = 0;
-    for (ObjHeader* o = gc_object_list; o != NULL; o = o->next) {
-        if (o->rc > 0) live_count++;
-    }
-    if (live_count == 0) {
-        gc_candidate_count = 0;
-        gc_old_head = gc_object_list;   /* tenure: nothing young to collect */
-        gc_running = 0;
-        atomic_flag_clear_explicit(&gc_list_lock, memory_order_release);
-        return;
-    }
-    if (gc_buffers_ensure(live_count) != 0) {
-        /* Out of memory growing the candidate buffer. Conservatively skip
-         * this collection — better to leak a cycle than abort the program. */
+    /* Step 1: Build the candidate set from the scanned region (young for a
+     * minor, all for a major) in ONE walk, tagging each candidate's rc with
+     * GC_CAND_BIT and counting the region's live objects as we go. The old
+     * region's live count is carried over from the previous pass's survivor
+     * count (gc_old_live_count), so no separate whole-list walk is needed.
+     * Buffers grow on demand mid-walk; on allocation failure we proceed with
+     * the partial candidate set — trial deletion over a subset treats refs
+     * from outside the subset as external, so it under-collects at worst. */
+    if (gc_buffers_ensure(GC_INITIAL_CAPACITY) != 0) {
+        /* Out of memory creating the candidate buffer. Conservatively skip
+         * this collection — better to leak a cycle than abort the program.
+         * Restart the allocation clock: otherwise the trigger condition
+         * stays permanently true and EVERY subsequent allocation re-enters
+         * the collector (observed as a ~180x slowdown on allocation-heavy
+         * acyclic workloads). */
         gc_old_head = gc_object_list;
+        gc_last_collect_count = gc_alloc_counter;
+        gc_trigger_at = gc_alloc_counter + gc_next_gap;
         gc_running = 0;
         atomic_flag_clear_explicit(&gc_list_lock, memory_order_release);
         return;
     }
 
     gc_candidate_count = 0;
-    gc_index_reset();
+    /* Whether ANY candidate's type declares a `deinit`. Collected objects are
+     * always a subset of the candidates, so when this stays 0 the sweep can
+     * skip the pin / deinit / resurrection phases and the defensive
+     * field-nulling walk entirely (see Step 6). */
+    int any_deinit = 0;
+    int64_t young_live = 0;
     ObjHeader* obj = gc_object_list;
-    while (obj != scan_end && gc_candidate_count < gc_candidates_capacity) {
+    /* SKIP the list head. The allocation-site trigger fires right after
+     * gc_list_add, so the head is the object being allocated RIGHT NOW: for
+     * a noinit allocation its payload is stale pool bytes (the caller's
+     * field stores have not run yet), and the collector must never read
+     * those as pointer fields. Excluding one object from candidacy only
+     * under-collects (its refs into the candidate set are treated as
+     * external), and the freshest allocation is never collectable anyway —
+     * the constructing code holds its rc=1 reference. It still counts as
+     * young+live for gap pacing. */
+    if (obj != NULL && obj != scan_end) {
+        if (obj->rc > 0) young_live++;
+        obj = obj->next;
+    }
+    while (obj != scan_end) {
         if (obj->rc > 0) {
+            young_live++;
             /* Acyclic-typed objects can never be part of a reference cycle, so
              * we exclude them from the candidate set. References *from* them to
              * candidates are then treated as external (keeping those candidates
@@ -1186,27 +1162,45 @@ void rt_gc_collect(void) {
              * refcounting in rt_obj_release, never by the collector. */
             TypeDescriptor* od = rt_get_type_descriptor(obj->type_id);
             if (od == NULL || !od->acyclic) {
-                int32_t idx = gc_candidate_count++;
-                GCCandidate* c = &gc_candidates[idx];
+                if (gc_candidate_count == gc_candidates_capacity &&
+                    gc_buffers_ensure(gc_candidates_capacity + 1) != 0) {
+                    break;  /* partial set: safe under-collection */
+                }
+                GCCandidate* c = &gc_candidates[gc_candidate_count++];
                 c->obj = obj;
                 c->saved_rc = obj->rc;
-                c->reachable = 0;
                 c->collected = 0;
-                gc_index_insert(obj, idx);
+                obj->rc |= GC_CAND_BIT;
+                if (od != NULL && od->deinit_fn != NULL) any_deinit = 1;
             }
         }
         obj = obj->next;
     }
+    int64_t live_count = young_live + (is_major ? 0 : gc_old_live_count);
 
 #ifdef ROLANG_GC_STATS
     {
         extern void rt_gc_stats_record(int is_major, int live, int cands);
-        rt_gc_stats_record(is_major, live_count, gc_candidate_count);
+        rt_gc_stats_record(is_major, (int)live_count, gc_candidate_count);
     }
 #endif
 
     if (gc_candidate_count == 0) {
         gc_old_head = gc_object_list;   /* tenure: no cyclic candidates this pass */
+        gc_old_live_count = live_count;
+        /* Restart the allocation clock and adapt the gap exactly like the
+         * normal epilogue (survivors == live_count: nothing was collected).
+         * An all-acyclic live set hits this path on EVERY collection; without
+         * the update the trigger stays armed and each subsequent allocation
+         * pays a full collect preamble. */
+        {
+            int64_t gap = live_count * GC_GROWTH;
+            if (gap < GC_MIN_GAP) gap = GC_MIN_GAP;
+            if (gap > GC_MAX_GAP) gap = GC_MAX_GAP;
+            gc_next_gap = gap;
+        }
+        gc_last_collect_count = gc_alloc_counter;
+        gc_trigger_at = gc_alloc_counter + gc_next_gap;
         gc_running = 0;
         atomic_flag_clear_explicit(&gc_list_lock, memory_order_release);
         return;
@@ -1219,10 +1213,7 @@ void rt_gc_collect(void) {
      * also walks dynamic pointers found inside an external buffer that
      * the static descriptor cannot see into. */
     for (int32_t i = 0; i < gc_candidate_count; i++) {
-        GCCandidate* c = &gc_candidates[i];
-        if (c->collected) continue;
-
-        ObjHeader* h = c->obj;
+        ObjHeader* h = gc_candidates[i].obj;
         TypeDescriptor* desc = rt_get_type_descriptor(h->type_id);
         if (desc == NULL) continue;
 
@@ -1247,9 +1238,9 @@ void rt_gc_collect(void) {
                 void* target = *(void**)((char*)payload + fd->offset);
                 if (target == NULL) continue;
 
-                int32_t target_idx = gc_index_lookup(target);
-                if (target_idx >= 0 && !gc_candidates[target_idx].collected) {
-                    gc_candidates[target_idx].obj->rc--;
+                ObjHeader* th = OBJ_HEADER(target);
+                if (th->rc & GC_CAND_BIT) {
+                    th->rc--;
                 }
             }
         }
@@ -1265,16 +1256,15 @@ void rt_gc_collect(void) {
      * still reachable through A and must survive. */
     int32_t work_count = 0;
     for (int32_t i = 0; i < gc_candidate_count; i++) {
-        GCCandidate* c = &gc_candidates[i];
-        if (c->obj->rc > 0) {
-            c->reachable = 1;
-            gc_worklist[work_count++] = i;
+        ObjHeader* h = gc_candidates[i].obj;
+        if ((h->rc & GC_RC_VALUE_MASK) > 0 && !(h->rc & GC_REACH_BIT)) {
+            h->rc |= GC_REACH_BIT;
+            gc_worklist[work_count++] = h;
         }
     }
 
     while (work_count > 0) {
-        int32_t current_idx = gc_worklist[--work_count];
-        ObjHeader* h = gc_candidates[current_idx].obj;
+        ObjHeader* h = gc_worklist[--work_count];
         TypeDescriptor* desc = rt_get_type_descriptor(h->type_id);
         if (desc == NULL) continue;
 
@@ -1297,10 +1287,12 @@ void rt_gc_collect(void) {
                 }
 
                 void* target = *(void**)((char*)payload + fd->offset);
-                int32_t target_idx = gc_index_lookup(target);
-                if (target_idx >= 0 && !gc_candidates[target_idx].reachable) {
-                    gc_candidates[target_idx].reachable = 1;
-                    gc_worklist[work_count++] = target_idx;
+                if (target == NULL) continue;
+
+                ObjHeader* th = OBJ_HEADER(target);
+                if ((th->rc & GC_CAND_BIT) && !(th->rc & GC_REACH_BIT)) {
+                    th->rc |= GC_REACH_BIT;
+                    gc_worklist[work_count++] = th;
                 }
             }
         }
@@ -1310,21 +1302,18 @@ void rt_gc_collect(void) {
         }
     }
 
-    /* Step 4: Identify garbage (unreachable after propagation) */
+    /* Step 4+5 (fused): identify garbage and restore survivor refcounts in
+     * one scan. Restoring from saved_rc clears both GC bits on survivors;
+     * collected objects keep their bits until pinned (deinit path) or freed. */
     int32_t collected_count = 0;
     for (int32_t i = 0; i < gc_candidate_count; i++) {
         GCCandidate* c = &gc_candidates[i];
-        if (!c->reachable) {
+        if (c->obj->rc & GC_REACH_BIT) {
+            c->obj->rc = c->saved_rc;
+        } else {
             c->collected = 1;
             collected_count++;
         }
-    }
-
-    /* Step 5: Restore refcounts for survivors */
-    for (int32_t i = 0; i < gc_candidate_count; i++) {
-        GCCandidate* c = &gc_candidates[i];
-        if (c->collected) continue;
-        c->obj->rc = c->saved_rc;
     }
 
     /* Step 6: Collect garbage objects.
@@ -1357,6 +1346,12 @@ void rt_gc_collect(void) {
      */
     if (collected_count > 0) {
         gc_cycle_count += collected_count;
+
+        /* Phases 5a-5c exist solely to give user `deinit` bodies a
+         * well-defined view of the dying graph (and to catch resurrection).
+         * When no candidate type has a deinit — the common case — they are
+         * three wasted scans over the collected set; skip them outright. */
+        if (any_deinit) {
 
         /* Phase 5a: Pin all collected objects so deinit-side ARC traffic
          * cannot cause an early free. INT64_MAX/2 leaves room for retains
@@ -1401,36 +1396,35 @@ void rt_gc_collect(void) {
             }
         }
 
-        /* Phase 5d: Unlink the (non-resurrected) collected objects from the
-         * doubly-linked gc_object_list. O(collected) — each unlink is O(1) via
-         * prev/next. Survivors and deinit-allocated objects stay in place;
-         * collected objects are freed in Phase 5e via gc_candidates.
-         * gc_old_head is NULL during a collection, so no boundary fixup here. */
+        } /* any_deinit */
+
+        /* Phase 5d+5e (fused): for each collected object, release its
+         * pointer fields and unlink it from gc_object_list in one scan, then
+         * free everything in a second scan.
+         *
+         * Releases for ALL collected objects must complete before ANY of
+         * them is freed: a closed cycle always has a back-edge to an
+         * earlier-freed member, and releasing through it after the free
+         * would scribble on the recycled pool slot (whose first word is the
+         * free-list link). Hence release-all, then free-all.
+         *
+         * Unlinking inside the release scan is safe because nothing is freed
+         * yet: a nested survivor teardown (a release driving a survivor's rc
+         * to 0 calls rt_obj_release_slow -> gc_list_remove, which works under
+         * gc_running) keeps the list consistent, and an already-unlinked
+         * collected object's stale prev/next are never read again.
+         * gc_old_head is NULL during a collection, so no boundary fixup. */
+        if (any_deinit) {
+        /* Deinit variant: collected objects are PINNED (rc ~= 2^62), so
+         * "target is collected" is a simple magnitude test — survivors and
+         * resurrected objects had their small exact rc restored. Null such
+         * edges before the generic field release so it cannot decrement a
+         * pinned rc or follow a dying edge. */
+        const int64_t GC_PIN_TEST = (int64_t)1 << 61;
         for (int32_t i = 0; i < gc_candidate_count; i++) {
             GCCandidate* c = &gc_candidates[i];
             if (!c->collected) continue;
             ObjHeader* h = c->obj;
-            ObjHeader* p = h->prev;
-            ObjHeader* n = h->next;
-            if (p != NULL) p->next = n;
-            else           gc_object_list = n;
-            if (n != NULL) n->prev = p;
-            /* h->prev/next left stale; h is freed in Phase 5e, never traversed
-             * via the list again. Adjacent collected objects unlink correctly
-             * because each reads its (already-updated) prev/next fresh. */
-        }
-
-        /* Phase 5e: Release pointer fields (each field release decrements
-         * the target's rc — survivors are still pinned, collected objects
-         * will be freed shortly), then free memory. */
-        for (int32_t i = 0; i < gc_candidate_count; i++) {
-            GCCandidate* c = &gc_candidates[i];
-            if (!c->collected) continue;
-            ObjHeader* h = OBJ_HEADER(c->obj);
-            /* Zero remaining pointer fields to other still-collected
-             * objects before doing field releases. This prevents recursive
-             * obj_release_fields from following an edge to an object
-             * already partway through teardown. */
             TypeDescriptor* desc = rt_get_type_descriptor(h->type_id);
             if (desc != NULL) {
                 int32_t field_count = rt_get_field_count(desc);
@@ -1450,26 +1444,58 @@ void rt_gc_collect(void) {
                         }
                         void** field_ptr = (void**)((char*)payload + fd->offset);
                         void* target = *field_ptr;
-                        if (target != NULL) {
-                            ObjHeader* th = OBJ_HEADER(target);
-                            int32_t tidx = gc_index_lookup(th);
-                            if (tidx >= 0 && gc_candidates[tidx].collected) {
-                                /* Target is also collected — null the slot
-                                 * so we don't decrement its pinned/zero rc. */
-                                *field_ptr = NULL;
-                            }
+                        if (target != NULL &&
+                            OBJ_HEADER(target)->rc >= GC_PIN_TEST) {
+                            /* Target is also collected — null the slot
+                             * so we don't decrement its pinned rc. */
+                            *field_ptr = NULL;
                         }
                     }
                 }
             }
-            obj_release_fields(c->obj);
-            /* Recover the pool bin from the descriptor (see rt_obj_release_slow);
-             * `desc` was fetched above for this object. */
+            obj_release_fields(h);
+            ObjHeader* p = h->prev;
+            ObjHeader* n = h->next;
+            if (p != NULL) p->next = n;
+            else           gc_object_list = n;
+            if (n != NULL) n->prev = p;
+        }
+        } else {
+        /* Fast variant (no deinits ran): the trial refcounts are exact, so
+         * every collected object's rc is exactly 0 (plus stale GC bits) and
+         * a release along a collected->collected edge merely perturbs a dead
+         * rc — it can never re-enter the teardown path (which fires only on
+         * the 1 -> 0 transition). No nulling walk needed: release every
+         * collected object's fields directly via the codegen fast path. */
+        for (int32_t i = 0; i < gc_candidate_count; i++) {
+            GCCandidate* c = &gc_candidates[i];
+            if (!c->collected) continue;
+            ObjHeader* h = c->obj;
+            TypeDescriptor* desc = rt_get_type_descriptor(h->type_id);
+            if (desc != NULL && desc->release_fields_fn != NULL) {
+                desc->release_fields_fn(OBJ_PAYLOAD(h));
+            } else {
+                obj_release_fields(h);
+            }
+            ObjHeader* p = h->prev;
+            ObjHeader* n = h->next;
+            if (p != NULL) p->next = n;
+            else           gc_object_list = n;
+            if (n != NULL) n->prev = p;
+        }
+        }
+
+        /* Free scan, shared by both variants. */
+        for (int32_t i = 0; i < gc_candidate_count; i++) {
+            GCCandidate* c = &gc_candidates[i];
+            if (!c->collected) continue;
+            ObjHeader* h = c->obj;
+            TypeDescriptor* desc = rt_get_type_descriptor(h->type_id);
             int64_t total = (desc != NULL) ? (OBJ_HEADER_SIZE + desc->payload_size) : 0;
             if (desc != NULL && total <= (int64_t)POOL_MAX_TOTAL_SIZE) {
-                pool_free_object((void*)c->obj, (size_t)total);
+                pool_free_object((void*)h, (size_t)total);
             } else {
-                rt_free(c->obj);
+                rt_free(h);
             }
         }
     }
@@ -1489,6 +1515,7 @@ void rt_gc_collect(void) {
     gc_next_gap = gap;
 
     gc_last_collect_count = gc_alloc_counter;
+    gc_trigger_at = gc_alloc_counter + gc_next_gap;
     /* Tenure: every object now in the list (all survivors, plus any allocated
      * by deinits during this pass) becomes old. The next minor scans only what
      * is allocated after this point. */
