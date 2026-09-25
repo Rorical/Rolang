@@ -64,9 +64,9 @@ Examples:
 
     parser.add_argument(
         "--emit",
-        choices=["llvm", "mir", "obj"],
+        choices=["llvm", "llvm-opt", "mir", "mir-opt", "asm", "obj"],
         default=None,
-        help="Emit intermediate representation (llvm=LLVM IR, mir=MIR, obj=object file)",
+        help="Emit llvm, llvm-opt (backend optimized), mir, mir-opt (lowered with ARC), asm, or obj",
     )
 
     # Optimization levels
@@ -151,6 +151,9 @@ def determine_emit_kind(args: argparse.Namespace) -> EmitKind:
         emit_map = {
             "llvm": EmitKind.LLVM_IR,
             "mir": EmitKind.MIR,
+            "mir-opt": EmitKind.MIR_OPTIMIZED,
+            "llvm-opt": EmitKind.LLVM_OPTIMIZED,
+            "asm": EmitKind.ASSEMBLY,
             "obj": EmitKind.OBJECT,
         }
         return emit_map[args.emit]
@@ -224,7 +227,7 @@ def run_compiler(args: argparse.Namespace) -> int:
 
     # Handle output
     if result.success:
-        if options.emit in (EmitKind.LLVM_IR, EmitKind.MIR):
+        if result.output_content is not None:
             # Print IR to stdout unless -o was specified
             if not args.output and result.output_content:
                 print(result.output_content)

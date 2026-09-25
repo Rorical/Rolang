@@ -1,6 +1,6 @@
 # Rorical (Rolang)
 
-Rorical (Rolang) is a statically typed, compiled systems programming language with automatic memory management. Programs compile to native executables via LLVM. Memory is managed through reference counting (ARC) with a cycle-detecting GC backstop — no manual `free`, no garbage collection pauses. The language has first-class async/await built on a cooperative task scheduler, generics, protocols, pattern matching, and a standard library covering collections, I/O, math, and more.
+Rorical (Rolang) is a statically typed, compiled systems programming language with automatic memory management. Programs compile to native executables via LLVM. Memory is managed through reference counting (ARC) with a cycle-detecting GC backstop — no manual `free`. Cycle collection runs synchronously and can pause program execution. The language has first-class async/await built on a cooperative task scheduler, generics, protocols, pattern matching, and a standard library covering collections, I/O, math, and more.
 
 ## Requirements
 
@@ -126,7 +126,7 @@ y = 30;       // ok
 // x = 5;    // error: cannot rebind a let binding
 
 struct Point { var x: f64; var y: f64; }
-let p = Point(x: 1.0, y: 2.0);
+let p = Point { x: 1.0, y: 2.0 };
 p.x = 9.0;   // ok — same object, only the binding is frozen
 ```
 
@@ -157,6 +157,7 @@ struct Vec2 {
         // runs when the last reference is released
     }
 }
+```
 
 `__release__` runs exactly once at end of life, before the runtime walks the object's pointer fields. Operator overloading uses `__add__`, `__sub__`, `__mul__`, etc.
 
@@ -406,7 +407,7 @@ languages (1.2× Go, 1.6× Java): cyclic garbage is unreachable to reference
 counting, and trial-deletion collection — which must visit every dead
 object — cannot match a generational scavenger that never touches garbage
 at all. That residual gap is the honest price of ARC's strengths
-(deterministic destruction, no pauses, and the `binary_trees`/`fib` wins),
+(prompt destruction of acyclic objects and the `binary_trees`/`fib` wins),
 and the rows exist so regressions and progress stay visible.
 
 ## Development

@@ -151,8 +151,8 @@ class ExprChecker:
     def _int_literal_fits(self, value: int, type_id: TypeId) -> bool:
         """Return True if `value` is representable in the given integer type.
 
-        Treats integer literals as unsigned magnitudes (the parser never
-        produces a negative literal; unary minus is a separate UnaryOp).
+        Includes signed minima. Unary minus passes the negated magnitude so
+        -128 can be checked as one i8 constant rather than rejecting +128.
         """
         info = self._c.type_table.get_type(type_id)
         if info is None or not isinstance(info.data, PrimitiveTypeData):
@@ -162,11 +162,13 @@ class ExprChecker:
         if bits is None:
             return False
         if prim in self._SIGNED_INTS:
-            return 0 <= value < (1 << (bits - 1))
+            return -(1 << (bits - 1)) <= value < (1 << (bits - 1))
         return 0 <= value < (1 << bits)
 
-    def _infer_int_literal(self, lit: ast.Literal) -> TypeId:
+    def _infer_int_literal(self, lit: ast.Literal, *, negative: bool = False) -> TypeId:
         value = lit.value if isinstance(lit.value, int) else 0
+        if negative:
+            value = -value
         tt = self._c.type_table
         expected = self._c._expected_type
 
@@ -494,7 +496,12 @@ class ExprChecker:
         if unop.operand is None:
             return self._c.type_table.error_type
 
-        operand_type = self._infer_expr(unop.operand)
+        if (unop.op == "-" and isinstance(unop.operand, ast.Literal)
+                and unop.operand.kind == "int"):
+            operand_type = self._infer_int_literal(unop.operand, negative=True)
+            self._c.expr_types[id(unop.operand)] = operand_type
+        else:
+            operand_type = self._infer_expr(unop.operand)
 
         if unop.op == "-":
             if self._c.type_table.is_numeric(operand_type):
@@ -748,8 +755,8 @@ class ExprChecker:
                 # Check argument types
                 for i, (arg, expected_type) in enumerate(zip(call.arguments, func_data.params)):
                     if arg.value:
-                        arg_type = self._infer_expr(arg.value)
                         expected_type = self._c._substitute_type(expected_type, inferred_generics)
+                        arg_type = self._infer_with_expected(arg.value, expected_type)
                         self._c._check_assignable(arg_type, expected_type, f"argument {i + 1}")
 
             # Record call target
@@ -858,10 +865,8 @@ class ExprChecker:
         for i, (arg, (_, payload_type_node)) in enumerate(zip(args, case_def.payload)):
             if arg.value is None:
                 continue
-            arg_type = self._c.expr_types.get(id(arg.value))
-            if arg_type is None:
-                arg_type = self._infer_expr(arg.value)
             expected = self._c._substitute_type(self._c._resolve_type(payload_type_node), inferred)
+            arg_type = self._infer_with_expected(arg.value, expected)
             self._c._check_assignable(arg_type, expected, f"enum payload {i + 1}")
 
         # Build the instantiated enum type if all generic params are bound.
@@ -1365,7 +1370,7 @@ class ExprChecker:
         """
         source_type = self._c.type_table.error_type
         if cast.expr:
-            source_type = self._infer_expr(cast.expr)
+            source_type = self._infer_with_expected(cast.expr, None)
 
         if not cast.target_type:
             return self._c.type_table.error_type

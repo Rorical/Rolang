@@ -28,6 +28,7 @@ from .async_lowering import lower_async
 from .arc_insertion import insert_arc
 from .mir_optimize import optimize_mir
 from .codegen import compile_to_llvm, compile_to_object
+from .codegen.object_file import compile_module_to_assembly, optimize_module_to_ir
 from .mir import format_program as format_mir
 from .diagnostics import DiagnosticCollector
 from .module import ModuleState
@@ -41,6 +42,9 @@ class EmitKind(Enum):
     OBJECT = auto()      # Object file (.o)
     LLVM_IR = auto()     # LLVM IR (.ll)
     MIR = auto()         # Mid-level IR (debug)
+    MIR_OPTIMIZED = auto()  # Lowered, optimized MIR with ARC
+    LLVM_OPTIMIZED = auto() # LLVM IR after backend optimization
+    ASSEMBLY = auto()       # Native assembly (.s)
     EXECUTABLE = auto()  # Linked executable
 
 
@@ -179,7 +183,6 @@ class CompilationDriver:
         # canonical resolved path of each file so that two files sharing
         # a basename (e.g. lib/util.rl and vendor/util.rl) do not collide.
         graph = mod.ModuleGraph()
-        entry_name = str(entry_path.resolve())
         self._discover_imports(entry_path, entry_ast, graph, set())
 
         if self.context.has_errors():
@@ -194,64 +197,20 @@ class CompilationDriver:
         if self.options.verbose:
             print(f"Compiling {len(compile_order)} module(s): {[m.name for m in compile_order]}")
 
-        object_files: list[Path] = []
-        temp_files: list[Path] = []
-
-        try:
-            for module in compile_order:
-                if self.context.has_errors():
-                    break
-
-                if self.options.emit == EmitKind.OBJECT:
-                    if self.options.verbose:
-                        print(f"  Compiling {module.name} ({module.path})...")
-
-                    result = self._compile_module(module, graph)
-                    if not result.success:
-                        return result
-
-                    obj_path = result.output_path
-                    if obj_path:
-                        object_files.append(obj_path)
-                        temp_files.append(obj_path)
-                else:
-                    if self.options.verbose:
-                        print(f"  Resolving {module.name} ({module.path})...")
-
-                    success = self._resolve_module_exports(module, graph)
-                    if not success:
-                        return self._fail()
-
-            if self.context.has_errors():
+        # All output formats share the same program: imported generic bodies
+        # must be available when monomorphizing, including for object output.
+        for module in compile_order:
+            if self.options.verbose:
+                print(f"  Resolving {module.name} ({module.path})...")
+            if not self._resolve_module_exports(module, graph):
                 return self._fail()
 
-            if self.options.emit == EmitKind.OBJECT:
-                if len(object_files) == 1:
-                    return CompileResult(
-                        success=True,
-                        output_path=object_files[0],
-                        diagnostics=self.context.diagnostics,
-                    )
-                self.context.diagnostics.add_error(
-                    "Multi-module compilation requires --emit executable or a single module."
-                )
-                return self._fail()
+        return self._compile_unified(entry_path, compile_order)
 
-            # Executable / LLVM / MIR: unified compilation so cross-module
-            # generic monomorphization works.  True separate object compilation
-            # requires a generic metadata/export model (future work).
-            return self._compile_unified(entry_path, entry_ast, graph,
-                                         compile_order, entry_name)
-
-        finally:
-            for tf in temp_files:
-                if tf.exists():
-                    tf.unlink()
-
-    def _compile_unified(self, entry_path, entry_ast, graph, compile_order, entry_name) -> CompileResult:
+    def _compile_unified(self, entry_path, compile_order) -> CompileResult:
         """Unified compilation: merge all module ASTs and compile as one program.
 
-        Used for MIR / LLVM_IR emits so the whole program appears in one file.
+        Used for every output format so imported generics are specialized together.
 
         Each module has already been resolved individually (in
         _resolve_module_exports), so we reuse those per-module
@@ -431,8 +390,11 @@ class CompilationDriver:
                             break
                 # 3. Bundled standard library
                 if dep_path is None and self.stdlib_path.exists():
-                    candidate = (self.stdlib_path / import_path).resolve()
-                    if candidate.exists():
+                    stdlib_relative = Path(import_path)
+                    if len(module_parts) > 1 and module_parts[0] == "std":
+                        stdlib_relative = Path(*module_parts[1:]).with_suffix(".rl")
+                    candidate = (self.stdlib_path / stdlib_relative).resolve()
+                    if candidate.is_file():
                         dep_path = candidate
                 if dep_path is None:
                     self.context.diagnostics.add_error(
@@ -641,24 +603,6 @@ class CompilationDriver:
         module.state = ModuleState.RESOLVED
         return True
 
-    def _compile_module(self, module, graph) -> CompileResult:
-        """Compile a single module through the full pipeline, returning an object file."""
-        success = self._resolve_module_exports(module, graph)
-        if not success:
-            return CompileResult(success=False, diagnostics=self.context.diagnostics)
-
-        # Compile to object file (use temp file, not user-specified output)
-        saved_emit = self.options.emit
-        saved_output = self.options.output_path
-        self.options.emit = EmitKind.OBJECT
-        self.options.output_path = None  # Force temp file for intermediate objects
-
-        resolution_result = module._resolution_result
-        result = self._run_pipeline(module.ast, resolution_result, module.path)
-        self.options.emit = saved_emit
-        self.options.output_path = saved_output
-        return result
-
     def _run_pipeline(self, ast_node, resolution_result, source_path: Path) -> CompileResult:
         """Run the compiler pipeline from type-checking through linking."""
         r = self.runner  # shorthand
@@ -705,15 +649,8 @@ class CompilationDriver:
 
         # Emit MIR if requested
         if self.options.emit == EmitKind.MIR:
-            mir_str = format_mir(mir_result.program, mir_result.type_table)
-            output_path = self._get_output_path(source_path, ".mir")
-            if output_path:
-                output_path.write_text(mir_str, encoding="utf-8")
-            return CompileResult(
-                success=True,
-                output_path=output_path,
-                output_content=mir_str,
-                diagnostics=self.context.diagnostics,
+            return self._emit_text(
+                source_path, ".mir", format_mir(mir_result.program, mir_result.type_table)
             )
 
         # Lower async functions to state machines
@@ -753,8 +690,13 @@ class CompilationDriver:
                 self.context.diagnostics.add_error(error)
             return self._fail()
 
-        # Emit LLVM IR if requested
-        if self.options.emit == EmitKind.LLVM_IR:
+        if self.options.emit == EmitKind.MIR_OPTIMIZED:
+            return self._emit_text(
+                source_path, ".opt.mir", format_mir(arc_result.program, arc_result.type_table)
+            )
+
+        # All backend text outputs start with the same ARC-lowered program.
+        if self.options.emit in (EmitKind.LLVM_IR, EmitKind.LLVM_OPTIMIZED, EmitKind.ASSEMBLY):
             llvm_result = r.run("Generating LLVM IR", compile_to_llvm,
                 arc_result,
                 module_name=source_path.stem,
@@ -767,16 +709,21 @@ class CompilationDriver:
                     self.context.diagnostics.add_codegen_error(error)
                 return self._fail()
 
-            llvm_ir = str(llvm_result.module)
-            output_path = self._get_output_path(source_path, ".ll")
-            if output_path:
-                output_path.write_text(llvm_ir, encoding="utf-8")
-            return CompileResult(
-                success=True,
-                output_path=output_path,
-                output_content=llvm_ir,
-                diagnostics=self.context.diagnostics,
+            if self.options.emit == EmitKind.LLVM_IR:
+                return self._emit_text(source_path, ".ll", str(llvm_result.module))
+            emitter = (compile_module_to_assembly if self.options.emit == EmitKind.ASSEMBLY
+                       else optimize_module_to_ir)
+            content, errors = r.run(
+                "Preparing backend output", emitter, llvm_result.module,
+                opt_level=self.options.opt_level.value,
+                target_triple=self.options.target_triple,
             )
+            if errors:
+                for error in errors:
+                    self.context.diagnostics.add_codegen_error(error)
+                return self._fail()
+            suffix = ".s" if self.options.emit == EmitKind.ASSEMBLY else ".opt.ll"
+            return self._emit_text(source_path, suffix, content)
 
         # Compile to object file
         if self.options.emit == EmitKind.OBJECT:
@@ -815,6 +762,19 @@ class CompilationDriver:
             output_path.unlink()
 
         return result
+
+    def _emit_text(self, source_path: Path, suffix: str, content: str) -> CompileResult:
+        """Write textual compiler output with consistent I/O diagnostics."""
+        output_path = self._get_output_path(source_path, suffix)
+        try:
+            output_path.write_text(content, encoding="utf-8")
+        except OSError as error:
+            self.context.diagnostics.add_io_error(str(error), output_path)
+            return self._fail()
+        return CompileResult(
+            success=True, output_path=output_path, output_content=content,
+            diagnostics=self.context.diagnostics,
+        )
 
     def _fail(self) -> CompileResult:
         """Return a failed CompileResult with current diagnostics."""

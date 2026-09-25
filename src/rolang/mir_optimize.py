@@ -252,7 +252,13 @@ def _all_scalar_struct_map(
     plain scalar (int/float/bool). RawPtr is deliberately excluded: the
     address-of cast idiom reads a local's storage slot directly."""
     out: Dict[TypeId, MirStruct] = {}
+    function_names = {fn.name for fn in program.functions}
     for st in program.structs:
+        # Removing the allocation also removes final release. Even an object
+        # with scalar fields can have observable destruction or tracing hooks.
+        if any(f"{st.name}_{hook}" in function_names
+               for hook in ("__release__", "__gc_trace__")):
+            continue
         info = type_table.get_type(st.type_id)
         if info is None or info.kind != TypeKind.STRUCT:
             continue

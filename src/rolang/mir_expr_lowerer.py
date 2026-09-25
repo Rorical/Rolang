@@ -15,7 +15,9 @@ from .hir import (
     HirTuple, HirArray, HirDict, HirLambda, HirClone,
     HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr,
     HirOptionalSome, HirOptionalNone, HirOptionalMatch,
+    HirParam, HirBlock, HirReturn,
 )
+from .symbols import SymbolKind, Namespace
 from .operators import (
     is_short_circuit_and_op,
     is_short_circuit_or_op,
@@ -186,6 +188,29 @@ class MirExpressionLowerer:
             place = Place(base=local_id, projections=[], type_id=actual_type)
             return CopyOperand(place)
         else:
+            symbol = self._b.symbol_table.get_symbol(var.symbol_id) if var.symbol_id else None
+            signature = self._b.type_table.get_function_data(var.type_id)
+            if symbol and symbol.kind == SymbolKind.FUNCTION and signature:
+                if signature.is_async:
+                    self._b.errors.append("Async function values are not supported; call and await the function directly")
+                    return ConstantOperand(ConstantKind.NIL, None, var.type_id)
+                # Function values use the closure ABI (hidden environment arg).
+                # Reuse lambda lowering to build an adapter with normal ARC
+                # handling, rather than calling a raw function with that ABI.
+                params = []
+                arguments = []
+                for index, type_id in enumerate(signature.params):
+                    param = self._b.symbol_table.create_symbol(
+                        name=f"__arg_{index}", kind=SymbolKind.PARAMETER,
+                        namespace=Namespace.VALUE,
+                    )
+                    params.append(HirParam(name=param.name, symbol_id=param.id, type_id=type_id))
+                    arguments.append((None, HirVar(name=param.name, symbol_id=param.id, type_id=type_id)))
+                call = HirCall(type_id=signature.return_type, callee=var,
+                               callee_symbol=var.symbol_id, arguments=arguments)
+                adapter = HirLambda(type_id=var.type_id, params=params,
+                                    body=HirBlock(statements=[HirReturn(value=call)]))
+                return self._lower_lambda(adapter)
             self._b.errors.append(f"Undefined variable: {var.name}")
             return ConstantOperand(ConstantKind.NIL, None, var.type_id)
 

@@ -4,7 +4,7 @@ Rolang manages memory automatically through two complementary mechanisms: *Autom
 
 ## Heap Allocation
 
-Every struct and enum value lives on the heap. When you write:
+Structs and enums have reference semantics and normally live on the heap. At `-O2` and `-O3`, the compiler can replace non-escaping structs with scalar locals when doing so preserves observable behavior. Types with destruction or GC trace hooks retain their allocations. When you write:
 
 ```rolang
 let p = Point { x: 1.0, y: 2.0 };
@@ -95,11 +95,7 @@ a.next = b;   // cycle: a → b → a
 // When a and b go out of scope, neither can be freed by ARC alone
 ```
 
-Rolang's runtime runs a cycle-detecting collector periodically to find and free such cycles. The collector:
-
-1. Builds a graph of all heap objects
-2. Identifies strongly-connected components (cycles)
-3. Calls `__release__` on each object in the cycle before freeing it
+Rolang's runtime runs a cycle-detecting collector periodically to find and free such cycles. The collector uses generational trial deletion to identify unreachable cycles, then runs any `__release__` hooks before reclaiming them. Collection is synchronous on the program thread and can pause execution. Cyclic objects are not necessarily destroyed as soon as external references disappear.
 
 The GC is not a replacement for ARC — it is a backstop. Well-structured code that avoids deliberate cycles rarely triggers it.
 

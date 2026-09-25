@@ -443,7 +443,6 @@ def test_cli_clean_nothing_to_clean(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
-@pytest.mark.skip(reason="requires full compiler + LLVM — run separately")
 def test_cli_build_hello_world(tmp_path: Path) -> None:
     _run_rolang("new", "helloworld", cwd=tmp_path)
     proj = tmp_path / "helloworld"
@@ -452,7 +451,6 @@ def test_cli_build_hello_world(tmp_path: Path) -> None:
     assert (proj / "build" / "helloworld").exists()
 
 
-@pytest.mark.skip(reason="requires full compiler + LLVM — run separately")
 def test_cli_run_hello_world(tmp_path: Path) -> None:
     _run_rolang("new", "runme", cwd=tmp_path)
     proj = tmp_path / "runme"

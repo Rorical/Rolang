@@ -61,7 +61,7 @@ class OpsArithmeticMixin:
                 else:
                     self._emit_div_zero_guard(right, is_remainder=False)
                     if is_signed:
-                        result = self.builder.sdiv(left, right, name="sdiv")
+                        result = self._emit_signed_division(left, right, is_remainder=False)
                     else:
                         result = self.builder.udiv(left, right, name="udiv")
 
@@ -78,7 +78,7 @@ class OpsArithmeticMixin:
                 else:
                     self._emit_div_zero_guard(right, is_remainder=True)
                     if is_signed:
-                        result = self.builder.srem(left, right, name="srem")
+                        result = self._emit_signed_division(left, right, is_remainder=True)
                     else:
                         result = self.builder.urem(left, right, name="urem")
 
@@ -155,10 +155,11 @@ class OpsArithmeticMixin:
         is_signed = self.type_cache.is_signed_integer(left_type)
 
         if is_float:
-            # Use ordered comparisons for floats
+            # NaN is unequal to every value, including itself. All other
+            # comparisons remain ordered (false when either operand is NaN).
             fcmp_map = {
                 CmpOpKind.EQ: "oeq",
-                CmpOpKind.NE: "one",
+                CmpOpKind.NE: "une",
                 CmpOpKind.LT: "olt",
                 CmpOpKind.LE: "ole",
                 CmpOpKind.GT: "ogt",
@@ -189,6 +190,25 @@ class OpsArithmeticMixin:
         # Store result
         self._store_local(op.result, result)
         return result
+
+    def _emit_signed_division(
+        self, left: ir.Value, right: ir.Value, *, is_remainder: bool,
+    ) -> ir.Value:
+        """Use wrapping results for MIN / -1 and MIN % -1, never LLVM poison.
+
+        Substituting +1 for this one divisor gives MIN and zero respectively.
+        Guard the operands themselves: selecting a result after an overflowing
+        divide can still allow a hardware trap before the select.
+        """
+        minimum = ir.Constant(left.type, -(1 << (left.type.width - 1)))
+        is_min = self.builder.icmp_signed("==", left, minimum)
+        is_neg_one = self.builder.icmp_signed("==", right, ir.Constant(right.type, -1))
+        overflow = self.builder.and_(is_min, is_neg_one, name="div.overflow")
+        divisor = self.builder.select(overflow, ir.Constant(right.type, 1), right,
+                                      name="div.safe")
+        if is_remainder:
+            return self.builder.srem(left, divisor, name="srem")
+        return self.builder.sdiv(left, divisor, name="sdiv")
 
     def _emit_div_zero_guard(self, divisor: ir.Value, is_remainder: bool) -> None:
         """

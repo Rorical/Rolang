@@ -149,7 +149,11 @@ let b: Bool = 1 as Bool;       // non-zero → true
 let n: i32 = true as i32;      // true → 1, false → 0
 ```
 
-**Float-to-integer conversion** saturates: NaN and values outside the integer range produce the minimum or maximum representable value rather than undefined behaviour.
+**Float-to-integer conversion** saturates: NaN produces zero; values outside the integer range clamp to the minimum or maximum representable value.
+
+**Floating-point comparisons** follow IEEE semantics: NaN is unequal to every value, including itself. Equality and ordering comparisons involving NaN are false.
+
+**Signed integer division** truncates toward zero. The overflow case (the minimum signed value divided by `-1`) wraps to the minimum value; its remainder is zero. Division or remainder by zero panics at every optimization level.
 
 **Integer shift** with a shift amount ≥ bit-width masks the amount to `bitwidth − 1`, giving defined wraparound.
 
