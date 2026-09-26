@@ -42,19 +42,7 @@ class AsyncCodegen:
         self.void = ir.VoidType()
         self.ptr = ir.PointerType(self.i8)
 
-        # TaskHandle LLVM type — kept in sync with the C struct in
-        # rolang_rt.c:1327-1332. Used to GEP into `result` from
-        # TaskGetResult lowering.
-        #     { void* frame; void(*resume_fn)(void*); int32_t completed;
-        #       int32_t result_kind; void* result; }
-        self.task_handle_type = ir.LiteralStructType([
-            self.ptr,       # frame
-            self.ptr,       # resume_fn
-            self.i32,       # completed
-            self.i32,       # result_kind
-            self.ptr,       # result
-        ])
-
+        # Task handles are opaque; all access goes through runtime functions.
         self._declare_async_runtime()
 
     def _declare_async_runtime(self) -> None:
@@ -70,6 +58,7 @@ class AsyncCodegen:
         self.rt_task_join = _get_or_declare("rt_task_join", self.ptr, [self.ptr])
         self.rt_task_complete = _get_or_declare("rt_task_complete", self.void, [self.ptr, self.ptr])
         self.rt_task_complete_owned = _get_or_declare("rt_task_complete_owned", self.void, [self.ptr, self.ptr, self.i32])
+        self.rt_task_borrow_result = _get_or_declare("rt_task_borrow_result", self.ptr, [self.ptr])
         self.rt_task_take_result = _get_or_declare("rt_task_take_result", self.ptr, [self.ptr])
         self.rt_task_destroy = _get_or_declare("rt_task_destroy", self.void, [self.ptr])
         self.rt_task_yield = _get_or_declare("rt_task_yield", self.void, [])

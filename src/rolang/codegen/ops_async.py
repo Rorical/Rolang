@@ -277,8 +277,10 @@ class OpsAsyncMixin:
 
     def _emit_task_get_result(self, op: TaskGetResult) -> Optional[ir.Value]:
         """
-        Join the task, take ownership of its result, then destroy the handle.
+        Join a task, transferring a private result or copying a shared one.
 
+        With consume=False, retain heap results and keep the handle and scalar
+        box alive for subsequent awaits. With consume=True, destroy the handle.
         Heap/reference results are stored directly in the handle with an extra
         retain taken by TaskComplete; taking the result transfers that owned
         reference to the destination local. Scalar results are stored in a
@@ -300,7 +302,9 @@ class OpsAsyncMixin:
             if join_func is not None:
                 self.builder.call(join_func, [handle_i8])
 
-        if self.async_codegen is not None:
+        if not op.consume:
+            result_void_ptr = self.builder.call(self.async_codegen.rt_task_borrow_result, [handle_i8])
+        elif self.async_codegen is not None:
             result_void_ptr = self.async_codegen.emit_task_take_result(self.builder, handle_i8)
         else:
             result_void_ptr = self.builder.call(
@@ -311,7 +315,7 @@ class OpsAsyncMixin:
 
         result_llvm = self.type_cache.get_llvm_type(op.result_type)
         if isinstance(result_llvm, ir.VoidType):
-            if self.async_codegen is not None:
+            if op.consume and self.async_codegen is not None:
                 self.async_codegen.emit_task_destroy(self.builder, handle_i8)
             return None
 
@@ -325,10 +329,13 @@ class OpsAsyncMixin:
                 result_void_ptr, ir.PointerType(result_llvm), name="result.box",
             )
             value = self.builder.load(typed_ptr, name="result.val")
-            self.runtime.emit_free(self.builder, result_void_ptr)
+            if op.consume:
+                self.runtime.emit_free(self.builder, result_void_ptr)
 
+        if not op.consume and self._type_needs_task_arc(op.result_type):
+            self.runtime.emit_obj_retain(self.builder, value)
         self._store_local(op.result, value)
-        if self.async_codegen is not None:
+        if op.consume and self.async_codegen is not None:
             self.async_codegen.emit_task_destroy(self.builder, handle_i8)
         return value
 

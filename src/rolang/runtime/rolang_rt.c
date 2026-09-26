@@ -2258,322 +2258,362 @@ void rt_dict_gc_trace(void* payload, GCTraceCb cb, void* ctx) {
     }
 }
 
-/* ============================================================================
- * Async Runtime — single-threaded cooperative multitasking
- *
- * Task structure:
- * {
- *     void* frame;           // Coroutine frame (state + locals)
- *     void (*resume)(void*); // Resume function pointer
- *     int32_t completed;     // Completion flag
- *     void* result;          // Result value
- * }
- * ============================================================================ */
+/* Async scheduler: ready tasks rotate FIFO; suspended tasks are parked on
+ * dependencies, monotonic deadlines, or socket readiness. No worker threads. */
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <poll.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#endif
 
+typedef struct AsyncStream { int fd; int refs; } AsyncStream;
 typedef struct TaskHandle {
     void* frame;
     void (*resume_fn)(void*);
     int32_t completed;
     int32_t result_kind;
     void* result;
+    int refs, cancelled, running, owns_dependency;
+    struct TaskHandle *dependency, *next;
+    int native_kind; /* 0 generated frame, 1 timer, 2 read, 3 write */
+    int64_t deadline;
+    AsyncStream* stream;
+    char* buffer;
+    int32_t length, offset;
 } TaskHandle;
-
-enum {
-    RT_TASK_RESULT_NONE = 0,
-    RT_TASK_RESULT_BOX = 1,
-    RT_TASK_RESULT_HEAP_REF = 2
-};
-
-/*
- * Dynamically growable ring buffer for the single-threaded task scheduler.
- * Starts at TASK_QUEUE_INITIAL_CAPACITY and doubles on demand. The previous
- * implementation had a hard cap of 256 tasks; in practice we want any
- * realistic workload (parser fan-out, fetch fan-out, etc.) to just work.
- */
-#define TASK_QUEUE_INITIAL_CAPACITY 256
-static TaskHandle** task_queue = NULL;
-static int task_queue_capacity = 0;
-static int task_queue_head = 0;
-static int task_queue_tail = 0;
-
-/* Thread-local current task for cooperative yield */
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_THREADS__)
-  #include <threads.h>
-  static _Thread_local TaskHandle* current_task = NULL;
-#else
-  /* Fallback for older C standards - not thread-safe but works for single-threaded */
-  static TaskHandle* current_task = NULL;
+enum { RT_TASK_RESULT_NONE, RT_TASK_RESULT_BOX, RT_TASK_RESULT_HEAP_REF };
+static TaskHandle *task_head = NULL, *task_tail = NULL, *current_task = NULL;
+static int64_t task_live_count = 0;
+static void task_release(TaskHandle* task);
+static void task_step(void);
+static void stream_release(AsyncStream* stream) {
+    if (stream && --stream->refs == 0) {
+#if defined(__unix__) || defined(__APPLE__)
+        close(stream->fd);
 #endif
-
-static int task_queue_count(void) {
-    if (task_queue_capacity == 0) return 0;
-    return (task_queue_tail - task_queue_head + task_queue_capacity) % task_queue_capacity;
+        free(stream);
+    }
 }
-
-static int task_queue_ensure_capacity(void) {
-    if (task_queue == NULL) {
-        task_queue_capacity = TASK_QUEUE_INITIAL_CAPACITY;
-        task_queue = (TaskHandle**)malloc(sizeof(TaskHandle*) * (size_t)task_queue_capacity);
-        if (task_queue == NULL) {
-            task_queue_capacity = 0;
-            return -1;
-        }
-        task_queue_head = 0;
-        task_queue_tail = 0;
-        return 0;
-    }
-
-    /* Grow when the ring would wrap into the head pointer. */
-    if (((task_queue_tail + 1) % task_queue_capacity) != task_queue_head) {
-        return 0;
-    }
-
-    int old_capacity = task_queue_capacity;
-    int new_capacity = old_capacity * 2;
-    TaskHandle** new_queue = (TaskHandle**)malloc(sizeof(TaskHandle*) * (size_t)new_capacity);
-    if (new_queue == NULL) {
-        return -1;
-    }
-    /* Linearise the ring into the new buffer starting at index 0. */
-    int count = task_queue_count();
-    for (int i = 0; i < count; i++) {
-        new_queue[i] = task_queue[(task_queue_head + i) % old_capacity];
-    }
-    free(task_queue);
-    task_queue = new_queue;
-    task_queue_capacity = new_capacity;
-    task_queue_head = 0;
-    task_queue_tail = count;
-    return 0;
+static int64_t task_now_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) rt_panic("monotonic clock failed");
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
-
-/**
- * Push a task onto the queue. Returns 0 on success, -1 on allocation failure.
- */
-static int task_queue_push(TaskHandle* task) {
-    if (task_queue_ensure_capacity() != 0) {
-        fprintf(stderr, "rolang runtime error: async task queue out of memory\n");
-        return -1;
-    }
-    task_queue[task_queue_tail] = task;
-    task_queue_tail = (task_queue_tail + 1) % task_queue_capacity;
-    return 0;
+static void task_append(TaskHandle* task) {
+    task->next = NULL;
+    if (task_tail) task_tail->next = task; else task_head = task;
+    task_tail = task;
 }
-
-static TaskHandle* task_queue_pop(void) {
-    if (task_queue == NULL || task_queue_head == task_queue_tail) {
-        return NULL; // Empty
-    }
-    TaskHandle* task = task_queue[task_queue_head];
-    task_queue_head = (task_queue_head + 1) % task_queue_capacity;
+static TaskHandle* task_new(void) {
+    TaskHandle* task = (TaskHandle*)calloc(1, sizeof(TaskHandle));
+    if (!task) rt_panic("async task allocation failed");
+    task->refs = 2; /* caller + scheduler */
+    task_live_count++;
+    task_append(task);
     return task;
 }
-
-/**
- * Yield CPU to the OS scheduler. Portable fallback.
- */
-static void cpu_yield(void) {
-#if defined(__linux__) || defined(__APPLE__)
-    sched_yield();
-#else
-    /* No-op on platforms without sched_yield */
-#endif
-}
-
-/**
- * Allocate a coroutine frame.
- *
- * @param size Size of the frame in bytes
- * @return Pointer to the allocated frame
- */
-void* rt_frame_alloc(int64_t size) {
-    return malloc((size_t)size);
-}
-
-/**
- * Free a coroutine frame.
- *
- * @param frame Pointer to the frame
- */
-void rt_frame_free(void* frame) {
-    if (frame != NULL) {
-        free(frame);
-    }
-}
-
-/**
- * Spawn a new async task.
- *
- * Creates a TaskHandle and schedules the task for execution.
- *
- * @param resume_fn The resume function for this coroutine
- * @param frame The coroutine frame
- * @return Pointer to the new TaskHandle
- */
+int64_t rt_task_live_count(void) { return task_live_count; }
+void* rt_frame_alloc(int64_t size) { return malloc((size_t)size); }
+void rt_frame_free(void* frame) { free(frame); }
 TaskHandle* rt_task_spawn(void (*resume_fn)(void*), void* frame) {
-    TaskHandle* task = (TaskHandle*)malloc(sizeof(TaskHandle));
-    if (task == NULL) {
-        return NULL;
-    }
-
+    TaskHandle* task = task_new();
     task->frame = frame;
     task->resume_fn = resume_fn;
-    task->completed = 0;
-    task->result_kind = RT_TASK_RESULT_NONE;
-    task->result = NULL;
-
-    // Add to ready queue
-    if (task_queue_push(task) != 0) {
-        if (frame != NULL) rt_obj_release(frame);
-        free(task);
-        return NULL;
-    }
-
+    /* The active scheduler is a GC root independent of the source Task. */
+    if (frame) rt_obj_retain(frame);
     return task;
 }
-
-/**
- * Join (await) a task.
- *
- * If the task is not complete, runs the scheduler until it is.
- *
- * @param handle The task to join
- * @return The task's result value
- */
-void* rt_task_join(TaskHandle* handle) {
-    if (handle == NULL) {
-        return NULL;
+static void task_clear_dependency(TaskHandle* task, int cancelling);
+int32_t rt_task_cancel(TaskHandle* task) {
+    if (!task || task->completed) return 0;
+    task->cancelled = task->completed = 1;
+    task_clear_dependency(task, 1);
+    return 1;
+}
+static void task_clear_dependency(TaskHandle* task, int cancelling) {
+    TaskHandle* child = task->dependency;
+    if (!child) return;
+    task->dependency = NULL;
+    if (task->owns_dependency) {
+        /* The generated await's result extraction normally consumes this
+         * owner. Cancellation must do that cleanup instead. */
+        if (cancelling) { rt_task_cancel(child); task_release(child); }
+    } else task_release(child);
+    task->owns_dependency = 0;
+}
+static void task_release(TaskHandle* task) {
+    if (!task || --task->refs) return;
+    if (task->result_kind == RT_TASK_RESULT_BOX) free(task->result);
+    else if (task->result_kind == RT_TASK_RESULT_HEAP_REF) rt_obj_release(task->result);
+    stream_release(task->stream);
+    free(task->buffer);
+    task_live_count--;
+    free(task);
+}
+void rt_task_gc_trace(void* payload, GCTraceCb cb, void* ctx) {
+    if (!payload || !cb) return;
+    TaskHandle* task = *(TaskHandle**)payload;
+    if (!task) return;
+    if (task->frame) cb(task->frame, ctx);
+    if (task->result_kind == RT_TASK_RESULT_HEAP_REF && task->result)
+        cb(task->result, ctx);
+}
+void rt_task_destroy(TaskHandle* task) {
+    if (!task) return;
+    rt_task_cancel(task);
+    task_release(task);
+}
+int32_t rt_task_poll(TaskHandle* task) { return !task || task->completed; }
+int32_t rt_task_cancelled(TaskHandle* task) { return task && task->cancelled; }
+void rt_task_complete_owned(TaskHandle* task, void* result, int32_t kind) {
+    if (!task || task->cancelled) {
+        if (kind == RT_TASK_RESULT_BOX) free(result);
+        else if (kind == RT_TASK_RESULT_HEAP_REF) rt_obj_release(result);
+        return;
     }
-
-    while (!handle->completed) {
-        TaskHandle* ready_task = task_queue_pop();
-        if (ready_task != NULL && !ready_task->completed) {
-            ready_task->resume_fn(ready_task->frame);
-            if (!ready_task->completed) {
-                task_queue_push(ready_task);
-            }
-        } else {
-            /* No runnable tasks — yield CPU instead of busy-waiting */
-            cpu_yield();
+    task->result = result;
+    task->result_kind = kind;
+    task->completed = 1;
+}
+void rt_task_complete(TaskHandle* task, void* result) {
+    rt_task_complete_owned(task, result, RT_TASK_RESULT_NONE);
+}
+void rt_task_wait_on(TaskHandle* child, int32_t owned) {
+    if (!current_task) rt_panic("task suspension outside scheduler");
+    if (!child || child == current_task) rt_panic("task cannot await itself or a null handle");
+    for (TaskHandle* p = child; p; p = p->dependency)
+        if (p == current_task) rt_panic("cyclic task dependency");
+    if (current_task->dependency) rt_panic("task already has a dependency");
+    current_task->dependency = child;
+    current_task->owns_dependency = owned;
+    if (!owned) child->refs++;
+}
+void rt_task_yield(void) { /* Resume functions return to the scheduler. */ }
+static void task_retire_completed(void) {
+    TaskHandle **link = &task_head, *prev = NULL;
+    while (*link) {
+        TaskHandle* task = *link;
+        if (!task->completed || task->running) { prev = task; link = &task->next; continue; }
+        *link = task->next;
+        if (task_tail == task) task_tail = prev;
+        task_clear_dependency(task, task->cancelled);
+        if (task->frame) {
+            void* frame = task->frame;
+            task->frame = NULL;
+            rt_obj_release(frame); /* scheduler GC root */
+            rt_obj_release(frame); /* transferred frame owner */
         }
+        task_release(task); /* scheduler handle owner */
+        /* Releasing a frame can cancel other tasks. Restart to retire those
+         * too before blocking in poll. */
+        link = &task_head; prev = NULL;
     }
-
-    return handle->result;
 }
-
-/**
- * Mark a task as complete.
- *
- * @param handle The task handle
- * @param result The result value
- */
-void rt_task_complete(TaskHandle* handle, void* result) {
-    if (handle == NULL) {
-        return;
-    }
-
-    handle->result = result;
-    handle->result_kind = RT_TASK_RESULT_NONE;
-    handle->completed = 1;
+static void task_native_result(TaskHandle* task, int32_t result) {
+    int32_t* box = malloc(sizeof(int32_t));
+    if (!box) rt_panic("async result allocation failed");
+    *box = result;
+    rt_task_complete_owned(task, box, RT_TASK_RESULT_BOX);
 }
-
-void rt_task_complete_owned(TaskHandle* handle, void* result, int32_t result_kind) {
-    if (handle == NULL) {
-        return;
+static void task_native_ready(TaskHandle* task) {
+#if defined(__unix__) || defined(__APPLE__)
+    ssize_t n;
+    if (task->native_kind == 2) {
+        n = recv(task->stream->fd, task->buffer, (size_t)task->length, 0);
+        if (n >= 0) { task->offset = (int32_t)n; task_native_result(task, (int32_t)n); }
+    } else {
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        n = send(task->stream->fd, task->buffer + task->offset,
+                 (size_t)(task->length - task->offset), flags);
+        if (n > 0) {
+            task->offset += (int32_t)n;
+            if (task->offset == task->length) task_native_result(task, task->offset);
+        } else if (n == 0) task_native_result(task, -EPIPE);
     }
-    handle->result = result;
-    handle->result_kind = result_kind;
-    handle->completed = 1;
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        task_native_result(task, -errno);
+#else
+    task_native_result(task, -ENOSYS);
+#endif
 }
-
-void* rt_task_take_result(TaskHandle* handle) {
-    if (handle == NULL) {
-        return NULL;
+static void task_poll_events(int may_block) {
+#if defined(__unix__) || defined(__APPLE__)
+    size_t count = 0;
+    int timeout = may_block ? -1 : 0;
+    int64_t now = task_now_ms();
+    for (TaskHandle* t = task_head; t; t = t->next) {
+        if (t->completed || t->running) continue;
+        if (t->native_kind == 1) {
+            int64_t delay = t->deadline - now;
+            if (delay <= 0) { task_native_result(t, 0); timeout = 0; }
+            else if (may_block && (timeout < 0 || delay < timeout))
+                timeout = delay > INT_MAX ? INT_MAX : (int)delay;
+        } else if (t->native_kind >= 2) count++;
     }
-    void* result = handle->result;
-    handle->result = NULL;
-    handle->result_kind = RT_TASK_RESULT_NONE;
+    if (!count && timeout < 0) rt_panic("async scheduler deadlock: no runnable tasks or I/O");
+    struct pollfd* fds = count ? calloc(count, sizeof(*fds)) : NULL;
+    TaskHandle** tasks = count ? malloc(count * sizeof(*tasks)) : NULL;
+    if (count && (!fds || !tasks)) rt_panic("async poll allocation failed");
+    size_t i = 0;
+    for (TaskHandle* t = task_head; t; t = t->next) {
+        if (t->completed || t->running || t->native_kind < 2) continue;
+        tasks[i] = t; fds[i].fd = t->stream->fd;
+        fds[i].events = t->native_kind == 2 ? POLLIN : POLLOUT; i++;
+    }
+    int n = poll(fds, (nfds_t)count, timeout);
+    if (n < 0 && errno != EINTR) rt_panic("async poll failed");
+    if (n > 0) for (i = 0; i < count; i++) {
+        if (fds[i].revents & POLLNVAL) task_native_result(tasks[i], -EBADF);
+        else if (fds[i].revents) task_native_ready(tasks[i]);
+    }
+    free(tasks); free(fds);
+#else
+    (void)may_block;
+    rt_panic("async I/O requires POSIX poll support");
+#endif
+}
+static void task_step(void) {
+    task_retire_completed();
+    if (!task_head) return;
+    /* Nonblocking polling on every turn prevents CPU-ready tasks from starving I/O. */
+    task_poll_events(0);
+    TaskHandle **link = &task_head, *prev = NULL;
+    while (*link) {
+        TaskHandle* t = *link;
+        if (!t->completed && !t->running && !t->native_kind &&
+            (!t->dependency || t->dependency->completed)) {
+            *link = t->next;
+            if (task_tail == t) task_tail = prev;
+            task_append(t);
+            task_clear_dependency(t, 0);
+            TaskHandle* saved = current_task;
+            current_task = t; t->running = 1;
+            t->resume_fn(t->frame);
+            t->running = 0; current_task = saved;
+            task_retire_completed();
+            return;
+        }
+        prev = t; link = &t->next;
+    }
+    task_retire_completed();
+    if (task_head) task_poll_events(1);
+    task_retire_completed();
+}
+void* rt_task_join(TaskHandle* task) {
+    if (!task) rt_panic("join of null task");
+    if (task->running) rt_panic("join of running task");
+    while (!task->completed) task_step();
+    task_retire_completed();
+    return task->result;
+}
+void* rt_task_borrow_result(TaskHandle* task) {
+    if (!task || !task->completed) rt_panic("result of pending task");
+    if (task->cancelled) rt_panic("await of cancelled task; use Task.wait() to inspect cancellation");
+    return task->result;
+}
+void* rt_task_take_result(TaskHandle* task) {
+    void* result = rt_task_borrow_result(task);
+    task->result = NULL; task->result_kind = RT_TASK_RESULT_NONE;
     return result;
 }
-
-void rt_task_destroy(TaskHandle* handle) {
-    if (handle == NULL) {
-        return;
-    }
-    if (!handle->completed) {
-        rt_task_join(handle);
-    }
-    if (handle->result != NULL) {
-        if (handle->result_kind == RT_TASK_RESULT_BOX) {
-            rt_free(handle->result);
-        } else if (handle->result_kind == RT_TASK_RESULT_HEAP_REF) {
-            rt_obj_release(handle->result);
-        }
-        handle->result = NULL;
-    }
-    if (handle->frame != NULL) {
-        rt_obj_release(handle->frame);
-        handle->frame = NULL;
-    }
-    free(handle);
+void rt_task_wait_done(TaskHandle* task) { rt_task_join(task); }
+void rt_scheduler_run(void) { while (task_head) task_step(); }
+void rt_scheduler_shutdown(void) {
+    for (TaskHandle* t = task_head; t; t = t->next) rt_task_cancel(t);
+    task_retire_completed();
 }
-
-/**
- * Yield control to the scheduler.
- *
- * Allows other tasks to run.
- */
-void rt_task_yield(void) {
-    /*
-     * Cooperative yield point. Generated state machines call this right
-     * before saving their state and RETURNING to whatever driver loop is
-     * running them (rt_task_join, rt_scheduler_run, or rt_scheduler_run's
-     * push-back path). EVERY driver re-queues a popped task whose resume
-     * returned incomplete, so the task is always rescheduled by its driver.
-     *
-     * This function must therefore NOT push the current task itself: doing
-     * so double-queues the task (once here, once by the driver). The second
-     * queue entry outlives the task — after the awaiter joins, takes the
-     * result, and destroys the handle, the stale entry is popped and its
-     * freed memory is interpreted as a TaskHandle, calling a garbage
-     * resume_fn (observed as SIGBUS in nested-async programs on macOS).
-     * It must not run a nested slice of another task either, for the same
-     * reason: the driver loop right above is about to do exactly that.
-     */
-    (void)current_task;
+TaskHandle* rt_async_sleep_start(int64_t ms) {
+    TaskHandle* task = task_new();
+    task->native_kind = 1;
+    int64_t now = task_now_ms();
+    task->deadline = ms <= 0 ? now : (ms > INT64_MAX - now ? INT64_MAX : now + ms);
+    return task;
 }
-
-/**
- * Poll a task's completion status.
- *
- * @param handle The task handle
- * @return 1 if complete, 0 if pending
- */
-int32_t rt_task_poll(TaskHandle* handle) {
-    if (handle == NULL) {
-        return 1; // NULL task is "complete"
-    }
-    return handle->completed;
+/* Streams own nonblocking socket descriptors. Every pending operation retains
+ * the stream, so closing the source wrapper cannot race descriptor reuse. */
+static AsyncStream* stream_adopt(int fd) {
+#if defined(__unix__) || defined(__APPLE__)
+    int socket_type;
+    socklen_t type_len = sizeof(socket_type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_len) < 0 ||
+        socket_type != SOCK_STREAM) { close(fd); return NULL; }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return NULL; }
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) < 0) { close(fd); return NULL; }
+#endif
+    AsyncStream* stream = malloc(sizeof(*stream));
+    if (!stream) { close(fd); rt_panic("async stream allocation failed"); }
+    stream->fd = fd; stream->refs = 1; return stream;
+#else
+    (void)fd; return NULL;
+#endif
 }
-
-/**
- * Run the scheduler until all tasks complete.
- *
- * This is the main event loop for async programs.
- */
-void rt_scheduler_run(void) {
-    while (task_queue_head != task_queue_tail) {
-        TaskHandle* task = task_queue_pop();
-        if (task != NULL && !task->completed) {
-            TaskHandle* prev = current_task;
-            current_task = task;
-            task->resume_fn(task->frame);
-            current_task = prev;
-            if (!task->completed) {
-                task_queue_push(task);
-            }
-        }
-    }
+void* rt_async_stream_adopt(int32_t fd) { return stream_adopt(fd); }
+void* rt_async_stream_pair(void** other) {
+    *other = NULL;
+#if defined(__unix__) || defined(__APPLE__)
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) return NULL;
+    AsyncStream* a = stream_adopt(fds[0]);
+    AsyncStream* b = stream_adopt(fds[1]);
+    if (!a || !b) { stream_release(a); stream_release(b); return NULL; }
+    *other = b; return a;
+#else
+    return NULL;
+#endif
+}
+void rt_async_stream_close(void* stream) { stream_release(stream); }
+int32_t rt_async_stream_shutdown(void* ptr) {
+#if defined(__unix__) || defined(__APPLE__)
+    AsyncStream* stream = ptr;
+    if (!stream) return -EBADF;
+    return shutdown(stream->fd, SHUT_WR) == 0 ? 0 : -errno;
+#else
+    (void)ptr; return -ENOSYS;
+#endif
+}
+TaskHandle* rt_async_read_start(void* ptr, int32_t limit) {
+    TaskHandle* task = task_new();
+    task->native_kind = 2; task->stream = ptr;
+    if (task->stream) task->stream->refs++;
+    if (!ptr || limit < 0) { task_native_result(task, -EINVAL); return task; }
+    task->length = limit;
+    task->buffer = malloc((size_t)limit + 1);
+    if (!task->buffer) { task_native_result(task, -ENOMEM); return task; }
+    if (limit == 0) task_native_result(task, 0);
+    return task;
+}
+static void* rt_string_handle_from_value(StringVal s);
+TaskHandle* rt_async_write_start(void* ptr, void* string) {
+    TaskHandle* task = task_new();
+    task->native_kind = 3; task->stream = ptr;
+    if (task->stream) task->stream->refs++;
+    StringVal value = rt_string_obj_value(string);
+    if (!ptr || value.len > INT32_MAX) { task_native_result(task, -EINVAL); return task; }
+    task->length = (int32_t)value.len;
+    task->buffer = malloc((size_t)task->length + 1);
+    if (!task->buffer) { task_native_result(task, -ENOMEM); return task; }
+    if (value.len) memcpy(task->buffer, value.data, (size_t)value.len);
+    if (!task->length) task_native_result(task, 0);
+    return task;
+}
+void* rt_async_read_data(TaskHandle* task) {
+    rt_task_borrow_result(task);
+    if (task->native_kind != 2) rt_panic("read data requires a read operation");
+    char* copy = malloc((size_t)task->offset + 1);
+    if (!copy) rt_panic("async read allocation failed");
+    if (task->offset) memcpy(copy, task->buffer, (size_t)task->offset);
+    copy[task->offset] = 0;
+    return rt_string_handle_from_value((StringVal){copy, task->offset});
 }
 
 /* ============================================================================
@@ -4383,5 +4423,6 @@ int main(int argc, char** argv) {
     rt_argc_global = argc;
     rt_argv_global = argv;
     int32_t rc = __rolang_user_main();
+    rt_scheduler_shutdown();
     return (int)rc;
 }

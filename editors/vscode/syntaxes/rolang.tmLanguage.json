@@ -101,7 +101,7 @@
 
     "keywords_async": {
       "name": "keyword.control.async.rolang",
-      "match": "\\b(async|await|throws|throw|try)\\b"
+      "match": "\\b(async|await|spawn|throws|throw|try)\\b"
     },
 
     "keywords_storage": {

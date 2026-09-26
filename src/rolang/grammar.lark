@@ -254,6 +254,7 @@ prefix_expr: "!" prefix_expr -> prefix_not_expr
            | "+" prefix_expr -> prefix_pos_expr
            | "~" prefix_expr -> prefix_bitnot_expr
            | "await" prefix_expr -> prefix_await_expr
+           | "spawn" prefix_expr -> prefix_spawn_expr
            | "try" prefix_expr -> prefix_try_expr
            | postfix_expr
 

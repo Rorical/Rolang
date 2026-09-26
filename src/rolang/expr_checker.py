@@ -38,6 +38,7 @@ class ExprChecker:
 
     def __init__(self, checker: "TypeChecker") -> None:
         self._c = checker
+        self._spawn_call: Optional[ast.Call] = None
 
     def _infer_with_expected(
         self,
@@ -496,6 +497,27 @@ class ExprChecker:
         if unop.operand is None:
             return self._c.type_table.error_type
 
+        if unop.op == "spawn":
+            if not isinstance(unop.operand, ast.Call):
+                self._c._error(TypeErrorKind.INVALID_OPERATION, "'spawn' requires an async function call")
+                return self._c.type_table.error_type
+            previous_spawn = self._spawn_call
+            self._spawn_call = unop.operand
+            try:
+                result = self._infer_with_expected(unop.operand, None)
+            finally:
+                self._spawn_call = previous_spawn
+            callee_type = self._c.expr_types.get(id(unop.operand.callee))
+            info = self._c.type_table.get_type(callee_type) if callee_type else None
+            if not info or not isinstance(info.data, FunctionTypeData) or not info.data.is_async:
+                self._c._error(TypeErrorKind.INVALID_OPERATION, "'spawn' requires an async function call")
+                return self._c.type_table.error_type
+            task_symbol = self._c.symbol_table.get_type_symbol("Task")
+            if task_symbol is None:
+                self._c._error(TypeErrorKind.INVALID_OPERATION, "Import std.task to use 'spawn'")
+                return self._c.type_table.error_type
+            return self._c.type_table.make_struct(task_symbol, (result,))
+
         if (unop.op == "-" and isinstance(unop.operand, ast.Literal)
                 and unop.operand.kind == "int"):
             operand_type = self._infer_int_literal(unop.operand, negative=True)
@@ -533,6 +555,12 @@ class ExprChecker:
                     "'await' can only be used inside an async function"
                 )
                 return self._c.type_table.error_type
+
+            task_info = self._c.type_table.get_type(operand_type)
+            if task_info and isinstance(task_info.data, StructTypeData):
+                task_symbol = self._c.symbol_table.get_type_symbol("Task")
+                if task_info.data.symbol_id == task_symbol and len(task_info.data.type_args) == 1:
+                    return task_info.data.type_args[0]
 
             # `await` on a function reference extracts the return type; on
             # anything else it is the identity (the call has already been
@@ -712,7 +740,8 @@ class ExprChecker:
             # Async-safety: calling an async function from a non-async context
             # would later miscompile or behave non-deterministically. Reject it
             # at the type-check stage and point users at the fix.
-            if func_data.is_async and not self._c._in_async_function:
+            if (func_data.is_async and not self._c._in_async_function
+                    and call is not self._spawn_call):
                 callee_name = "<async function>"
                 if callee_symbol is not None:
                     sym = self._c.symbol_table.get_symbol(callee_symbol)

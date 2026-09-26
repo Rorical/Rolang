@@ -10,7 +10,7 @@ Transforms async functions into state machine form for cooperative multitasking.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .types import TypeId, TypeTable
 from .symbols import SymbolTable
@@ -70,7 +70,7 @@ class AsyncAnalyzer:
     def _is_async_call(self, op: Op) -> bool:
         """Return True if this call op targets a known async function."""
         if isinstance(op, CallStatic):
-            return op.func_name in self.async_func_names
+            return op.func_name in self.async_func_names or op.func_name in {"__rolang_await_task", "rt_task_wait_done"}
         # For indirect calls (VTable, Witness, Closure) we cannot statically
         # determine the callee name, so we conservatively treat them as
         # potential await points when the function itself is async-aware.
@@ -114,7 +114,6 @@ def lower_async(mir_result: MirBuildResult) -> AsyncLoweringResult:
     # Analyze once up front. We also pre-create every async frame struct before
     # building resume bodies so a caller can allocate and initialize a spawned
     # callee's frame at MIR level.
-    async_with_awaits: set[str] = set()
     for f in mir_result.program.functions:
         if not f.is_async:
             continue
@@ -127,8 +126,6 @@ def lower_async(mir_result: MirBuildResult) -> AsyncLoweringResult:
         # resume function's entry switches on ``frame.state`` to land on
         # the right segment when the scheduler re-runs the task.
         await_points_by_func[f.name] = await_points
-        if await_points:
-            async_with_awaits.add(f.name)
 
     if errors:
         return AsyncLoweringResult(
@@ -174,6 +171,38 @@ def lower_async(mir_result: MirBuildResult) -> AsyncLoweringResult:
         frame_mir = MirStruct(name=frame_name, symbol_id=frame_sym_id, fields=frame_fields, type_id=frame_type_id)
         new_structs.append(frame_mir)
 
+    for owner in mir_result.program.functions:
+        next_local = max((l.id.id for l in owner.locals), default=0) + 1
+        for block in owner.blocks.values():
+            expanded = []
+            for op in block.ops:
+                if isinstance(op, TaskSpawn) and op.frame is None:
+                    callee = async_functions_by_name.get(op.async_func_name)
+                    frame_type = frame_type_ids.get(op.async_func_name)
+                    if callee is None or frame_type is None:
+                        errors.append(f"Cannot spawn async external function '{op.async_func_name}'; use an async wrapper")
+                        continue
+                    local_id = LocalId(next_local)
+                    next_local += 1
+                    owner.locals.append(Local(local_id, None, "_spawn_frame", frame_type, False, False))
+                    if owner.is_async:
+                        owner_frame = next(st for st in new_structs if st.type_id == frame_type_ids[owner.name])
+                        insert_at = 2 + len(owner.locals) - 1
+                        owner_frame.fields.insert(insert_at, MirField(f"$f{local_id}", frame_type, True))
+                    expanded.append(AllocAsyncFrame(local_id, frame_type))
+                    expanded.extend(_store_args_to_frame(local_id, callee, op.args))
+                    op.frame = CopyOperand(Place(local_id, [], frame_type))
+                    op.args = []
+                expanded.append(op)
+                if isinstance(op, TaskSpawn) and op.frame is not None:
+                    expanded.append(Assign(place=op.frame.place,
+                        value=ConstantOperand(ConstantKind.NIL, None, op.frame.place.type_id)))
+            block.ops = expanded
+        # Expansion shifts await instruction indices. Transferred frame temps
+        # are reset to nil before they can be spilled across a suspension.
+        if owner.is_async:
+            await_points_by_func[owner.name] = AsyncAnalyzer(owner, async_func_names).analyze()
+
     for func in mir_result.program.functions:
         if not func.is_async:
             new_functions.append(func)
@@ -190,7 +219,6 @@ def lower_async(mir_result: MirBuildResult) -> AsyncLoweringResult:
             mir_result,
             frame_type_id,
             frame_name,
-            async_with_awaits,
             frame_type_ids,
             async_functions_by_name,
         )
@@ -390,7 +418,6 @@ def _build_resume(
     mir_result: MirBuildResult,
     frame_type_id: TypeId,
     frame_name: str,
-    async_with_awaits: Set[str],
     frame_type_ids: Dict[str, TypeId],
     async_functions_by_name: Dict[str, MirFunction],
 ) -> MirFunction:
@@ -404,11 +431,9 @@ def _build_resume(
       1. Loads every original local from the frame (cheap and uniform).
       2. Optionally performs a *post-await fixup* — pulls a spawned
          child task's result out of ``frame._task_{i-1}``.
-      3. Emits the original ops in its slice of the block, replacing
-         the await call with either a synchronous direct call (leaf
-         async children) or a ``TaskSpawn`` + ``frame._task_i`` store
-         followed by a ``TaskYield`` / ``Return(None)`` exit (non-leaf
-         children).
+      3. Emits the original ops, starts or borrows the awaited task,
+         registers a dependency and saves its handle in the frame.
+         TaskYield / Return(None) gives control back to the scheduler.
       4. Spills locals to the frame, then either yields (mid-await)
          or runs the block's original terminator. ``Return(X)``
          terminators are converted into ``TaskComplete(handle, X)``
@@ -504,7 +529,7 @@ def _build_resume(
         return stores
 
     is_spawn: List[bool] = [
-        ap.awaited_call.func_name in async_with_awaits for ap in await_points
+        ap.awaited_call.func_name not in {"__rolang_await_task", "rt_task_wait_done"} for ap in await_points
     ]
 
     # Group awaits by their containing block, sorted by op_index.
@@ -557,96 +582,75 @@ def _build_resume(
         return term
 
     def _emit_await(ap: AwaitPoint, global_idx: int, ops: List[Op]) -> None:
-        """Emit the spawn-or-direct-call lowering for an await point.
+        """Start a child or borrow a Task handle, then park on its completion."""
+        if not is_spawn[global_idx]:
+            ops.append(Store(place=_fplace(2 + len(func.locals) + global_idx, ptr_t),
+                             value=ap.awaited_call.args[0]))
+            ops.append(CallStatic(result=None, func_name="rt_task_wait_on", func_symbol=None,
+                args=[ap.awaited_call.args[0], ConstantOperand(ConstantKind.INT, 0, i32_t)], result_type=void_t))
+            return
 
-        For spawned children: allocates the child frame (if known),
-        copies args, calls TaskSpawn, and stashes the resulting handle
-        in ``frame._task_{global_idx}``. For leaf children: emits a
-        synchronous CallStatic and assigns the result to
-        ``ap.result_local``.
-        """
         task_result = fresh_local_id()
         new_locals.append(Local(
             id=task_result, symbol_id=None,
             name=f"_task_res{global_idx}",
-            type_id=ptr_t if is_spawn[global_idx] else ap.result_type,
+            type_id=ptr_t,
             is_mutable=True, is_arg=False,
         ))
 
-        if is_spawn[global_idx]:
-            child_frame_operand: Optional[Operand] = None
-            callee_name = ap.awaited_call.func_name if isinstance(ap.awaited_call, CallStatic) else ""
-            child_func = async_functions_by_name.get(callee_name)
-            child_frame_type = frame_type_ids.get(callee_name)
-            if callee_name and (child_func is None or child_frame_type is None):
-                errors.append(
-                    f"async_lowering: cannot find frame for async callee '{callee_name}'; "
-                    "arguments will not be passed correctly"
-                )
-            if child_func is not None and child_frame_type is not None:
-                child_frame = fresh_local_id()
-                new_locals.append(Local(
-                    id=child_frame, symbol_id=None,
-                    name=f"_child_frame_{global_idx}",
-                    type_id=child_frame_type,
-                    is_mutable=False, is_arg=False,
-                ))
-                ops.append(AllocAsyncFrame(
-                    result=child_frame, frame_type=child_frame_type,
-                ))
-                ops.extend(_store_args_to_frame(
-                    child_frame, child_func, ap.awaited_call.args,
-                ))
-                child_frame_operand = CopyOperand(Place(
-                    base=child_frame, projections=[],
-                    type_id=child_frame_type,
-                ))
+        child_frame_operand: Optional[Operand] = None
+        callee_name = ap.awaited_call.func_name if isinstance(ap.awaited_call, CallStatic) else ""
+        child_func = async_functions_by_name.get(callee_name)
+        child_frame_type = frame_type_ids.get(callee_name)
+        if callee_name and (child_func is None or child_frame_type is None):
+            raise ValueError(f"Missing async frame for '{callee_name}'")
+        if child_func is not None and child_frame_type is not None:
+            child_frame = fresh_local_id()
+            new_locals.append(Local(
+                id=child_frame, symbol_id=None,
+                name=f"_child_frame_{global_idx}",
+                type_id=child_frame_type,
+                is_mutable=False, is_arg=False,
+            ))
+            ops.append(AllocAsyncFrame(
+                result=child_frame, frame_type=child_frame_type,
+            ))
+            ops.extend(_store_args_to_frame(
+                child_frame, child_func, ap.awaited_call.args,
+            ))
+            child_frame_operand = CopyOperand(Place(
+                base=child_frame, projections=[],
+                type_id=child_frame_type,
+            ))
 
-            ops.append(TaskSpawn(
-                result=task_result,
-                async_func_name=callee_name,
-                args=[] if child_frame_operand is not None else ap.awaited_call.args,
-                result_type=ptr_t,
-                frame=child_frame_operand,
-            ))
-            task_field_idx = 2 + len(func.locals) + global_idx
-            ops.append(Store(
-                place=_fplace(task_field_idx, ptr_t),
-                value=CopyOperand(Place(
-                    base=task_result, projections=[], type_id=ptr_t,
-                )),
-            ))
-        else:
-            ops.append(CallStatic(
-                result=task_result,
-                func_name=ap.awaited_call.func_name,
-                func_symbol=ap.awaited_call.func_symbol,
-                args=ap.awaited_call.args,
-                result_type=ap.result_type,
-            ))
-            if ap.result_local is not None:
-                ops.append(Assign(
-                    place=Place(
-                        base=ap.result_local, projections=[],
-                        type_id=ap.result_type,
-                    ),
-                    value=CopyOperand(Place(
-                        base=task_result, projections=[],
-                        type_id=ap.result_type,
-                    )),
-                ))
+        ops.append(TaskSpawn(
+            result=task_result,
+            async_func_name=callee_name,
+            args=[] if child_frame_operand is not None else ap.awaited_call.args,
+            result_type=ptr_t,
+            frame=child_frame_operand,
+        ))
+        task_field_idx = 2 + len(func.locals) + global_idx
+        ops.append(Store(
+            place=_fplace(task_field_idx, ptr_t),
+            value=CopyOperand(Place(
+                base=task_result, projections=[], type_id=ptr_t,
+            )),
+        ))
+        ops.append(CallStatic(result=None, func_name="rt_task_wait_on", func_symbol=None,
+            args=[CopyOperand(Place(task_result, [], ptr_t)), ConstantOperand(ConstantKind.INT, 1, i32_t)],
+            result_type=void_t))
 
     def _emit_post_await_fixup(ap: AwaitPoint, global_idx: int, ops: List[Op]) -> None:
         """Recover a spawned child's result after re-entry.
 
-        For direct (leaf) calls this is a no-op — the result was
-        assigned synchronously at the call site. For spawns we read
-        the stashed handle out of ``frame._task_{global_idx}`` and run
-        ``TaskGetResult`` to pull the value into ``ap.result_local``.
+        Read the saved handle and extract the result. Implicit child handles
+        are consumed; source Task handles retain their result for repeated
+        awaits. Task.wait() only waits for completion and reads no result.
         Void returns still need the call so the runtime can destroy
         the handle and avoid leaking one ``TaskHandle*`` per spawn.
         """
-        if not is_spawn[global_idx]:
+        if ap.awaited_call.func_name == "rt_task_wait_done":
             return
 
         handle_local_id = fresh_local_id()
@@ -676,6 +680,7 @@ def _build_resume(
                 base=handle_local_id, projections=[], type_id=ptr_t,
             )),
             result_type=ap.result_type,
+            consume=is_spawn[global_idx],
         ))
 
     blocks: Dict[BlockId, Block] = {}

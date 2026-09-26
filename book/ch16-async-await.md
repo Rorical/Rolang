@@ -1,157 +1,162 @@
-# Chapter 16: Async/Await
+# Chapter 16: Async/Await and Tasks
 
-Rolang has built-in support for asynchronous programming through the `async` and `await` keywords. Async functions compile to cooperative state machines driven by a single-threaded task scheduler in the runtime.
+Rolang compiles async functions to state machines. A single-threaded cooperative
+scheduler runs ready tasks and uses POSIX `poll` for socket readiness and a
+monotonic clock for timers. Pending operations let other tasks run; an idle
+scheduler blocks instead of spinning.
 
-## Why Async?
-
-Async is useful for structuring concurrent work — multiple tasks that can make progress independently. Instead of blocking while waiting for one task to complete, the scheduler can run another.
-
-Rolang's async model is *cooperative* and *single-threaded*: there are no OS threads, no preemption, and no parallel execution. Tasks voluntarily yield at `await` points, letting the scheduler run other tasks.
-
-## Declaring an Async Function
-
-Add the `async` keyword before the return type:
+## Async functions
 
 ```rolang
-def load_data() async -> String {
-    return "result";
-}
-```
+def load() async -> i32 { return 42; }
 
-## Calling an Async Function
-
-Async functions must be called with `await` from within another async function:
-
-```rolang
-def process() async -> i32 {
-    let data = await load_data();
-    return data.len() as i32;
-}
-```
-
-Calling an async function from a non-async context is a compile-time error. The `async` annotation propagates up the call stack.
-
-## The Async Entry Point
-
-The `main` function may be declared `async`. This starts the scheduler and drives all tasks to completion before the program exits:
-
-```rolang
 def main() async -> i32 {
-    let result = await process();
-    return result;
+    return await load();
 }
 ```
 
-## Chaining Awaits
+`await` is available inside async functions. An ordinary async call waits for its
+child task. Use `spawn` to start independent work before waiting for its result.
 
-Multiple `await` expressions execute sequentially within a function. The scheduler may run other tasks between them:
-
-```rolang
-def fetch_a() async -> i32 { return 1; }
-def fetch_b() async -> i32 { return 2; }
-def fetch_c() async -> i32 { return 3; }
-
-def combine() async -> i32 {
-    let a = await fetch_a();
-    let b = await fetch_b();
-    let c = await fetch_c();
-    return a + b + c;   // 6
-}
-```
-
-## How It Works
-
-Each `async` function is compiled into three pieces:
-
-1. An **entry function** (keeps the original name) that allocates a state-machine frame on the heap and registers it with the task scheduler.
-2. A **resume function** (`FuncName_resume`) that the scheduler calls repeatedly to advance the state machine.
-3. A **frame struct** (`FuncName_Frame`) that holds `state`, all locals that must survive across `await` points, and a task handle.
-
-When `await` is reached, the resume function saves its state to the frame, pushes itself back onto the scheduler's task queue, and returns. The next time it is called, it picks up exactly where it left off.
-
-## Task Scheduling
-
-The runtime maintains a FIFO task queue:
-
-- `rt_task_spawn`: push a new task onto the queue
-- `rt_task_yield`: push the current task and run the next one
-- `rt_task_join(handle)`: spin the queue until a specific task completes
-
-The entry function runs `rt_task_join` on its own handle, so `await func()` in non-main code blocks until that specific task completes before continuing.
-
-## Cooperative Yielding
-
-Because scheduling is cooperative, a task that never reaches an `await` will never yield. An infinite loop without `await` inside an async function will starve all other tasks:
+## Spawn and await
 
 ```rolang
-// Bad — this never yields:
-def runaway() async -> Void {
-    while true { }
-}
+import std.task
+import std.io
 
-// Good — yield on every iteration (if needed):
-def polling() async -> Void {
-    while true {
-        let status = await check_status();
-        if status { break; }
-    }
-}
-```
-
-## Async with Result
-
-Async functions combine naturally with `Result` for error propagation:
-
-```rolang
-import "result.rl"
-
-def fetch_user(id: i32) async -> Result<String, String> {
-    if id <= 0 {
-        return Result.err(error: "invalid id");
-    }
-    return Result.ok(value: "user_" + id.to_string());
-}
-
-def load_profile(id: i32) async -> Result<String, String> {
-    let user = try (await fetch_user(id));
-    return Result.ok(value: "profile of " + user);
-}
-```
-
-## Current Limitations
-
-- **Single-threaded only.** No OS thread parallelism.
-- **No I/O event loop.** There is no integration with `epoll`, `kqueue`, or timers. `await` only interleaves tasks already on the queue.
-- **No `spawn` keyword yet.** Every `await` immediately joins its task. True concurrent execution (fire and forget) is not yet available at the source level.
-- **No cancellation.** Tasks cannot be cancelled once started.
-
-## A Complete Example
-
-```rolang
-import "io.rl"
-
-def square(n: i64) async -> i64 {
-    return n * n;
-}
-
-def sum_of_squares(a: i64, b: i64) async -> i64 {
-    let sq_a = await square(a);
-    let sq_b = await square(b);
-    return sq_a + sq_b;
+def work(n: i32) async -> i32 {
+    await sleep(10);
+    return n * 2;
 }
 
 def main() async -> i32 {
-    let result = await sum_of_squares(3, 4);   // 9 + 16 = 25
-    println_i64(result);
+    let first = spawn work(20);   // Task<i32>
+    let second = spawn work(21);
+    println_i32(await first);
+    println_i32(await second);
     return 0;
 }
 ```
 
-## Summary
+Arguments are evaluated when spawning, and the task retains heap arguments until
+its frame is released. `spawn` returns immediately; the function body runs when
+the scheduler next gets control. Named async functions, generic specializations,
+and statically resolved methods are supported. Async closures, dynamic protocol
+dispatch, and spawning external C functions directly are not supported.
 
-- Declare async functions with `async` before the return type: `def f() async -> T`
-- Call async functions with `await`: `let x = await f()`
-- `async` is contagious — calling an async function from a non-async context is a compile error
-- `main` may be `async`; it starts the scheduler and drives all tasks to completion
-- The runtime is single-threaded and cooperative — tasks yield only at `await` points
-- Combine with `Result` for async operations that can fail
+`Task<T>` has reference semantics: copying a binding aliases the same task.
+`await task` returns a value of type `T`, including `Void`. A completed result can
+be awaited repeatedly. Heap results retain their usual reference semantics.
+
+## Task control
+
+| Operation | Meaning |
+| --- | --- |
+| `task.done()` | Whether the task completed or was cancelled. |
+| `task.cancel()` | Cancel unfinished work; return true only for the first successful cancellation. |
+| `task.cancelled()` | Whether cancellation ended the task. |
+| `await task.wait()` | Wait without extracting a result; return false for cancellation, true for normal completion. |
+| `task.wait_blocking()` | Drive the scheduler from synchronous code until the task finishes; return the same completion status. |
+| `await task` | Obtain the result; panics if the task was cancelled. |
+| `await sleep(milliseconds)` | Suspend on a timer. Zero and negative durations yield without a delay. |
+| `await yield_now()` | Give other ready tasks a chance to run. |
+
+`spawn` is allowed in synchronous code. `wait_blocking()` provides a synchronous
+bridge; prefer `await` inside async code so waits become state-machine suspension
+points. Self-await and cyclic task dependencies panic with a diagnostic.
+
+Dropping the last reference to a Task cancels unfinished work. A task retains its
+result until its last reference is dropped. Cycles involving tasks are traced by
+the cycle collector and may be reclaimed later.
+
+Cancellation takes effect between resume steps. It cancels an implicit child
+being awaited, releases the suspended frame and its managed resources, and wakes
+waiters. It does not preempt running code. Cancelling a waiter does not cancel a
+separately owned task that another caller may still await.
+
+**Cancellation discards the suspended continuation, including pending `defer`
+blocks.** Put resources that must be released on cancellation in managed objects
+with `__release__` hooks. Code already running continues until it yields or
+returns; side effects already performed are not rolled back.
+
+Returning from `main` cancels remaining tasks and releases their frames. Keep
+handles and await the work whose completion is required before exit.
+
+## Asynchronous socket streams
+
+Import `std.async_io` for `AsyncStream` and `AsyncPipe`. Import `std.task`
+explicitly when using its timer/task APIs.
+
+`AsyncPipe.create()` returns an optional pair of connected, full-duplex local
+socket streams. This example writes from one task while another reads:
+
+```rolang
+import std.async_io
+import std.task
+import std.io
+
+def writer(stream: AsyncStream) async -> i32 {
+    await sleep(10);
+    let written = await stream.write("hello");
+    stream.shutdown_write();
+    switch written {
+        case .ok(let count): return count;
+        case .err(let error): return -error;
+    }
+}
+
+def main() async -> i32 {
+    if let pair = AsyncPipe.create() {
+        let sender = spawn writer(pair.second);
+        while true {
+            let result = await pair.first.read(4096);
+            switch result {
+                case .ok(let chunk):
+                    if chunk.len() == 0 { break; }
+                    print(chunk);
+                case .err(let error): return error;
+            }
+        }
+        let count = await sender;
+        return 0;
+    }
+    return 1;
+}
+```
+
+- `read(limit)` returns `Result<String, i32>`. Success contains at most `limit`
+  bytes; an empty string means EOF, or a zero-length read. A negative limit
+  returns an error. Read boundaries are byte boundaries and can split UTF-8.
+- `write(value)` returns `Result<i32, i32>` after sending every byte, handling
+  partial writes and backpressure. Success contains the byte count.
+- Error values are positive POSIX `errno` numbers. A failed or cancelled write
+  may already have sent a prefix; it is not transactional.
+- `shutdown_write()` sends EOF after pending data has been written. Call it after
+  awaiting writes. It returns zero on success or negative `errno` on failure.
+- Concurrent reads can divide incoming bytes between readers; concurrent writes
+  can interleave. Use one reader and one writer per stream when ordering matters.
+- Pending operations retain the stream. Its descriptor closes after both its
+  managed wrapper and all pending operations release their references.
+
+For a connected socket obtained through FFI, `unsafe { AsyncStream.adopt(fd) }`
+transfers exclusive descriptor ownership, including on failure, and makes the
+socket nonblocking. The caller must stop using or closing that descriptor.
+`Task.from_handle` and `raw_handle` are unsafe runtime integration APIs; a handle
+must have the matching result representation and exactly one transferred owner.
+
+## Implementation and limits
+
+Each async function has an entry function, a resume function, and a heap frame.
+Await points save locals and register a task dependency. The scheduler resumes
+the frame only when the dependency completes. Results are copied from shared
+Task handles or transferred from private child handles, with ARC ownership
+preserved in both cases.
+
+- Execution is cooperative, on one thread. CPU loops need explicit yields.
+- Timer/socket I/O is implemented for POSIX hosts (Linux/macOS); validation here
+  has been performed on Apple Silicon macOS.
+- Existing `std.fs` and console I/O remain blocking. Regular-file asynchronous
+  I/O, DNS, connect/listen/accept helpers, and TLS are not implemented.
+- `poll` scans pending operations; this is not an epoll/kqueue scalability claim.
+- Cancellation does not unwind suspended `defer` blocks, and cycle collection
+  remains synchronous.

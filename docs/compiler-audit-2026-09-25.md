@@ -44,7 +44,7 @@ uv run pytest -q -n 4
 - Numeric literals now use concrete parameter types, including narrow integer arguments and signed minima. Variables still require explicit casts when narrowing.
 - Signed division truncates toward zero. Minimum divided by -1 wraps to minimum; its remainder is zero. Zero divisors still panic. NaN converts to integer zero, and compares unequal to every floating-point value.
 - Cyclic garbage is reclaimed by a synchronous generational cycle collector. Collection can pause execution, and destruction of cyclic objects is delayed. The README's former pause-free claim was incorrect.
-- Async execution remains cooperative and single-threaded, with no source-level spawn, cancellation, or I/O event loop. Those require language/runtime features beyond this corrective refactor.
+- At the initial audit, async execution lacked source-level spawn, cancellation, and an I/O event loop. These are implemented in the subsequent [async/task implementation](async-io-task-control.md); execution remains cooperative and single-threaded.
 - `--emit mir` and `--emit llvm` retain their original stages. New `--emit mir-opt` includes async lowering, MIR optimization and ARC; `--emit llvm-opt` exposes verified backend-optimized LLVM IR; `--emit asm` emits assembly with the same target and optimization settings as object output.
 - Object output is one unified translation unit containing the entry and its dependencies. This does not implement independent module compilation or reusable generic metadata; separately emitted objects with shared dependencies can contain duplicate symbols.
 - Package dependencies support paths and Git; a package registry remains unsupported.
@@ -67,4 +67,4 @@ rolangc --emit asm -O3 program.rl -o program.s
 
 Final follow-up validation: **767 passed, no skips**, in 301.70 seconds on Apple Silicon macOS. This includes 43 focused literal/function-value/output checks and the two newly enabled project build/run tests. Emitted assembly is independently assembled, linked, and executed at O0–O3; LLVM output is verified; callback tests check observable output and heap-object reclamation.
 
-Remaining architectural work is unchanged: asynchronous I/O and task spawning/cancellation, independent module compilation with generic metadata, and a package registry. Synchronous cycle collection remains an execution-time caveat. These require separate language/runtime or service designs; this follow-up does not implement them.
+The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). Independent module compilation with generic metadata and a package registry remain outstanding. Synchronous cycle collection remains an execution-time caveat.

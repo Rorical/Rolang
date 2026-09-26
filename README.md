@@ -231,7 +231,7 @@ Protocols can be used with static dispatch through generics (`<T: P>`) or dynami
 
 ### Async / Await
 
-Async functions compile to state machines driven by a single-threaded cooperative task scheduler in the runtime. Every `await` is a yield point; the scheduler runs all tasks to completion without OS threads or preemption.
+Async functions compile to state machines driven by a single-threaded cooperative scheduler. `spawn` creates `Task<T>` handles with cancellation and repeatable awaits. Timers and socket-stream I/O suspend through a POSIX `poll` event loop.
 
 ```rolang
 def load() async -> i32 {
@@ -249,7 +249,7 @@ def main() async -> i32 {
 }
 ```
 
-`async` propagates upward — calling an async function from a non-async context is a compile error.
+Use `spawn work()` to start an async function from either synchronous or async code. Import `std.task` for task control, `sleep`, and `yield_now`; import `std.async_io` for nonblocking socket streams. See [Async/Await and Tasks](book/ch16-async-await.md) for ownership, cancellation, and platform limits.
 
 ### Closures and Function Values
 

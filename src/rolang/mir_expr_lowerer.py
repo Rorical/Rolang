@@ -36,7 +36,7 @@ from .mir import (
     CallStatic, CallVTable, CallWitness,
     MakeClosure, CallClosure,
     BoxExistential, ExistentialCheckType, ExistentialUnbox,
-    TaskYield,
+    TaskYield, TaskSpawn,
     Clone,
     Terminator, Branch, CondBranch, SwitchInt, Return, Unreachable,
 )
@@ -328,9 +328,42 @@ class MirExpressionLowerer:
 
     def _lower_unary_op(self, unop: HirUnaryOp) -> Operand:
         """Lower a unary operation."""
+        if unop.op == "spawn":
+            self.lower_expr(unop.operand)
+            block = self._b.current_block()
+            call = block.ops.pop() if block and block.ops else None
+            if not isinstance(call, CallStatic):
+                self._b.errors.append("spawn currently requires a statically resolved async call")
+                return ConstantOperand(ConstantKind.UNIT, None, unop.type_id)
+            ptr_t = self._b.type_table.get_builtin("RawPtr")
+            handle = self._b.create_temp(ptr_t)
+            self._b.emit_op(TaskSpawn(result=handle, async_func_name=call.func_name,
+                                      args=call.args, result_type=ptr_t))
+            result = self._b.create_temp(unop.type_id)
+            self._b.emit_op(MakeStruct(result=result, struct_type=unop.type_id,
+                fields=[("handle", CopyOperand(Place(handle, [], ptr_t)))]))
+            return CopyOperand(Place(result, [], unop.type_id))
+
         operand = self.lower_expr(unop.operand)
 
         if unop.op == "await":
+            info = self._b.type_table.get_type(operand_type(operand))
+            if info and isinstance(info.data, StructTypeData):
+                symbol = self._b.symbol_table.get_symbol(info.data.symbol_id)
+                if symbol and (symbol.name == "Task" or symbol.name.startswith("Task_")):
+                    ptr_t = self._b.type_table.get_builtin("RawPtr")
+                    handle = self._b.create_temp(ptr_t)
+                    self._b.emit_op(ExtractField(result=handle, aggregate=operand, field_index=0,
+                        field_name="handle", result_type=ptr_t))
+                    is_void = unop.type_id == self._b.type_table.void_type
+                    result = None if is_void else self._b.create_temp(unop.type_id)
+                    self._b.emit_op(CallStatic(result=result, func_name="__rolang_await_task",
+                        func_symbol=None, args=[CopyOperand(Place(handle, [], ptr_t))],
+                        result_type=unop.type_id))
+                    if is_void:
+                        return ConstantOperand(ConstantKind.UNIT, None, unop.type_id)
+                    return CopyOperand(Place(result, [], unop.type_id))
+
             operand = self._b._coerce_operand(operand, unop.type_id)
             # Emit TaskYield to allow cooperative scheduling.
             # The async lowering pass will later transform this into

@@ -600,6 +600,7 @@ class TaskGetResult(Op):
     result: LocalId
     task_handle: Operand
     result_type: TypeId
+    consume: bool = True  # False copies the result and preserves its Task owner.
 
 
 # =============================================================================
@@ -1026,7 +1027,8 @@ def format_op(op: Op, type_table: TypeTable) -> str:
         return "scheduler_run"
     elif isinstance(op, TaskGetResult):
         handle = format_operand(op.task_handle, type_table)
-        return f"_{op.result.id} = task_get_result {handle}"
+        operation = "task_get_result" if op.consume else "task_borrow_result"
+        return f"_{op.result.id} = {operation} {handle}"
     elif isinstance(op, AllocObj):
         type_str = type_table.format_type(op.result_type)
         return f"_{op.result.id} = alloc_obj {type_str}"

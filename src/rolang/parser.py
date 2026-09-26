@@ -937,6 +937,9 @@ class RoLangTransformer(Transformer):
     def prefix_bitnot_expr(self, items: list) -> ast.UnaryOp:
         return ast.UnaryOp(op="~", operand=items[0])
 
+    def prefix_spawn_expr(self, items: list) -> ast.UnaryOp:
+        return ast.UnaryOp(op="spawn", operand=items[0])
+
     def prefix_await_expr(self, items: list) -> ast.UnaryOp:
         return ast.UnaryOp(op="await", operand=items[0])
 
