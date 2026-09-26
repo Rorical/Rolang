@@ -723,8 +723,14 @@ class MirFunctionBuilder:
 
         if ret.value is not None:
             value = self.expr_lowerer.lower_expr(ret.value)
-            value = self._coerce_operand(value, self.func.return_type)
-            self.emit_terminator(Return(value=value))
+            if self.func.return_type == self.type_table.void_type:
+                # A Void expression still has effects, but no return operand.
+                # Emitting its UNIT placeholder would produce `ret i64 0` in
+                # a void function, including function-value adapters.
+                self.emit_terminator(Return(value=None))
+            else:
+                value = self._coerce_operand(value, self.func.return_type)
+                self.emit_terminator(Return(value=value))
         else:
             self.emit_terminator(Return(value=None))
 

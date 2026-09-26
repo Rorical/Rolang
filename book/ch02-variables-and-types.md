@@ -136,6 +136,8 @@ let x: i32 = 5;
 takes_i64(x);   // ok — i32 widens to i64 automatically
 ```
 
+Numeric literals use a known parameter type at function, method, and enum payload call sites. For example, a function taking `i8` accepts `f(-128)` without a cast; `f(128)` is rejected as out of range. This does not allow an `i32` variable to narrow implicitly. Explicit casts retain their conversion semantics, so `f(128 as i8)` deliberately truncates.
+
 ### Explicit Cast (`as`)
 
 All other numeric conversions require an explicit `as` cast:

@@ -191,6 +191,12 @@ class MirExpressionLowerer:
             symbol = self._b.symbol_table.get_symbol(var.symbol_id) if var.symbol_id else None
             signature = self._b.type_table.get_function_data(var.type_id)
             if symbol and symbol.kind == SymbolKind.FUNCTION and signature:
+                if getattr(symbol.decl_node, "is_unsafe", False):
+                    self._b.errors.append("Unsafe function values require a wrapper with an explicit unsafe block")
+                    return ConstantOperand(ConstantKind.NIL, None, var.type_id)
+                if getattr(symbol.decl_node, "generic_params", None):
+                    self._b.errors.append("Generic function values require a non-generic wrapper")
+                    return ConstantOperand(ConstantKind.NIL, None, var.type_id)
                 if signature.is_async:
                     self._b.errors.append("Async function values are not supported; call and await the function directly")
                     return ConstantOperand(ConstantKind.NIL, None, var.type_id)

@@ -306,7 +306,10 @@ rolangc hello.rl                 # compile to ./hello
 rolangc hello.rl -o greet        # custom output name
 rolangc -c hello.rl -o hello.o   # object file only
 rolangc --emit llvm hello.rl     # print LLVM IR
-rolangc --emit mir  hello.rl     # print MIR (debug)
+rolangc --emit mir  hello.rl     # MIR before async lowering and ARC
+rolangc --emit mir-opt -O3 hello.rl   # lowered, optimized MIR with ARC
+rolangc --emit llvm-opt -O3 hello.rl  # LLVM IR after backend optimization
+rolangc --emit asm -O3 hello.rl       # native assembly
 rolangc -O2 hello.rl             # optimized build
 rolangc -I ./deps hello.rl       # add include path
 ```

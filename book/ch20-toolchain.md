@@ -320,6 +320,9 @@ rolangc -c hello.rl -o hello.o      # object file only (no link)
 rolangc --emit mir  hello.rl        # print MIR to stdout
 rolangc --emit llvm hello.rl        # print LLVM IR to stdout
 rolangc --emit obj  hello.rl -o a.o # object file
+rolangc --emit mir-opt -O3 hello.rl # lowered and optimized MIR, including ARC
+rolangc --emit llvm-opt -O3 hello.rl # LLVM IR after backend optimization
+rolangc --emit asm -O3 hello.rl -o hello.s # native assembly
 
 # Optimization
 rolangc -O0 hello.rl    # no optimisation (default)
@@ -337,6 +340,10 @@ rolangc --target x86_64-unknown-linux-gnu hello.rl
 # Verbose output
 rolangc -v hello.rl
 ```
+
+Text output is printed to stdout when `-o` is omitted and is also saved beside the source. Default suffixes are `.mir`, `.opt.mir`, `.ll`, `.opt.ll`, and `.s`. With `-o`, the compiler writes the requested file without printing its content.
+
+`mir` shows the program before async lowering and ARC insertion. `mir-opt` shows the MIR consumed by code generation, with passes selected by `-O0` through `-O3`. `llvm` shows generated LLVM IR before backend optimization; `llvm-opt` and `asm` use the same target layout and optimization pipeline as object emission.
 
 ## Summary of Commands
 

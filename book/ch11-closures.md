@@ -147,7 +147,9 @@ def square(n: i32) -> i32 { n * n }
 let result = apply(square, 6);   // 36
 ```
 
-Named functions and closures share the same calling convention — they are both represented as typed heap objects with a function pointer.
+Named function values use an adapter to the closure calling convention and are represented as typed heap objects with a function pointer. They can be stored, passed, and returned like closures.
+
+Bare references currently support synchronous, non-generic safe functions. Use a non-generic wrapper for generic functions, and a wrapper with an explicit `unsafe` block for unsafe functions. Async functions must be called and awaited directly.
 
 ## Closures Inside Methods
 
