@@ -2,12 +2,15 @@ import "lexer.rl"
 import "ast.rl"
 
 pub def reserved(text: String) -> Bool {
-    return text.equals("def") || text.equals("return") || text.equals("let") || text.equals("var") || text.equals("if") || text.equals("else") || text.equals("while") || text.equals("true") || text.equals("false") || text.equals("i32") || text.equals("Bool");
+    return text.equals("def") || text.equals("return") || text.equals("let") || text.equals("var") || text.equals("if") || text.equals("else") || text.equals("while") || text.equals("true") || text.equals("false") || text.equals("nil") || text.equals("pub") || text.equals("static") || text.equals("struct") || text.equals("import") || text.equals("typealias") || text.equals("for") || text.equals("in") || text.equals("as") || text.equals("break") || text.equals("continue") || text.equals("unsafe");
+}
+pub def primitive_type(text: String) -> Bool {
+    return text.equals("i8") || text.equals("i16") || text.equals("i32") || text.equals("i64") || text.equals("u8") || text.equals("u16") || text.equals("u32") || text.equals("u64") || text.equals("f32") || text.equals("f64") || text.equals("Bool") || text.equals("Void") || text.equals("RawPtr");
 }
 pub def precedence(op: String) -> i32 {
     if op.equals("||") { return 1; }
     if op.equals("&&") { return 2; }
-    if op.equals("==") || op.equals("!=") { return 3; }
+    if op.equals("==") || op.equals("!=") { return 4; }
     if op.equals("<") || op.equals(">") || op.equals("<=") || op.equals(">=") { return 4; }
     if op.equals("+") || op.equals("-") { return 5; }
     if op.equals("*") || op.equals("/") || op.equals("%") { return 6; }
@@ -18,13 +21,18 @@ pub struct Parser {
     pub var pos: i32;
     pub var error: String;
     pub var depth: i32;
+    pub var allow_empty_literal: Bool;
     pub var program: Program;
 
     pub static def new(tokens: Vec<Token>) -> Parser {
-        return Parser { tokens: tokens, pos: 0, error: "", depth: 0,
-            program: Program { functions: Vec<Function>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new() } };
+        return Parser { tokens: tokens, pos: 0, error: "", depth: 0, allow_empty_literal: true,
+            program: Program { functions: Vec<Function>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new(), declarations: Vec<Declaration>.new() } };
     }
     pub def peek() -> Token { return self.tokens.get(self.pos); }
+    pub def ahead(offset: i32) -> Token {
+        if self.pos + offset >= self.tokens.len() { return self.tokens.get(self.tokens.len() - 1); }
+        return self.tokens.get(self.pos + offset);
+    }
     pub def advance() -> Token {
         let token = self.peek();
         if token.kind != 0 { self.pos = self.pos + 1; }
@@ -46,16 +54,101 @@ pub struct Parser {
         return token;
     }
     pub def type_name() -> String {
-        let token = self.advance();
-        if !token.text.equals("i32") && !token.text.equals("Bool") {
-            self.fail(token, "stage 0 supports only i32 and Bool types");
+        self.depth = self.depth + 1;
+        if self.depth > 128 { self.fail(self.peek(), "type nesting limit exceeded"); self.depth = self.depth - 1; return ""; }
+        var text = "";
+        if self.take("[") {
+            text = "[" + self.type_name();
+            if self.take(":") { text = text + ":" + self.type_name(); }
+            self.expect("]"); text = text + "]";
+        } else {
+            if self.take("(") {
+                text = "(";
+                if !self.take(")") {
+                    while self.error.is_empty() {
+                        text = text + self.type_name();
+                        if !self.take(",") { break; }
+                        text = text + ",";
+                    }
+                    self.expect(")");
+                }
+                self.expect("->"); text = text + ")->" + self.type_name();
+            } else {
+                text = self.name().text;
+                let primitive = primitive_type(text);
+                while !primitive && self.take(".") { text = text + "." + self.name().text; }
+                if !primitive && self.take("<") {
+                    text = text + "<";
+                    while self.error.is_empty() {
+                        text = text + self.type_name();
+                        if !self.take(",") { break; }
+                        text = text + ",";
+                    }
+                    self.expect(">"); text = text + ">";
+                }
+            }
         }
-        return token.text;
+        if self.take("?") { text = text + "?"; }
+        self.depth = self.depth - 1;
+        return text;
+    }
+    pub def generics() -> Vec<String> {
+        let names = Vec<String>.new();
+        if self.take("<") {
+            while self.error.is_empty() {
+                names.push(self.name().text);
+                if !self.take(",") { break; }
+            }
+            self.expect(">");
+        }
+        return names;
+    }
+    pub def modifiers() -> String {
+        var text = "";
+        if self.take("pub") { text = "pub "; }
+        if self.take("static") { text = text + "static "; }
+        return text;
     }
     pub def add_expr(token: Token, kind: i32, left: i32, right: i32, args: Vec<i32>) -> i32 {
         let id = self.program.expressions.len();
-        self.program.expressions.push(Expression { token: token, kind: kind, left: left, right: right, args: args });
+        self.program.expressions.push(Expression { token: token, kind: kind, left: left, right: right, args: args, labels: Vec<String>.new(), type_name: "" });
         return id;
+    }
+    // Look ahead without mutating tokens: relational '<' must remain an operator.
+    pub def generic_reference() -> Bool {
+        if !self.peek().text.equals("<") { return false; }
+        var offset = 0;
+        var balance = 0;
+        while self.ahead(offset).kind != 0 {
+            let text = self.ahead(offset).text;
+            if text.equals("<") { balance = balance + 1; }
+            if text.equals(">") {
+                balance = balance - 1;
+                if balance == 0 { return self.ahead(offset + 1).text.equals(".") || self.ahead(offset + 1).text.equals("{"); }
+            }
+            if text.equals(";") || text.equals("{") || text.equals("}") { return false; }
+            offset = offset + 1;
+        }
+        return false;
+    }
+    pub def value_expression() -> i32 {
+        let previous = self.allow_empty_literal; self.allow_empty_literal = true;
+        let result = self.expression(1); self.allow_empty_literal = previous; return result;
+    }
+    pub def condition() -> i32 {
+        let previous = self.allow_empty_literal; self.allow_empty_literal = false;
+        let result = self.expression(1); self.allow_empty_literal = previous; return result;
+    }
+    pub def reference_name(id: i32) -> String {
+        var current = id; var suffix = "";
+        while current >= 0 {
+            let node = self.program.expressions.get(current);
+            if node.kind == 3 { return node.token.text + suffix; }
+            if node.kind == 13 { return node.type_name + suffix; }
+            if node.kind != 9 { return ""; }
+            suffix = "." + node.token.text + suffix; current = node.left;
+        }
+        return "";
     }
     pub def expression(minimum: i32) -> i32 {
         self.depth = self.depth + 1;
@@ -65,38 +158,92 @@ pub struct Parser {
         let empty = Vec<i32>.new();
         if token.kind == 2 { left = self.add_expr(token, 1, -1, -1, empty); }
         else {
-            if token.text.equals("true") || token.text.equals("false") { left = self.add_expr(token, 2, -1, -1, empty); }
+            if token.kind == 4 { left = self.add_expr(token, 7, -1, -1, empty); }
             else {
-                if token.text.equals("(") {
-                    left = self.expression(1); self.expect(")");
-                } else {
-                    if token.text.equals("-") || token.text.equals("!") || token.text.equals("+") {
-                        let operand = self.expression(7);
-                        left = self.add_expr(token, 5, operand, -1, empty);
-                    } else {
-                        if token.kind == 1 && !reserved(token.text) {
-                            if self.take("(") {
-                                let args = Vec<i32>.new();
-                                if !self.take(")") {
-                                    while self.error.is_empty() {
-                                        args.push(self.expression(1));
-                                        if !self.take(",") { break; }
+                if token.text.equals("true") || token.text.equals("false") { left = self.add_expr(token, 2, -1, -1, empty); }
+                else {
+                    if token.text.equals("nil") { left = self.add_expr(token, 8, -1, -1, empty); }
+                    else {
+                        if token.text.equals("(") { left = self.value_expression(); self.expect(")"); }
+                        else {
+                            if token.text.equals("-") || token.text.equals("!") || token.text.equals("+") {
+                                let operand = self.expression(7);
+                                left = self.add_expr(token, 5, operand, -1, empty);
+                            } else {
+                                if token.kind == 1 && !reserved(token.text) {
+                                    left = self.add_expr(token, 3, -1, -1, empty);
+                                    if self.generic_reference() {
+                                        self.pos = self.pos - 1;
+                                        let type_name = self.type_name();
+                                        let node = self.program.expressions.get(left);
+                                        node.kind = 13; node.type_name = type_name;
                                     }
-                                    self.expect(")");
-                                }
-                                left = self.add_expr(token, 6, -1, -1, args);
-                            } else { left = self.add_expr(token, 3, -1, -1, empty); }
-                        } else { self.fail(token, "expected expression"); }
+                                } else { self.fail(token, "expected expression"); }
+                            }
+                        }
                     }
                 }
             }
         }
         while self.error.is_empty() {
-            let op = self.peek();
-            let rank = precedence(op.text);
+            if self.take(".") {
+                let member = self.name();
+                left = self.add_expr(member, 9, left, -1, Vec<i32>.new());
+                continue;
+            }
+            if self.take("(") {
+                let callee = self.program.expressions.get(left);
+                let args = Vec<i32>.new();
+                if !self.take(")") {
+                    while self.error.is_empty() {
+                        args.push(self.value_expression());
+                        if !self.take(",") { break; }
+                    }
+                    self.expect(")");
+                }
+                var kind = 14;
+                var target = left;
+                if callee.kind == 3 { kind = 6; target = -1; }
+                left = self.add_expr(callee.token, kind, target, -1, args);
+                continue;
+            }
+            if self.take("[") {
+                let index = self.value_expression(); self.expect("]");
+                left = self.add_expr(token, 12, left, index, Vec<i32>.new()); continue;
+            }
+            let callee = self.program.expressions.get(left);
+            // A field label distinguishes literals from control-flow blocks.
+            // In conditions an empty brace pair starts the body, unless grouped.
+            var literal = false;
+            if self.peek().text.equals("{") && !self.reference_name(left).is_empty() {
+                literal = self.ahead(1).kind == 1 && self.ahead(2).text.equals(":");
+                if self.ahead(1).text.equals("}") && self.allow_empty_literal { literal = true; }
+            }
+            if literal {
+                self.advance();
+                let args = Vec<i32>.new(); let labels = Vec<String>.new();
+                if !self.take("}") {
+                    while self.error.is_empty() {
+                        labels.push(self.name().text); self.expect(":"); args.push(self.value_expression());
+                        if !self.take(",") || self.peek().text.equals("}") { break; }
+                    }
+                    self.expect("}");
+                }
+                let type_name = self.reference_name(left);
+                left = self.add_expr(callee.token, 10, -1, -1, args);
+                let node = self.program.expressions.get(left); node.labels = labels;
+                node.type_name = type_name;
+                continue;
+            }
+            if minimum <= 4 && self.take("as") {
+                let type_name = self.type_name();
+                left = self.add_expr(token, 11, left, -1, Vec<i32>.new());
+                let node = self.program.expressions.get(left); node.type_name = type_name;
+                continue;
+            }
+            let op = self.peek(); let rank = precedence(op.text);
             if rank < minimum { break; }
-            self.advance();
-            let right = self.expression(rank + 1);
+            self.advance(); let right = self.expression(rank + 1);
             left = self.add_expr(op, 4, left, right, Vec<i32>.new());
         }
         self.depth = self.depth - 1;
@@ -111,60 +258,119 @@ pub struct Parser {
             if self.peek().kind == 0 { self.fail(self.peek(), "expected '}'"); break; }
             body.push(self.statement());
         }
-        self.expect("}");
-        self.depth = self.depth - 1;
+        self.expect("}"); self.depth = self.depth - 1;
         return body;
     }
     pub def statement() -> i32 {
-        var token = self.peek();
-        var kind = 6;
-        var expr = -1;
-        var annotation = "";
-        var mutable = false;
-        var body = Vec<i32>.new();
-        var alternative = Vec<i32>.new();
-        if self.take("return") { kind = 1; expr = self.expression(1); self.expect(";"); }
-        else {
+        var token = self.peek(); var kind = 6; var expr = -1; var target = -1;
+        var annotation = ""; var mutable = false;
+        var body = Vec<i32>.new(); var alternative = Vec<i32>.new();
+        if self.take("return") {
+            kind = 1;
+            if !self.peek().text.equals(";") { expr = self.expression(1); }
+            self.expect(";");
+        } else {
             if token.text.equals("let") || token.text.equals("var") {
                 self.advance(); kind = 2; mutable = token.text.equals("var"); token = self.name();
                 if self.take(":") { annotation = self.type_name(); }
-                self.expect("="); expr = self.expression(1); self.expect(";");
+                if self.take("=") { expr = self.expression(1); }
+                else { if !mutable || annotation.is_empty() { self.fail(self.peek(), "expected initializer"); } }
+                self.expect(";");
             } else {
                 if self.take("if") {
-                    kind = 4; expr = self.expression(1); body = self.block();
+                    kind = 4;
+                    if self.take("let") { kind = 9; token = self.name(); self.expect("="); }
+                    expr = self.condition(); body = self.block();
                     if self.take("else") { alternative = self.block(); }
                 } else {
-                    if self.take("while") { kind = 5; expr = self.expression(1); body = self.block(); }
+                    if self.take("while") { kind = 5; expr = self.condition(); body = self.block(); }
                     else {
-                        if token.kind == 1 && self.tokens.get(self.pos + 1).text.equals("=") {
-                            kind = 3; token = self.name(); self.expect("="); expr = self.expression(1); self.expect(";");
-                        } else { expr = self.expression(1); self.expect(";"); }
+                        if self.take("for") { kind = 8; token = self.name(); self.expect("in"); expr = self.condition(); body = self.block(); }
+                        else {
+                            if self.take("break") { kind = 10; self.expect(";"); }
+                            else {
+                                if self.take("continue") { kind = 11; self.expect(";"); }
+                                else {
+                                    if self.take("unsafe") { kind = 12; body = self.block(); }
+                                    else {
+                                        if self.peek().text.equals("{") { kind = 7; body = self.block(); }
+                                        else {
+                                            expr = self.expression(1);
+                                            if self.error.is_empty() && self.take("=") {
+                                                target = expr; let node = self.program.expressions.get(target);
+                                                kind = 13;
+                                                if node.kind == 3 { kind = 3; token = node.token; }
+                                                else { if node.kind != 9 && node.kind != 12 { self.fail(node.token, "invalid assignment target"); } }
+                                                expr = self.expression(1);
+                                            }
+                                            self.expect(";");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         let id = self.program.statements.len();
-        self.program.statements.push(Statement { token: token, kind: kind, expr: expr, annotation: annotation, mutable: mutable, body: body, alternative: alternative });
+        self.program.statements.push(Statement { token: token, kind: kind, expr: expr, target: target, annotation: annotation, mutable: mutable, body: body, alternative: alternative });
+        return id;
+    }
+    pub def function(owner: String, modifiers: String) -> i32 {
+        self.expect("def"); let token = self.name(); let generics = self.generics(); self.expect("(");
+        let params = Vec<Parameter>.new();
+        if !self.take(")") {
+            while self.error.is_empty() {
+                let param = self.name(); self.expect(":");
+                params.push(Parameter { token: param, type_name: self.type_name() });
+                if !self.take(",") { break; }
+            }
+            self.expect(")");
+        }
+        var return_type = "Void";
+        if self.take("->") { return_type = self.type_name(); }
+        let body = self.block(); let id = self.program.functions.len();
+        self.program.functions.push(Function { token: token, params: params, return_type: return_type, body: body, owner: owner, modifiers: modifiers, generics: generics });
         return id;
     }
     pub def parse() -> Void {
         while self.error.is_empty() && self.peek().kind != 0 {
-            self.expect("def");
-            let token = self.name();
-            self.expect("(");
-            let params = Vec<Parameter>.new();
-            if !self.take(")") {
-                while self.error.is_empty() {
-                    let param = self.name(); self.expect(":");
-                    params.push(Parameter { token: param, type_name: self.type_name() });
-                    if !self.take(",") { break; }
+            let modifiers = self.modifiers(); let token = self.peek();
+            if token.text.equals("def") { self.function("", modifiers); }
+            else {
+                var name = token; var kind = 0; var value = "";
+                var generics = Vec<String>.new(); let fields = Vec<Field>.new(); let methods = Vec<i32>.new();
+                if self.take("import") {
+                    kind = 1;
+                    if self.peek().kind == 4 { value = self.advance().text; }
+                    else { value = self.name().text; while self.take(".") { value = value + "." + self.name().text; } }
+                    if self.take("as") { name = self.name(); }
+                    self.take(";");
+                } else {
+                    if self.take("typealias") {
+                        kind = 3; name = self.name(); self.expect("="); value = self.type_name(); self.expect(";");
+                    } else {
+                        if self.take("struct") {
+                            kind = 2; name = self.name(); generics = self.generics(); self.expect("{");
+                            while self.error.is_empty() && !self.peek().text.equals("}") {
+                                let member_modifiers = self.modifiers();
+                                if self.peek().text.equals("def") { methods.push(self.function(name.text, member_modifiers)); }
+                                else {
+                                    var mutable = false;
+                                    if self.take("var") { mutable = true; } else { self.expect("let"); }
+                                    let field = self.name(); self.expect(":"); let type_name = self.type_name();
+                                    var expr = -1; if self.take("=") { expr = self.expression(1); }
+                                    self.expect(";");
+                                    fields.push(Field { token: field, type_name: type_name, mutable: mutable, modifiers: member_modifiers, expr: expr });
+                                }
+                            }
+                            self.expect("}");
+                        } else { self.fail(token, "expected declaration (def, import, struct, or typealias)"); }
+                    }
                 }
-                self.expect(")");
+                self.program.declarations.push(Declaration { token: name, kind: kind, value: value, modifiers: modifiers, generics: generics, fields: fields, methods: methods });
             }
-            self.expect("->");
-            let return_type = self.type_name();
-            let body = self.block();
-            self.program.functions.push(Function { token: token, params: params, return_type: return_type, body: body });
         }
     }
 }

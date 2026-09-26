@@ -205,7 +205,29 @@ pub struct Backend {
         text.append(")");
         return text.to_string();
     }
+    // Validate the whole tree, including unreachable nodes, before C emission.
+    pub def supported_type(token: Token, type_name: String) -> Void {
+        if !type_name.equals("i32") && !type_name.equals("Bool") { self.fail(token, "C backend supports only i32 and Bool types"); }
+    }
+    pub def validate_subset() -> Void {
+        for declaration in self.program.declarations { self.fail(declaration.token, "declaration unsupported by C backend"); }
+        for function in self.program.functions {
+            if !function.owner.is_empty() || function.generics.len() != 0 || function.modifiers.contains("static") { self.fail(function.token, "function unsupported by C backend"); }
+            self.supported_type(function.token, function.return_type);
+            for param in function.params { self.supported_type(param.token, param.type_name); }
+        }
+        for expression in self.program.expressions {
+            if expression.kind > 6 { self.fail(expression.token, "expression unsupported by C backend"); }
+        }
+        for statement in self.program.statements {
+            if statement.kind > 6 { self.fail(statement.token, "statement unsupported by C backend"); }
+            if statement.expr < 0 { self.fail(statement.token, "C backend requires an expression or initializer"); }
+            if !statement.annotation.is_empty() { self.supported_type(statement.token, statement.annotation); }
+        }
+    }
     pub def generate() -> Void {
+        self.validate_subset();
+        if !self.error.is_empty() { return; }
         var i = 0;
         while i < self.program.functions.len() {
             let function = self.program.functions.get(i);

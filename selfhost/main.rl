@@ -1,6 +1,7 @@
 import "lexer.rl"
 import "parser.rl"
 import "backend.rl"
+import "ast_json.rl"
 import std.fs
 import std.process
 import std.io
@@ -10,12 +11,14 @@ import std.path
 // The caller chooses whether/how to invoke a C compiler on the result.
 def main() -> i32 {
     if argc() != 3 {
-        println("usage: rolang-stage0 <input.rl> <output.c>");
+        println("usage: rolang-stage0 <input.rl> <output.c> | --parse <input.rl>");
         return 2;
     }
-    let input = argv(1);
+    let parse_only = argv(1).equals("--parse");
+    var input = argv(1);
+    if parse_only { input = argv(2); }
     let output = argv(2);
-    if path_resolve(input).equals(path_resolve(output)) { println("input and output paths must differ"); return 2; }
+    if !parse_only && path_resolve(input).equals(path_resolve(output)) { println("input and output paths must differ"); return 2; }
     let file = fs_open(input, 0);
     unsafe { if (file as i64) == 0 { println("cannot open input: " + input); return 2; } }
     let source = fs_read_all(file);
@@ -25,6 +28,7 @@ def main() -> i32 {
     let parser = Parser.new(scanned.tokens);
     parser.parse();
     if !parser.error.is_empty() { println(input + ":" + parser.error); return 1; }
+    if parse_only { let json = AstJson.new(); json.program(parser.program); println(json.out.to_string()); return 0; }
     let backend = Backend.new(parser.program);
     backend.generate();
     if !backend.error.is_empty() { println(input + ":" + backend.error); return 1; }

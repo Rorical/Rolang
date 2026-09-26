@@ -1,7 +1,7 @@
-// Stage-0 source scanner. Positions are one-based ASCII byte columns.
+// Stage-0 source scanner. Positions use one-based lines and byte columns.
 pub struct Token {
     pub var text: String;
-    pub var kind: i32; // 0 EOF, 1 identifier, 2 decimal integer, 3 punctuation
+    pub var kind: i32; // 0 EOF, 1 identifier, 2 decimal integer, 3 punctuation, 4 quoted string
     pub var line: i32;
     pub var column: i32;
 }
@@ -33,6 +33,43 @@ pub def lex(source: String) -> LexResult {
                 continue;
             }
         }
+        if c == 47 && pos + 1 < length && source.byte_at(pos + 1) == 42 {
+            let opening = Token { text: "/*", kind: 3, line: line, column: column };
+            pos = pos + 2; column = column + 2;
+            var closed = false;
+            while pos < length {
+                if source.byte_at(pos) == 42 && pos + 1 < length && source.byte_at(pos + 1) == 47 {
+                    pos = pos + 2; column = column + 2; closed = true; break;
+                }
+                if source.byte_at(pos) == 10 { line = line + 1; column = 1; }
+                else { column = column + 1; }
+                pos = pos + 1;
+            }
+            if !closed { return LexResult { tokens: tokens, error: location(opening, "unterminated block comment") }; }
+            continue;
+        }
+        if c == 34 {
+            let start = pos;
+            let opening = Token { text: "", kind: 4, line: line, column: column };
+            pos = pos + 1; column = column + 1;
+            var closed = false;
+            var escaped = false;
+            while pos < length {
+                let byte = source.byte_at(pos);
+                pos = pos + 1;
+                if byte == 10 { line = line + 1; column = 1; }
+                else { column = column + 1; }
+                if escaped { escaped = false; }
+                else {
+                    if byte == 34 { closed = true; break; }
+                    if byte == 92 { escaped = true; }
+                }
+            }
+            if !closed { return LexResult { tokens: tokens, error: location(opening, "unterminated string") }; }
+            opening.text = source.substring(start, pos - start);
+            tokens.push(opening);
+            continue;
+        }
         let start = pos;
         let start_column = column;
         var kind = 3;
@@ -58,7 +95,7 @@ pub def lex(source: String) -> LexResult {
                     }
                 }
                 let spelling = source.substring(start, pos - start);
-                if !(spelling.equals("->") || spelling.equals("==") || spelling.equals("!=") || spelling.equals("<=") || spelling.equals(">=") || spelling.equals("&&") || spelling.equals("||") || "(){}:;,+-*/%=<>!".contains(spelling)) {
+                if !(spelling.equals("->") || spelling.equals("==") || spelling.equals("!=") || spelling.equals("<=") || spelling.equals(">=") || spelling.equals("&&") || spelling.equals("||") || "(){}[]?.:;,+-*/%=<>!".contains(spelling)) {
                     let bad = Token { text: spelling, kind: 3, line: line, column: column };
                     return LexResult { tokens: tokens, error: location(bad, "unsupported character") };
                 }

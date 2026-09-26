@@ -1,12 +1,13 @@
-# Rolang-written bootstrap compiler — first milestone
+# Rolang-written bootstrap compiler — self-parsing milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves local/function names, checks
 types, and emits standalone C11. It does not invoke Python, Lark, or llvmlite.
 
 **This is not full self-hosting yet.** The existing Python compiler builds this
-compiler. Its accepted language subset cannot yet compile its own source, which
-uses structs, generics, imports, strings, and the standard library. Here, “stage 0”
+compiler. Its frontend now parses every `.rl` file in this directory and exposes the syntax
+tree as JSON. Its C backend cannot yet compile those files: lowering structs,
+generics, imports, strings, and standard-library calls remains to be implemented. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
 
 ## Build and run
@@ -22,17 +23,17 @@ build/fibonacci
 # Exit status: 88 (sum of Fibonacci values for 0 through 9).
 ```
 
-The native frontend takes exactly two paths: input `.rl` and output C. C emission
+For C emission the native frontend takes two paths: input `.rl` and output C. C emission
 needs no Python or C compiler on PATH. Compiling the resulting C requires a C11
 compiler; the resulting program needs no Rolang runtime.
 
-Exit codes: 0 for successful emission, 1 for a frontend diagnostic, and 2 for
+Exit codes: 0 for successful emission or parsing, 1 for a frontend diagnostic, and 2 for
 usage/file errors. Diagnostics currently go to stdout and use `path:line:column`,
-with one-based ASCII byte columns. Only the first frontend error is reported.
+with one-based byte columns. Only the first frontend error is reported.
 Existing output is left untouched on lexer/parser/type errors. Input/output paths
 that resolve to the same path are rejected, including symlink aliases.
 
-## Supported subset
+## Supported C subset
 
 | Area | Supported |
 |---|---|
@@ -42,7 +43,7 @@ that resolve to the same path are rejected, including symlink aliases.
 | Statements | `return`, `if { } else { }`, `while { }`, expression statements |
 | Expressions | Decimal i32 integers, Boolean literals, variables, calls, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
-| Source | ASCII identifiers, whitespace, `//` comments; explicit statement semicolons |
+| Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
 
 Function arguments are immutable. Conditions require Bool. Arguments, assignments,
 annotations, and return values are checked for type compatibility. Parameters and
@@ -56,10 +57,46 @@ by zero terminates the generated program with an error. The C backend avoids
 signed-overflow undefined behavior, emits explicit temporaries for left-to-right
 evaluation, preserves Boolean short-circuiting, and mangles all source names.
 
+## Self-parsing frontend
+
+```sh
+build/rolang-stage0 --parse selfhost/parser.rl > build/parser.ast.json
+```
+
+`--parse` reads one file and prints a deterministic JSON syntax tree. It does not
+resolve imports or check types, names, assignment mutability, or return paths.
+A library file does not need `main`. Successful parsing does **not** mean that a
+program can be compiled by this backend.
+
+The syntax supported beyond the C subset includes:
+
+- Quoted strings (raw spelling retained), `nil`, member access, method calls,
+  indexed access, struct literals with field labels, and numeric `as` syntax.
+- Qualified named types, generic types and parameters, optional types, array and
+  dictionary types, and function types.
+- Imports and aliases, `pub` declarations, structs with stored fields and methods,
+  static methods, generic functions, and transparent `typealias` declarations.
+- `for`, `if let`, `break`, `continue`, `unsafe` and ordinary nested blocks,
+  assignment through members/indices, bare `return`, and typed uninitialized `var`.
+
+The JSON object contains `declarations`, `functions`, `expressions`, and
+`statements`. Methods carry their owner name and declarations store method indices.
+Function bodies and child expressions use indices into flat arrays; `-1` denotes
+an absent child. Types are canonical strings. Tokens retain spelling, line and
+byte column. Numeric node kinds are documented in `ast.rl`. This development
+format may evolve with the rewrite.
+
+Every source file in this directory is parsed at O0 and O3 and compared with the
+Python frontend: declarations, field types, function signatures, and complete
+expression/statement trees. This establishes self-parsing, not self-compilation.
+The C backend checks the whole parsed tree and rejects unsupported constructs,
+including unreachable ones, before publishing output.
+
 ## Structure
 
 - `lexer.rl`: tokenization and source positions.
-- `ast.rl`: functions and flat, indexed expression/statement trees.
+- `ast.rl`: declarations, types, functions, and flat expression/statement trees.
+- `ast_json.rl`: deterministic syntax-tree serialization.
 - `parser.rl`: recursive-descent statements and precedence-climbing expressions.
 - `backend.rl`: name resolution, type checking, return checks, and C emission.
 - `main.rl`: command-line and file I/O.
@@ -85,21 +122,32 @@ The tests build the Rolang-written compiler at O0 and O3, then:
   incorrect calls, and unsupported constructs;
 - check output preservation, deterministic emission, file failures, and symlinks;
 - run a 300-function frontend workload;
-- run the native compiler with Python/backend tools absent from PATH.
+- run the native compiler with Python/backend tools absent from PATH;
+- compare the expanded frontend against the Python syntax trees for its own
+  sources and compound-type/operator fixtures;
+- check malformed extended syntax, type/block nesting limits, source positions,
+  JSON escaping, and explicit C-backend rejection.
 
 ## Deliberate limits and next milestones
 
-The frontend accepts a strict subset. Imports, structs/enums, generics, aliases,
-closures, strings, collections, protocols, async, FFI, additional numeric types,
-and ARC code generation are not implemented here. The existing compiler continues
-to provide all those features. Expression/block nesting is limited to 128; source
-length is limited to the scanner's signed 32-bit indexing range. This first backend
-is C-only; it does not emit MIR or LLVM.
+The frontend still accepts a subset. Enums, protocols, extensions, constraints,
+closures, labeled/default call parameters, collection literals, tuple types,
+optional chaining, additional numeric literal forms, bitwise operators, async,
+FFI declarations, and implicit returns are not implemented here. Struct fields
+and statements require semicolons. `else if` must be written as `else { if ... }`.
+Generic expression receivers currently use unqualified names (`Vec<T>.new()`).
+The existing compiler continues to provide the complete language.
+
+Expression/block/type nesting is limited to 128; source length is limited to the
+scanner's signed 32-bit indexing range. Identifiers are ASCII; strings may contain
+UTF-8. The backend remains C-only, with no ARC, MIR or LLVM generation.
 
 Next steps toward actual self-compilation:
 
-1. Expand the lexer/parser to represent the constructs used by these source files.
-2. Add structs/enums, strings/collections, imports, and generic specialization.
+1. **Done:** expand the frontend to parse its own source, verified against the
+   existing frontend.
+2. Add semantic analysis and lowering for structs/enums, strings/collections,
+   imports, and generic specialization.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
 5. Compare bootstrap generations and run the broader language regression suite.
@@ -108,14 +156,18 @@ A C backend and the existing C runtime can remain dependencies during those
 bootstrap generations. Porting the package manager and language server is separate
 from achieving compiler self-hosting.
 
-## Validation recorded for this milestone
+## Validation
 
-On Apple Silicon macOS:
+On Apple Silicon macOS, this milestone passed:
 
-- **78 tests passed** in 94.02 seconds, including emitted-C UBSan checks.
-- **54 AddressSanitizer checks passed** in 35.90 seconds with the bootstrap
-  runtime instrumented at O0/O3 (`detect_leaks=0`). These cover malformed input,
-  random arithmetic, the 300-function workload, and execution without Python.
+- **162 tests** in 115.10 seconds, including O0/O3 self-parsing, complete tree
+  comparisons, differential program execution, and emitted-C UBSan checks.
+- **86 AddressSanitizer checks** in 54.98 seconds, covering the expanded frontend,
+  its own sources, malformed input, precedence, JSON output, and execution with
+  Python/backend tools absent from PATH. The bootstrap runtime is instrumented;
+  `detect_leaks=0` means these checks do not validate leaks.
 
-No existing compiler/runtime implementation was changed for this milestone; the
+See the test command above to reproduce the standard suite.
+
+No existing compiler/runtime implementation is changed by this milestone; the
 new compiler is entirely source-level Rolang code using the existing library.
