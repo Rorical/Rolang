@@ -445,3 +445,10 @@ Transparent `typealias` declarations, dictionary removal/snapshots, custom-key
 `HashMap`, `StringBuilder`, and `StringInterner` support compiler workloads.
 See [the API guide](docs/compiler-rewrite-foundations.md) and
 [the frontend example](examples/compiler_frontend.rl).
+
+### Self-hosting work
+
+The [Rolang-written bootstrap compiler](selfhost/README.md) now lexes, parses,
+checks, and emits C for an integer/Boolean subset. It is built by the existing
+compiler and does not yet compile its own source. Differential tests compare its
+output with the current compiler.
