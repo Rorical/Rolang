@@ -166,6 +166,10 @@ def lower_async(mir_result: MirBuildResult) -> AsyncLoweringResult:
             frame_fields.append(MirField(name=f"$task{i}", type_id=ptr_type, is_mutable=True))
 
         frame_sym_id = mir_result.symbol_table.create_synthetic_symbol_id()
+        if getattr(mir_result.symbol_table, 'separate_modules', False):
+            from .module_abi import symbol_key
+            st = mir_result.symbol_table
+            st.module_type_keys[frame_sym_id] = 'frame:' + symbol_key(func.symbol_id, st, type_table)
         frame_type_id = type_table.make_struct(frame_sym_id)
         frame_type_ids[func.name] = frame_type_id
         frame_mir = MirStruct(name=frame_name, symbol_id=frame_sym_id, fields=frame_fields, type_id=frame_type_id)

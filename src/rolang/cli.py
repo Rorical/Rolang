@@ -64,9 +64,9 @@ Examples:
 
     parser.add_argument(
         "--emit",
-        choices=["llvm", "llvm-opt", "mir", "mir-opt", "asm", "obj"],
+        choices=["llvm", "llvm-opt", "mir", "mir-opt", "asm", "obj", "module"],
         default=None,
-        help="Emit llvm, llvm-opt (backend optimized), mir, mir-opt (lowered with ARC), asm, or obj",
+        help="Emit llvm, llvm-opt (backend optimized), mir, mir-opt (lowered with ARC), asm, obj, or module (.rlm)",
     )
 
     # Optimization levels
@@ -155,6 +155,7 @@ def determine_emit_kind(args: argparse.Namespace) -> EmitKind:
             "llvm-opt": EmitKind.LLVM_OPTIMIZED,
             "asm": EmitKind.ASSEMBLY,
             "obj": EmitKind.OBJECT,
+            "module": EmitKind.MODULE,
         }
         return emit_map[args.emit]
     elif args.compile_only:

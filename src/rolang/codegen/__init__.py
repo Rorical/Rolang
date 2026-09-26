@@ -801,12 +801,14 @@ def _emit_type_descriptor_table(
         if trace_fn is not None:
             type_to_trace[mir_struct.type_id] = trace_fn
 
+    fd_global = None
+
     # === RT_TYPE_FIELD_DESCRIPTORS ===
     # {i32 offset, i64 field_type_id, i32 case_tag, i32 _pad}
     fd_type = ir.LiteralStructType([i32, i64, i32, i32])
     flat_field_descriptors: list[ir.Constant] = []
 
-    for desc_id in range(descriptor_count):
+    for desc_id in sorted(desc_to_type):
         fds_for_type = field_desc_map.get(desc_id, [])
         for offset, field_desc_id, case_tag in fds_for_type:
             flat_field_descriptors.append(ir.Constant(fd_type, [
@@ -853,7 +855,7 @@ def _emit_type_descriptor_table(
     release_fields_sig = ir.FunctionType(ir.VoidType(), [ptr_t])
     type_to_release_fields: dict[int, ir.Function] = {}
 
-    for desc_id in range(descriptor_count):
+    for desc_id in sorted(desc_to_type):
         fds_for_type = field_desc_map.get(desc_id, [])
         if not fds_for_type:
             continue
@@ -900,7 +902,7 @@ def _emit_type_descriptor_table(
 
     null_ptr = ir.Constant(ptr_t, None)
 
-    for desc_id in range(descriptor_count):
+    for desc_id in sorted(desc_to_type):
         type_id = desc_to_type.get(desc_id)
         payload_size = 0
         if type_id is not None:
@@ -956,6 +958,10 @@ def _emit_type_descriptor_table(
     )
     count_global.global_constant = True
     count_global.initializer = ir.Constant(i32, descriptor_count)
+
+    if getattr(type_cache.symbol_table, 'separate_modules', False):
+        from ..module_abi import register_descriptors
+        register_descriptors(module, type_cache, desc_global, fd_global, sorted(desc_to_type))
 
 
 # Public exports

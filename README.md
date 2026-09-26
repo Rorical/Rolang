@@ -72,6 +72,12 @@ rolang run
 | `rolang remove <name>` | Remove a dependency |
 | `rolang info` | Show project metadata |
 
+## Compiled Libraries
+
+`rolangc --emit module lib.rl -o lib.rlm` builds a reusable native library.
+Consumers use `import "lib.rlm"`; generic specialization works with consumer types.
+See [separate modules](docs/separate-modules.md) for the format and current constraints.
+
 ## Project Manifest (`rolang.toml`)
 
 ```toml

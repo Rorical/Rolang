@@ -46,7 +46,7 @@ uv run pytest -q -n 4
 - Cyclic garbage is reclaimed by a synchronous generational cycle collector. Collection can pause execution, and destruction of cyclic objects is delayed. The README's former pause-free claim was incorrect.
 - At the initial audit, async execution lacked source-level spawn, cancellation, and an I/O event loop. These are implemented in the subsequent [async/task implementation](async-io-task-control.md); execution remains cooperative and single-threaded.
 - `--emit mir` and `--emit llvm` retain their original stages. New `--emit mir-opt` includes async lowering, MIR optimization and ARC; `--emit llvm-opt` exposes verified backend-optimized LLVM IR; `--emit asm` emits assembly with the same target and optimization settings as object output.
-- Object output is one unified translation unit containing the entry and its dependencies. This does not implement independent module compilation or reusable generic metadata; separately emitted objects with shared dependencies can contain duplicate symbols.
+- Plain source imports use unified object output. The subsequent [separate-module implementation](separate-modules.md) adds `.rlm` artifacts with native objects and generic source metadata; consumers link non-generic library code and instantiate generics locally.
 - Package dependencies support paths and Git; a package registry remains unsupported.
 
 Validation here targets the local Apple Silicon macOS host. It does not establish cross-platform correctness or a new performance ranking.
@@ -67,4 +67,17 @@ rolangc --emit asm -O3 program.rl -o program.s
 
 Final follow-up validation: **767 passed, no skips**, in 301.70 seconds on Apple Silicon macOS. This includes 43 focused literal/function-value/output checks and the two newly enabled project build/run tests. Emitted assembly is independently assembled, linked, and executed at O0–O3; LLVM output is verified; callback tests check observable output and heap-object reclamation.
 
-The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). Independent module compilation with generic metadata and a package registry remain outstanding. Synchronous cycle collection remains an execution-time caveat.
+The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). The subsequent [module implementation](separate-modules.md) adds independent native objects and generic source metadata. A package registry and incremental front-end caching remain outstanding. Synchronous cycle collection remains an execution-time caveat.
+
+
+## Follow-up — separate native modules
+
+Added `rolangc --emit module` and `.rlm` imports with reusable native objects,
+generic source metadata, stable native/type identities, and transitive dependency
+linking. The implementation also preserves cycle-analysis optimizations for sparse
+type IDs and diagnoses incompatible or conflicting artifacts. See
+[separate modules](separate-modules.md) for usage and limitations.
+
+Validation: 819 tests passed in the full suite, followed by 69 focused tests after
+final adjustments. Seven module sanitizer scenarios passed, including async tasks,
+heap values, destructors, and cyclic object reclamation at O0/O3.

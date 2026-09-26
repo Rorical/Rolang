@@ -39,6 +39,7 @@ from .symbols import SymbolTable
 
 class EmitKind(Enum):
     """Output format for compilation."""
+    MODULE = auto()      # Native module archive with generic metadata (.rlm)
     OBJECT = auto()      # Object file (.o)
     LLVM_IR = auto()     # LLVM IR (.ll)
     MIR = auto()         # Mid-level IR (debug)
@@ -99,6 +100,11 @@ class CompilationDriver:
         Otherwise discovers and compiles all imports in dependency order.
         """
         self.source_files = {}
+        self.module_sources = {}
+        self.module_objects = {}
+        self._module_link_objects = []
+        self.separate_modules = self.options.emit == EmitKind.MODULE
+        self.entry_path = source_path.resolve()
         diagnostics = DiagnosticCollector(self.source_files)
         self.context = CompilerContext(
             symbol_table=SymbolTable(),
@@ -114,7 +120,7 @@ class CompilationDriver:
             diagnostics.add_io_error(str(e), source_path)
             return CompileResult(success=False, diagnostics=diagnostics)
 
-        self.source_files[source_path] = source_content
+        self.source_files[source_path.resolve()] = source_content
 
         # Parse
         if self.options.verbose:
@@ -136,7 +142,7 @@ class CompilationDriver:
 
         # Check for imports
         has_imports = any(isinstance(item, ast_module.ImportDecl) for item in ast.items)
-        if has_imports:
+        if has_imports or self.separate_modules:
             return self._compile_with_imports(source_path, ast)
 
         return self._compile_single(source_path, ast, source_content)
@@ -196,6 +202,21 @@ class CompilationDriver:
 
         if self.options.verbose:
             print(f"Compiling {len(compile_order)} module(s): {[m.name for m in compile_order]}")
+
+        self.compile_order = compile_order
+        if self.separate_modules:
+            from .module_abi import mark_declarations, digest
+            self.context.symbol_table.separate_modules = True
+            self.context.symbol_table.module_type_keys = {}
+            for module in compile_order:
+                key = self._module_key(module.path)
+                mark_declarations(module.ast, key, digest(self.source_files[module.path]))
+                if (module.path != self.entry_path and not key.startswith('std:')
+                        and key not in self.module_objects):
+                    self.context.diagnostics.add_error(
+                        f"Compile dependency '{module.path}' with --emit module and import its .rlm artifact")
+            if self.context.has_errors():
+                return self._fail()
 
         # All output formats share the same program: imported generic bodies
         # must be available when monomorphizing, including for object output.
@@ -317,6 +338,7 @@ class CompilationDriver:
         module = mod.Module(name=name, path=resolved)
         module.ast = ast_node
         module.source = self.source_files.get(resolved, "")
+        module.import_paths = {}
         module.state = mod.ModuleState.PARSED
         graph.add_module(module)
 
@@ -355,9 +377,9 @@ class CompilationDriver:
             # deliberately don't make this a hard error so embedded DSLs
             # or test fixtures can still opt in, but a typo like
             # `import "io"` would otherwise silently fail to find a file.
-            if raw_path and not raw_path.endswith(".rl"):
+            if raw_path and not raw_path.endswith((".rl", ".rlm")):
                 self.context.diagnostics.add_warning(
-                    f"Imported file '{raw_path}' does not end in '.rl'",
+                    f"Imported file '{raw_path}' does not end in '.rl' or '.rlm'",
                     file_path=resolved,
                     code="W0002",
                 )
@@ -374,8 +396,13 @@ class CompilationDriver:
 
             dep_path: Optional[Path] = None
 
+            record = self.module_sources.get(self._module_key(resolved))
+            saved_import = record['imports'].get(import_key) if record else None
+            if saved_import:
+                dep_path = self._module_path(saved_import)
+
             # Handle file-path imports: import "./foo.rl"
-            if raw_path:
+            if raw_path and dep_path is None:
                 import_path = raw_path
                 # 1. Relative to the importing module
                 candidate = (resolved.parent / import_path).resolve()
@@ -442,7 +469,7 @@ class CompilationDriver:
                     )
 
             # Handle module-path imports: import std.io
-            elif getattr(item, 'module', []):
+            elif dep_path is None and getattr(item, 'module', []):
                 module_path = ".".join(item.module)
                 dep_path = self._resolve_dotted_module(module_path)
                 if not dep_path:
@@ -457,6 +484,17 @@ class CompilationDriver:
                 continue
 
             dep_path = dep_path.resolve()
+            if dep_path.suffix == '.rlm':
+                try:
+                    dep_path = self._load_module_artifact(dep_path)
+                except ValueError as error:
+                    self.context.diagnostics.add_error(str(error))
+                    continue
+            module.import_paths[import_key] = self._module_key(dep_path)
+            # Resolve against the artifact's preserved module identity, even
+            # when its source files no longer exist on this machine.
+            if saved_import or raw_path.endswith('.rlm'):
+                item.path = str(dep_path)
 
             # Reject self-imports up front with a clearer diagnostic than
             # "Circular dependency detected involving: {...}".
@@ -477,7 +515,8 @@ class CompilationDriver:
             # Parse the dependency if not already parsed
             if dep_name not in graph.modules:
                 try:
-                    dep_content = dep_path.read_text(encoding="utf-8")
+                    saved_source = self.module_sources.get(self._module_key(dep_path))
+                    dep_content = saved_source['text'] if saved_source else dep_path.read_text(encoding="utf-8")
                 except OSError as e:
                     self.context.diagnostics.add_io_error(str(e), dep_path)
                     continue
@@ -495,6 +534,47 @@ class CompilationDriver:
 
                 # Recursively discover imports in the dependency
                 self._discover_imports(dep_path, dep_ast, graph, visited)
+
+    def _module_key(self, path):
+        path = path.resolve()
+        try:
+            return 'std:' + path.relative_to(self.stdlib_path.resolve()).as_posix()
+        except ValueError:
+            return 'user:' + str(path)
+
+    def _module_path(self, key):
+        if key.startswith('std:'):
+            relative = Path(key[4:])
+            if relative.is_absolute() or '..' in relative.parts:
+                raise ValueError('Invalid standard module path')
+            return (self.stdlib_path / relative).resolve()
+        if not key.startswith('user:') or not Path(key[5:]).is_absolute():
+            raise ValueError('Invalid user module path')
+        return Path(key[5:]).resolve()
+
+    def _module_target(self):
+        from .codegen.object_file import get_host_triple
+        return self.options.target_triple or get_host_triple()
+
+    def _load_module_artifact(self, path):
+        from .module_artifact import read_artifact
+        entry, sources, objects = read_artifact(path, self._module_target())
+        for key, record in sources.items():
+            source_path = self._module_path(key)
+            loaded = self.source_files.get(source_path)
+            if loaded is not None and loaded != record['text']:
+                raise ValueError(f'Conflicting module source for {key}')
+            previous = self.module_sources.get(key)
+            if previous is not None and previous != record:
+                raise ValueError(f'Conflicting module versions for {key}')
+        for key, data in objects.items():
+            previous = self.module_objects.get(key)
+            if previous is not None and previous != data:
+                raise ValueError(f'Conflicting native module objects for {key}')
+        self.module_sources.update(sources)
+        self.module_objects.update(objects)
+        self.separate_modules = True
+        return self._module_path(entry)
 
     def _resolve_module_exports(
         self,
@@ -695,6 +775,9 @@ class CompilationDriver:
                 source_path, ".opt.mir", format_mir(arc_result.program, arc_result.type_table)
             )
 
+        if self.separate_modules:
+            return self._emit_separate(arc_result, source_path)
+
         # All backend text outputs start with the same ARC-lowered program.
         if self.options.emit in (EmitKind.LLVM_IR, EmitKind.LLVM_OPTIMIZED, EmitKind.ASSEMBLY):
             llvm_result = r.run("Generating LLVM IR", compile_to_llvm,
@@ -762,6 +845,59 @@ class CompilationDriver:
             output_path.unlink()
 
         return result
+
+    def _emit_separate(self, arc_result, source_path):
+        from .module_abi import finish_module
+        from .module_artifact import write_artifact
+        from .codegen.object_file import compile_module_to_object
+        owner = self._module_key(self.entry_path)
+        if self.options.emit == EmitKind.MODULE and any(f.name == 'main' for f in arc_result.program.functions):
+            self.context.diagnostics.add_error('A library module cannot define main')
+            return self._fail()
+        try:
+            result = compile_to_llvm(arc_result, module_name=source_path.stem,
+                target_triple=self.options.target_triple, frame_structs=arc_result.frame_structs)
+            if result.has_errors():
+                raise ValueError('; '.join(result.errors))
+            native = finish_module(result.module, arc_result.program,
+                                   arc_result.symbol_table, arc_result.type_table, owner)
+            with native:
+                if self.options.emit == EmitKind.LLVM_IR:
+                    return self._emit_text(source_path, '.ll', str(native))
+                if self.options.emit in (EmitKind.LLVM_OPTIMIZED, EmitKind.ASSEMBLY):
+                    emitter = compile_module_to_assembly if self.options.emit == EmitKind.ASSEMBLY else optimize_module_to_ir
+                    content, errors = emitter(native, opt_level=self.options.opt_level.value,
+                                              target_triple=self.options.target_triple)
+                    if errors:
+                        raise ValueError('; '.join(errors))
+                    return self._emit_text(source_path, '.s' if self.options.emit == EmitKind.ASSEMBLY else '.opt.ll', content)
+                with tempfile.TemporaryDirectory(prefix='rolang-module-') as directory:
+                    obj = Path(directory) / 'entry.o'
+                    errors = compile_module_to_object(native, str(obj), self.options.opt_level.value, self.options.target_triple)
+                    if errors:
+                        raise ValueError('; '.join(errors))
+                    if self.options.emit == EmitKind.MODULE:
+                        path = self._get_output_path(source_path, '.rlm')
+                        sources = {self._module_key(m.path): {
+                            'text': self.source_files[m.path], 'imports': m.import_paths,
+                        } for m in self.compile_order}
+                        objects = {**self.module_objects, owner: obj.read_bytes()}
+                        write_artifact(path, owner, sources, objects, self._module_target())
+                        return CompileResult(True, path, diagnostics=self.context.diagnostics)
+                    if self.options.emit == EmitKind.OBJECT:
+                        path = self._get_output_path(source_path, '.o')
+                        path.write_bytes(obj.read_bytes())
+                        return CompileResult(True, path, diagnostics=self.context.diagnostics)
+                    dependencies = []
+                    for index, data in enumerate(self.module_objects.values()):
+                        dep = Path(directory) / f'dependency_{index}.o'
+                        dep.write_bytes(data)
+                        dependencies.append(dep)
+                    self._module_link_objects = dependencies
+                    return self._link_executable(obj, self._get_output_path(source_path, ''))
+        except (OSError, ValueError, RuntimeError) as error:
+            self.context.diagnostics.add_error(f'Module compilation failed: {error}')
+            return self._fail()
 
     def _emit_text(self, source_path: Path, suffix: str, content: str) -> CompileResult:
         """Write textual compiler output with consistent I/O diagnostics."""
@@ -906,6 +1042,7 @@ class CompilationDriver:
         link_cmd = [
             cc,
             str(object_path),
+            *(str(path) for path in getattr(self, '_module_link_objects', [])),
             str(runtime_obj),
             "-o", str(output_path),
             f"-O{self.options.opt_level.value}",

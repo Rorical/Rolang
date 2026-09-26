@@ -91,6 +91,7 @@ class TypeLayoutCache:
         # Maps TypeId → sequential descriptor index (0-based)
         self._descriptor_ids: Dict[TypeId, int] = {}
         self._next_descriptor_id = 0
+        self._descriptor_keys = {}
 
         # Common LLVM types
         self.i1 = ir.IntType(1)
@@ -323,10 +324,20 @@ class TypeLayoutCache:
         return 0
 
     def get_or_assign_descriptor_id(self, type_id: TypeId) -> int:
-        """Get or assign a sequential type descriptor ID for GC tracing."""
+        """Assign a dense ID, or a stable sparse ID for separate modules."""
         if type_id not in self._descriptor_ids:
-            self._descriptor_ids[type_id] = self._next_descriptor_id
-            self._next_descriptor_id += 1
+            descriptor = self._next_descriptor_id
+            if getattr(self.symbol_table, 'separate_modules', False):
+                from ..module_abi import type_key, digest
+                key = type_key(type_id, self.symbol_table, self.type_table)
+                descriptor = 0x4000000000000000 | (int(digest(key)[:16], 16) & 0x3fffffffffffffff)
+                previous = self._descriptor_keys.get(descriptor)
+                if previous is not None and previous != key:
+                    raise ValueError('Module ABI type hash collision')
+                self._descriptor_keys[descriptor] = key
+            self._descriptor_ids[type_id] = descriptor
+            self._next_descriptor_id = (len(self._descriptor_keys) if self._descriptor_keys
+                                        else len(self._descriptor_ids))
         return self._descriptor_ids[type_id]
 
     def get_descriptor_count(self) -> int:
@@ -493,36 +504,39 @@ class TypeLayoutCache:
         num = self.get_descriptor_count()
         desc_to_type = {did: tid for tid, did in self._descriptor_ids.items()}
 
+        # The graph algorithm uses dense node indices; module descriptor IDs
+        # are sparse hashes and must be mapped in both directions.
+        indices = {did: index for index, did in enumerate(desc_to_type)}
         edges: Dict[int, list] = {}
         conservative = set()
-        for did in range(num):
+        for did, index in indices.items():
             # field_desc_map[did] entries are
             # (byte_offset, field_type_descriptor_id, case_tag); index [1] is
             # the target descriptor id.
             targets = []
             for fd in field_desc_map.get(did, []):
                 target = fd[1]
-                if 0 <= target < num:
-                    targets.append(target)
+                if target in indices:
+                    targets.append(indices[target])
                 else:
                     # Opaque managed pointer (existential sentinel) or any other
                     # out-of-range target: points to an unknown type. Treat the
                     # source as conservative so it can reach anything.
-                    conservative.add(did)
-            edges[did] = targets
+                    conservative.add(index)
+            edges[index] = targets
 
             tid = desc_to_type.get(did)
             if tid is None:
-                conservative.add(did)
+                conservative.add(index)
                 continue
             info = type_table.get_type(tid)
             if info is not None and info.kind in (TypeKind.EXISTENTIAL, TypeKind.CLOSURE):
-                conservative.add(did)
+                conservative.add(index)
             if tid in type_to_trace:  # containers (Vec/Dict/user __gc_trace__)
-                conservative.add(did)
+                conservative.add(index)
 
         cyclic = cyclic_capable_ids(num_ids=num, edges=edges, conservative=conservative)
-        return set(range(num)) - cyclic
+        return {did for did, index in indices.items() if index not in cyclic}
 
     def get_enum_type(self, mir_enum: MirEnum) -> ir.IdentifiedStructType:
         """

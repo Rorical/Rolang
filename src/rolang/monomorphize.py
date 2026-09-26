@@ -769,6 +769,10 @@ class Monomorphizer:
                 kind=SymbolKind.FUNCTION,
                 namespace=Namespace.VALUE,
             )
+            self.symbol_table.record_specialization(
+                method_symbol.id, method.symbol_id,
+                self.symbol_table.specialization_origin.get(new_symbol, (None, ()))[1],
+            )
             specialized_method = self._specialize_function(
                 method, subst, method_symbol.id, method_mangled
             )
@@ -817,6 +821,10 @@ class Monomorphizer:
                 name=method_mangled,
                 kind=SymbolKind.FUNCTION,
                 namespace=Namespace.VALUE,
+            )
+            self.symbol_table.record_specialization(
+                method_symbol.id, method.symbol_id,
+                self.symbol_table.specialization_origin.get(new_symbol, (None, ()))[1],
             )
             specialized_method = self._specialize_function(
                 method, subst, method_symbol.id, method_mangled

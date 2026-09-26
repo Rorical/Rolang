@@ -65,7 +65,7 @@ With an include path set, `import "utils/helpers.rl"` resolves to `./libs/utils/
 
 ## The Module Graph
 
-When a file is compiled with imports, the compiler builds a *module graph* — a directed acyclic graph of all files reachable from the entry point, in dependency order. Each module is resolved, type-checked, and compiled once, then linked together.
+When a file is compiled with imports, the compiler builds a *module graph* — a directed acyclic graph of all files reachable from the entry point, in dependency order. Source imports are resolved in dependency order and merged into one compilation. Compiled artifact imports reuse native objects as described below.
 
 Circular imports are detected and reported as errors.
 
@@ -169,3 +169,28 @@ See [Chapter 20](ch20-toolchain.md) for full package management and library crea
 - Fields also require `pub` to be accessible outside their defining module
 - The compiler discovers all transitive imports, checks for cycles, and compiles in dependency order
 - Use `-I dir` for additional search paths; the toolchain handles this for declared dependencies
+
+## Compiled Module Artifacts
+
+Compile a library separately, then import its artifact:
+
+```bash
+rolangc --emit module -O2 math.rl -o math.rlm
+rolangc main.rl -o main
+```
+
+```rolang
+// main.rl
+import "math.rlm"
+def main() -> i32 { return answer(); }
+```
+
+`math.rl` must export `answer` and must not define `main`. Build user dependencies
+as `.rlm` artifacts first. Artifacts contain native code, transitive dependency
+objects, and source metadata for generic specialization. They can be relocated
+and used after the original sources are removed.
+
+Artifacts require the same compiler implementation, llvmlite version, and target.
+They include private source text and original paths. The consumer still processes
+the metadata through the front end; native non-generic function bodies are reused.
+Plain `.rl` imports and project/package builds keep their existing source workflow.

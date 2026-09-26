@@ -320,6 +320,7 @@ rolangc -c hello.rl -o hello.o      # object file only (no link)
 rolangc --emit mir  hello.rl        # print MIR to stdout
 rolangc --emit llvm hello.rl        # print LLVM IR to stdout
 rolangc --emit obj  hello.rl -o a.o # object file
+rolangc --emit module lib.rl -o lib.rlm # reusable native library with generic metadata
 rolangc --emit mir-opt -O3 hello.rl # lowered and optimized MIR, including ARC
 rolangc --emit llvm-opt -O3 hello.rl # LLVM IR after backend optimization
 rolangc --emit asm -O3 hello.rl -o hello.s # native assembly

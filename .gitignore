@@ -20,6 +20,7 @@ dist/
 # Rolang compiler outputs
 *.ll
 *.mir
+*.rlm
 *.o
 *.out
 

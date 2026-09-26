@@ -480,9 +480,72 @@ int64_t gc_trigger_at = GC_MIN_GAP;    /* non-static: inline alloc fast path */
 
 /* ---- GC list lock helpers ---- */
 
+/* Separately compiled modules register private descriptor tables before main.
+ * Dense legacy tables remain the fast path for unified builds. */
+typedef struct ModuleTypeEntry {
+    TypeDescriptor* descriptor;
+    FieldDescriptor* fields;
+    const char* key;
+    struct ModuleTypeEntry* next;
+} ModuleTypeEntry;
+static ModuleTypeEntry** module_type_buckets;
+static size_t module_type_capacity, module_type_count;
+static ModuleTypeEntry* module_type_find(uint64_t id) {
+    if (!module_type_capacity) return NULL;
+    ModuleTypeEntry* e = module_type_buckets[id % module_type_capacity];
+    while (e && e->descriptor->type_id != id) e = e->next;
+    return e;
+}
+void rt_register_module_types(TypeDescriptor* descriptors, int32_t count,
+                              FieldDescriptor* fields, int32_t field_count,
+                              const char** keys) {
+    for (int32_t i = 0; i < count; i++) {
+        TypeDescriptor* d = &descriptors[i];
+        if (d->fields_start < 0 || d->field_count < 0 ||
+            (int64_t)d->fields_start + d->field_count > field_count)
+            rt_panic("invalid module type descriptor");
+        ModuleTypeEntry* existing = module_type_find(d->type_id);
+        if (existing) {
+            TypeDescriptor* old = existing->descriptor;
+            if (strcmp(existing->key, keys[i]) || old->payload_size != d->payload_size ||
+                old->field_count != d->field_count || old->acyclic != d->acyclic)
+                rt_panic("module type identity collision or incompatible layout");
+            for (int32_t j = 0; j < d->field_count; j++) {
+                FieldDescriptor* a = &existing->fields[j];
+                FieldDescriptor* b = &fields[d->fields_start + j];
+                if (a->offset != b->offset || a->field_type_id != b->field_type_id || a->case_tag != b->case_tag)
+                    rt_panic("incompatible module field layout");
+            }
+            continue;
+        }
+        if (module_type_count * 2 >= module_type_capacity) {
+            size_t capacity = module_type_capacity ? module_type_capacity * 2 : 256;
+            ModuleTypeEntry** buckets = calloc(capacity, sizeof(*buckets));
+            if (!buckets) rt_panic("module type registry allocation failed");
+            for (size_t j = 0; j < module_type_capacity; j++) {
+                ModuleTypeEntry* e = module_type_buckets[j];
+                while (e) {
+                    ModuleTypeEntry* next = e->next;
+                    size_t slot = e->descriptor->type_id % capacity;
+                    e->next = buckets[slot]; buckets[slot] = e; e = next;
+                }
+            }
+            free(module_type_buckets);
+            module_type_buckets = buckets; module_type_capacity = capacity;
+        }
+        ModuleTypeEntry* e = malloc(sizeof(*e));
+        if (!e) rt_panic("module type registry allocation failed");
+        size_t slot = d->type_id % module_type_capacity;
+        e->descriptor = d; e->fields = d->field_count ? fields + d->fields_start : NULL;
+        e->key = keys[i]; e->next = module_type_buckets[slot];
+        module_type_buckets[slot] = e; module_type_count++;
+    }
+}
+
 static inline TypeDescriptor* rt_get_type_descriptor(uint64_t type_id) {
     if (type_id >= (uint64_t)RT_TYPE_DESCRIPTOR_COUNT) {
-        return NULL;
+        ModuleTypeEntry* entry = module_type_find(type_id);
+        return entry ? entry->descriptor : NULL;
     }
     return &RT_TYPE_DESCRIPTORS[type_id];
 }
@@ -494,6 +557,10 @@ static inline int32_t rt_get_field_count(const TypeDescriptor* desc) {
 
 static inline FieldDescriptor* rt_get_field_descriptors(const TypeDescriptor* desc) {
     if (desc == NULL || desc->field_count == 0) return NULL;
+    if (desc->type_id >= (uint64_t)RT_TYPE_DESCRIPTOR_COUNT) {
+        ModuleTypeEntry* entry = module_type_find(desc->type_id);
+        return entry ? entry->fields : NULL;
+    }
     if (desc->fields_start < 0) return NULL;
     if (desc->fields_start + desc->field_count > RT_TYPE_FIELD_DESCRIPTOR_COUNT) return NULL;
     return &RT_TYPE_FIELD_DESCRIPTORS[desc->fields_start];
