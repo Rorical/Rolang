@@ -493,8 +493,9 @@ class CompilationDriver:
             module.import_paths[import_key] = self._module_key(dep_path)
             # Resolve against the artifact's preserved module identity, even
             # when its source files no longer exist on this machine.
-            if saved_import or raw_path.endswith('.rlm'):
-                item.path = str(dep_path)
+            # Preserve the exact discovery result through name resolution.
+            # Installed packages can have differently named symlink entries.
+            item.path = str(dep_path)
 
             # Reject self-imports up front with a clearer diagnostic than
             # "Circular dependency detected involving: {...}".

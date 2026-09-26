@@ -69,8 +69,13 @@ rolang run
 | `rolang install` | Fetch and install all dependencies |
 | `rolang add <name> --path <path>` | Add a local path dependency |
 | `rolang add <name> --git <url> --tag <tag>` | Add a git dependency |
+| `rolang add <name> VERSION [--registry URL]` | Add a registry dependency |
 | `rolang remove <name>` | Remove a dependency |
 | `rolang info` | Show project metadata |
+
+Registry dependencies use a configured HTTPS or local static registry, with
+checksummed archives, transitive resolution, and lockfile pins. See
+[package registries](docs/package-registries.md) for setup and supported ranges.
 
 ## Compiled Libraries
 

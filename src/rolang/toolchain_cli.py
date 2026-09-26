@@ -353,7 +353,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         ref = tag or branch or rev or "HEAD"
         display = f"git:{git_url} ({ref})"
     elif version is not None:
-        dep = RegistryDependency(version=version)
+        dep = RegistryDependency(version=version, registry=getattr(args, "registry", None))
         display = version
     else:
         return _err(
@@ -535,6 +535,7 @@ Examples:
                        help="Local path dependency")
     p_add.add_argument("--git", metavar="URL", default=None,
                        help="Git repository URL")
+    p_add.add_argument("--registry", default=None, help="Registry URL or local directory")
     p_add.add_argument("--tag", metavar="TAG", default=None)
     p_add.add_argument("--branch", metavar="BRANCH", default=None)
     p_add.add_argument("--rev", metavar="REV", default=None)

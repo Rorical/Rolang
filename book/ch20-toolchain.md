@@ -362,3 +362,32 @@ Text output is printed to stdout when `-o` is omitted and is also saved beside t
 | `rolang add <name> ...` | Add a dependency |
 | `rolang remove <name>` | Remove a dependency |
 | `rolang info` | Show project metadata |
+
+
+## Registry Dependencies
+
+Configure a registry and install a versioned dependency:
+
+```bash
+export ROLANG_REGISTRY_URL=https://packages.example.org/rolang/
+rolang add geometry '^1.2'
+rolang install
+rolang build
+```
+
+`rolang add geometry '^1.2' --registry /path/to/registry` selects a local registry
+for that dependency. Registries serve `packages/NAME.json` indexes and source tar
+archives. Installed packages support the same imports as path and Git packages.
+
+The resolver installs transitive dependencies and selects one compatible version
+per name, preferring existing lockfile pins. Archives are checksum-verified and
+lockfiles record versions, sources, checksums, and dependency names. Compatible
+locked graphs can be reinstalled from cached archives without network access.
+
+Supported version requirements include exact `1.2.3`, partial `1.2`,
+caret `^1.2`, tilde `~1.2`, `*`, and comma-separated full-version comparisons.
+Prereleases require an explicit opt-in such as `^1.2.0-beta.1`; this admits
+prereleases of 1.2.0 and compatible stable releases, but excludes prereleases of
+other version cores. Build metadata is ignored in comparisons. The exact selected
+release and checksum remain pinned in the lockfile. No public default registry
+or publish service is configured; use your own static HTTPS host or a local directory.

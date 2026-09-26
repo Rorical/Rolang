@@ -47,7 +47,7 @@ uv run pytest -q -n 4
 - At the initial audit, async execution lacked source-level spawn, cancellation, and an I/O event loop. These are implemented in the subsequent [async/task implementation](async-io-task-control.md); execution remains cooperative and single-threaded.
 - `--emit mir` and `--emit llvm` retain their original stages. New `--emit mir-opt` includes async lowering, MIR optimization and ARC; `--emit llvm-opt` exposes verified backend-optimized LLVM IR; `--emit asm` emits assembly with the same target and optimization settings as object output.
 - Plain source imports use unified object output. The subsequent [separate-module implementation](separate-modules.md) adds `.rlm` artifacts with native objects and generic source metadata; consumers link non-generic library code and instantiate generics locally.
-- Package dependencies support paths and Git; a package registry remains unsupported.
+- Package dependencies support paths, Git, and now [configured static registries](package-registries.md). Hosted registry operations and publishing remain future work.
 
 Validation here targets the local Apple Silicon macOS host. It does not establish cross-platform correctness or a new performance ranking.
 
@@ -67,7 +67,7 @@ rolangc --emit asm -O3 program.rl -o program.s
 
 Final follow-up validation: **767 passed, no skips**, in 301.70 seconds on Apple Silicon macOS. This includes 43 focused literal/function-value/output checks and the two newly enabled project build/run tests. Emitted assembly is independently assembled, linked, and executed at O0–O3; LLVM output is verified; callback tests check observable output and heap-object reclamation.
 
-The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). The subsequent [module implementation](separate-modules.md) adds independent native objects and generic source metadata. A package registry and incremental front-end caching remain outstanding. Synchronous cycle collection remains an execution-time caveat.
+The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). The subsequent [module implementation](separate-modules.md) adds independent native objects and generic source metadata. The subsequent [registry implementation](package-registries.md) adds static registry consumption. Hosted publishing and incremental front-end caching remain outstanding. Synchronous cycle collection remains an execution-time caveat.
 
 
 ## Follow-up — separate native modules
@@ -81,3 +81,28 @@ type IDs and diagnoses incompatible or conflicting artifacts. See
 Validation: 819 tests passed in the full suite, followed by 69 focused tests after
 final adjustments. Seven module sanitizer scenarios passed, including async tasks,
 heap values, destructors, and cyclic object reclamation at O0/O3.
+
+
+## Follow-up — static package registries
+
+Added configurable static registry consumption, stable version requirements,
+transitive resolution with backtracking, verified archive caching, checksum pins,
+and offline reuse of compatible locked graphs. Fixed name resolution for
+symlinked package entry points and development-dependency installation for test
+targets. See [package registries](package-registries.md) for setup and limitations.
+
+Validation: **856 tests passed** in the full suite, followed by **72 focused
+registry/toolchain tests** after final fixes. HTTP downloads were exercised with
+a temporary loopback server; no external registry was deployed or published to.
+
+
+## Follow-up — prerelease registry versions
+
+Added SemVer prerelease/build-metadata parsing and ordering. Stable requirements
+exclude prereleases unless explicitly opted into their version core. Registry
+selection handles metadata variants deterministically and preserves exact locked
+artifact identities. Extracted version handling from registry transport and
+archive code into `toolchain/versions.py`.
+
+Validation: **130 version/registry/toolchain tests passed**, including a compiled
+consumer installed from a prerelease package and restored offline from its lock.

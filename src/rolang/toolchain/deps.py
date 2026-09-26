@@ -50,6 +50,9 @@ class ResolvedDep:
     version: str
     source: str       # same format as LockedPackage.source
     local_path: Path  # root of the resolved package (contains rolang.toml)
+    checksum: Optional[str] = None
+    archive: Optional[str] = None
+    dependencies: tuple[str, ...] = ()
 
 
 # ── Per-kind resolution ───────────────────────────────────────────────────────
@@ -67,11 +70,10 @@ def resolve_dep(
     if isinstance(dep, GitDependency):
         return _resolve_git(name, dep, project_root, lockfile)
     if isinstance(dep, RegistryDependency):
-        raise DependencyError(
-            f"Registry dependencies are not yet supported: "
-            f"'{name} = \"{dep.version}\"'. "
-            "Use --path or --git instead."
-        )
+        candidate = next(_registry_candidates(name, dep, project_root, lockfile), None)
+        if candidate is None:
+            raise DependencyError(f'No matching release for {name}: {dep.version}')
+        return candidate
     raise DependencyError(f"Unknown dependency type for '{name}': {type(dep)!r}")
 
 
@@ -81,7 +83,7 @@ def _resolve_path(
     project_root: Path,
 ) -> ResolvedDep:
     raw = Path(dep.path)
-    resolved = raw if raw.is_absolute() else (project_root / raw).resolve()
+    resolved = (raw if raw.is_absolute() else project_root / raw).resolve()
     if not resolved.exists():
         raise DependencyError(
             f"Path dependency '{name}' not found: {resolved}"
@@ -194,20 +196,8 @@ def install_deps(
     if dev:
         to_install.update(manifest.dev_dependencies)
 
-    resolved: dict[str, ResolvedDep] = {}
-    for name, dep in to_install.items():
-        if verbose:
-            print(f"  Resolving {name}...", flush=True)
-        rdep = resolve_dep(name, dep, project_root, lockfile)
-        resolved[name] = rdep
-        lockfile.upsert(
-            LockedPackage(
-                name=rdep.name,
-                version=rdep.version,
-                source=rdep.source,
-            )
-        )
-
+    resolved = _resolve_graph(to_install, project_root, lockfile, verbose)
+    # Keep installation/lock mutation after successful resolution of the graph.
     # Symlink each dep into .rolang/deps/<name>/ and create a .rl entry shim.
     #
     # After installation the following import styles all work:
@@ -251,6 +241,31 @@ def install_deps(
             if verbose:
                 print(f"  Installed {name} {rdep.version} -> {rdep.local_path}")
 
+    # Remove only generated symlinks for dependencies removed from the graph.
+    for previous in lockfile.packages:
+        if previous.name not in resolved:
+            from .registry import validate_name
+            validate_name(previous.name)
+            for obsolete in (dd / previous.name, dd / f'{previous.name}.rl'):
+                if obsolete.is_symlink():
+                    obsolete.unlink()
+    # Production installs retain dev pins for later test builds without
+    # installing those packages into the production import path.
+    keep_dev = set(manifest.dev_dependencies) if not dev else set()
+    queue = list(keep_dev)
+    while queue:
+        pinned = lockfile.find(queue.pop())
+        if pinned:
+            for child in pinned.dependencies:
+                if child not in keep_dev:
+                    keep_dev.add(child)
+                    queue.append(child)
+    retained = [p for p in lockfile.packages if p.name in keep_dev and p.name not in resolved]
+    lockfile.packages = [LockedPackage(
+        name=rdep.name, version=rdep.version, source=rdep.source,
+        checksum=rdep.checksum, archive=rdep.archive,
+        dependencies=list(rdep.dependencies),
+    ) for rdep in resolved.values()] + retained
     return resolved
 
 
@@ -269,3 +284,82 @@ def build_include_paths(project_root: Path) -> list[Path]:
     if not dd.exists():
         return []
     return [dd]
+
+
+class _Conflict(DependencyError):
+    """An unsatisfied graph branch; allows trying another release."""
+
+
+def _registry_candidates(name, dep, root, lockfile):
+    from .registry import registry_url, releases, matches, fetch_package
+    base = registry_url(dep.registry, root)
+    source = 'registry:' + base
+    locked = lockfile.find(name)
+    tried = set()
+    if locked and locked.source == source and matches(locked.version, dep.version) and locked.checksum and locked.archive:
+        release = {'version': locked.version, 'sha256': locked.checksum, 'archive': locked.archive}
+        path = fetch_package(name, release, base, cache_dir())
+        tried.add(locked.version)
+        yield ResolvedDep(name, locked.version, source, path, locked.checksum, locked.archive)
+    for release in releases(name, base):
+        if release['version'] in tried or release.get('yanked') or not matches(release['version'], dep.version):
+            continue
+        path = fetch_package(name, release, base, cache_dir())
+        yield ResolvedDep(name, release['version'], source, path, release['sha256'], release['archive'])
+
+
+def _resolve_graph(dependencies, root, lockfile, verbose):
+    from .registry import validate_name, matches, registry_url
+    attempts = 0
+
+    def visit(pending, selected):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 10000 or len(selected) > 200:
+            raise DependencyError('Dependency resolution limit exceeded')
+        if not pending:
+            return selected
+        name, dep, parent, ancestors = pending[0]
+        validate_name(name)
+        if name in ancestors:
+            raise _Conflict('Dependency cycle: ' + ' -> '.join((*ancestors, name)))
+        existing = selected.get(name)
+        if existing:
+            if isinstance(dep, RegistryDependency):
+                compatible = (existing.source == 'registry:' + registry_url(dep.registry, parent)
+                              and matches(existing.version, dep.version))
+            elif isinstance(dep, PathDependency):
+                compatible = existing.local_path == (parent / dep.path).resolve()
+            else:
+                compatible = existing.source == _source_str(dep)
+            if not compatible:
+                raise _Conflict(f'Conflicting dependency requirements for {name}: selected {existing.version} from {existing.source}')
+            return visit(pending[1:], selected)
+        candidates = (_registry_candidates(name, dep, parent, lockfile)
+                      if isinstance(dep, RegistryDependency)
+                      else [resolve_dep(name, dep, parent, lockfile)])
+        failure = _Conflict(f'No matching release for {name}: {dep}')
+        for candidate in candidates:
+            if verbose:
+                print(f'  Resolving {name} {candidate.version}...', flush=True)
+            child_manifest = Manifest.load(candidate.local_path)
+            children = dict(child_manifest.dependencies)
+            if isinstance(dep, RegistryDependency):
+                base = registry_url(dep.registry, parent)
+                for child_name, child in children.items():
+                    if not isinstance(child, RegistryDependency):
+                        raise DependencyError(f'Registry package {name} must use registry dependencies ({child_name})')
+                    if child.registry is None:
+                        children[child_name] = RegistryDependency(child.version, base)
+            candidate.dependencies = tuple(sorted(children))
+            following = [(n, d, candidate.local_path, (*ancestors, name)) for n, d in children.items()]
+            try:
+                return visit(following + pending[1:], {**selected, name: candidate})
+            except _Conflict as exc:
+                failure = exc
+        raise failure
+
+    try:
+        return visit([(n, d, root, ()) for n, d in dependencies.items()], {})
+    except RecursionError as exc:
+        raise DependencyError('Dependency graph is too deep') from exc

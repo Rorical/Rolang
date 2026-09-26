@@ -62,10 +62,11 @@ def build_project(
 
     # Install / resolve dependencies
     include_paths: list[Path] = []
-    if manifest.dependencies or (manifest.dev_dependencies and not check_only):
+    include_dev = bool(targets and any(t.name in targets for t in manifest.tests))
+    if manifest.dependencies or (manifest.dev_dependencies and include_dev):
         if verbose:
             print("Resolving dependencies...")
-        install_deps(manifest, lock, verbose=verbose)
+        install_deps(manifest, lock, dev=include_dev, verbose=verbose)
         lock.save(root)
         include_paths = build_include_paths(root)
     else:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -19,6 +21,7 @@ class LockedPackage:
     source: str            # "path:../foo", "git:https://...?tag=v1.0"
     checksum: Optional[str] = None    # sha256 hex for registry packages
     dependencies: list[str] = field(default_factory=list)
+    archive: Optional[str] = None
 
 
 @dataclass
@@ -46,6 +49,7 @@ class LockFile:
                 version=pkg["version"],
                 source=pkg["source"],
                 checksum=pkg.get("checksum"),
+                archive=pkg.get("archive"),
                 dependencies=pkg.get("dependencies", []),
             )
             for pkg in data.get("package", [])
@@ -76,7 +80,16 @@ class LockFile:
 
     def save(self, dest: Path) -> None:
         lock_path = dest if dest.name == LOCK_FILENAME else dest / LOCK_FILENAME
-        lock_path.write_text(self._to_toml(), encoding="utf-8")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                    dir=lock_path.parent, prefix='.rolang-lock-', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(self._to_toml())
+            temporary.replace(lock_path)
+        finally:
+            if temporary and temporary.exists():
+                temporary.unlink()
 
     def _to_toml(self) -> str:
         lines = [
@@ -88,9 +101,11 @@ class LockFile:
         ]
         for pkg in sorted(self.packages, key=lambda p: p.name):
             lines.append("[[package]]")
-            lines.append(f'name = "{pkg.name}"')
-            lines.append(f'version = "{pkg.version}"')
-            lines.append(f'source = "{pkg.source}"')
+            lines.append(f'name = {json.dumps(pkg.name)}')
+            lines.append(f'version = {json.dumps(pkg.version)}')
+            lines.append(f'source = {json.dumps(pkg.source)}')
+            if pkg.archive:
+                lines.append(f'archive = {json.dumps(pkg.archive)}')
             if pkg.checksum:
                 lines.append(f'checksum = "{pkg.checksum}"')
             if pkg.dependencies:

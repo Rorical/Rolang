@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -333,8 +334,8 @@ def _toml_str_array(items: list[str]) -> str:
 def _dep_value(dep: Dependency) -> str:
     if isinstance(dep, RegistryDependency):
         if dep.registry is None:
-            return f'"{dep.version}"'
-        return f'{{ version = "{dep.version}", registry = "{dep.registry}" }}'
+            return json.dumps(dep.version)
+        return f'{{ version = {json.dumps(dep.version)}, registry = {json.dumps(dep.registry)} }}'
     elif isinstance(dep, PathDependency):
         return f'{{ path = "{dep.path}" }}'
     elif isinstance(dep, GitDependency):
