@@ -4,8 +4,7 @@
 // understands fixed-size key types and string keys (via key_kind=1), so
 // the set automatically inherits the same key compatibility.
 //
-// Insertion order is NOT preserved. `iter()` walks elements in the
-// underlying dict's internal bucket order.
+// Snapshot values follow insertion order, as in the underlying dictionary.
 
 import "dict.rl"
 import "vec.rl"
@@ -38,6 +37,15 @@ pub struct Set<T> {
     pub def is_empty() -> Bool {
         return self.d.len() == 0;
     }
+
+    pub def remove(elem: T) -> Bool {
+        if let removed = self.d.remove(elem) { return true; }
+        return false;
+    }
+
+    pub def clear() -> Void { self.d.clear(); }
+
+    pub def values() -> Vec<T> { return self.d.keys(); }
 
     pub def free() -> Void {
         self.d.free();

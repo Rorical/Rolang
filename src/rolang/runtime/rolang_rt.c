@@ -1698,8 +1698,8 @@ enum {
  *   0 = primitive (no retain/release needed)
  *   non-zero = heap type (retain on insert, release on overwrite/free)
  *
- * Note: dict remove is not exposed by the language yet, so we never
- * generate tombstones — this keeps probing simple.
+ * Removal repairs the probe chain and compacts the entries; surviving
+ * entries retain insertion order without tombstones.
  */
 typedef struct RolangDict {
     int64_t len;
@@ -2250,6 +2250,48 @@ void rt_dict_set_at(void* dict_ptr, int64_t index, const void* value) {
     _dict_retain_element(dict->value_type_id, slot);
 }
 
+/* Remove with backward-shift bucket repair and ordered entry compaction.
+ * O(n + capacity); preserves insertion order but invalidates entry indices.
+ * The removed value's ownership transfers to out. */
+int32_t rt_dict_remove(void* ptr, const void* key, void* out) {
+    if (!ptr || !key || !out) return 0;
+    RolangDict* dict = ptr;
+    uint64_t hole; uint32_t tag;
+    int32_t idx = _dict_probe(dict, key, &hole, &tag);
+    if (idx < 0) return 0;
+    void* old_key = dict->key_type_id ? *(void**)rt_dict_key_at(dict, idx) : NULL;
+    memcpy(out, rt_dict_value_at(dict, idx), (size_t)dict->value_size);
+    DictBucket* buckets = _dict_buckets(dict);
+    uint64_t mask = (uint64_t)dict->bucket_count - 1;
+    uint64_t scan = (hole + 1) & mask;
+    while (buckets[scan].idx != RT_DICT_BUCKET_EMPTY) {
+        uint64_t ideal = _dict_hash_key(dict, rt_dict_key_at(dict, buckets[scan].idx)) & mask;
+        if (((hole - ideal) & mask) < ((scan - ideal) & mask)) {
+            buckets[hole] = buckets[scan]; hole = scan;
+        }
+        scan = (scan + 1) & mask;
+    }
+    buckets[hole].idx = RT_DICT_BUCKET_EMPTY; buckets[hole].tag = 0;
+    int64_t last = dict->len - 1;
+    if (idx != last) {
+        memmove(rt_dict_key_at(dict, idx), rt_dict_key_at(dict, idx + 1),
+                (size_t)(last - idx) * _dict_stride(dict));
+        for (int32_t i = 0; i < dict->bucket_count; i++)
+            if (buckets[i].idx > idx) buckets[i].idx--;
+    }
+    dict->len--;
+    memset(rt_dict_key_at(dict, last), 0, _dict_stride(dict));
+    if (old_key) rt_obj_release(old_key);
+    return 1;
+}
+void rt_dict_clear(void* ptr) {
+    if (!ptr) return;
+    RolangDict* dict = ptr;
+    _dict_release_all(dict);
+    dict->len = 0;
+    _dict_clear_buckets(dict);
+}
+
 int64_t rt_dict_len(void* dict_ptr) {
     if (dict_ptr == NULL) {
         return 0;
@@ -2332,6 +2374,8 @@ void rt_dict_gc_trace(void* payload, GCTraceCb cb, void* ctx) {
 #include <time.h>
 #if defined(__unix__) || defined(__APPLE__)
 #include <poll.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #endif
@@ -2345,9 +2389,10 @@ typedef struct TaskHandle {
     void* result;
     int refs, cancelled, running, owns_dependency;
     struct TaskHandle *dependency, *next;
-    int native_kind; /* 0 generated frame, 1 timer, 2 read, 3 write */
+    int native_kind; /* 0 frame, 1 timer, 2 read, 3 write, 4 connect, 5 accept */
     int64_t deadline;
     AsyncStream* stream;
+    AsyncStream* result_stream;
     char* buffer;
     int32_t length, offset;
 } TaskHandle;
@@ -2416,6 +2461,7 @@ static void task_release(TaskHandle* task) {
     if (task->result_kind == RT_TASK_RESULT_BOX) free(task->result);
     else if (task->result_kind == RT_TASK_RESULT_HEAP_REF) rt_obj_release(task->result);
     stream_release(task->stream);
+    stream_release(task->result_stream);
     free(task->buffer);
     task_live_count--;
     free(task);
@@ -2485,8 +2531,30 @@ static void task_native_result(TaskHandle* task, int32_t result) {
     *box = result;
     rt_task_complete_owned(task, box, RT_TASK_RESULT_BOX);
 }
+static AsyncStream* stream_adopt(int fd);
 static void task_native_ready(TaskHandle* task) {
 #if defined(__unix__) || defined(__APPLE__)
+    if (task->native_kind == 4) {
+        int error = 0;
+        socklen_t size = sizeof(error);
+        if (getsockopt(task->stream->fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0)
+            error = errno;
+        if (!error) {
+            task->result_stream = task->stream;
+            task->result_stream->refs++;
+        }
+        task_native_result(task, -error);
+        return;
+    }
+    if (task->native_kind == 5) {
+        int fd = accept(task->stream->fd, NULL, NULL);
+        if (fd >= 0) {
+            task->result_stream = stream_adopt(fd);
+            task_native_result(task, task->result_stream ? 0 : -errno);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            task_native_result(task, -errno);
+        return;
+    }
     ssize_t n;
     if (task->native_kind == 2) {
         n = recv(task->stream->fd, task->buffer, (size_t)task->length, 0);
@@ -2531,7 +2599,7 @@ static void task_poll_events(int may_block) {
     for (TaskHandle* t = task_head; t; t = t->next) {
         if (t->completed || t->running || t->native_kind < 2) continue;
         tasks[i] = t; fds[i].fd = t->stream->fd;
-        fds[i].events = t->native_kind == 2 ? POLLIN : POLLOUT; i++;
+        fds[i].events = (t->native_kind == 2 || t->native_kind == 5) ? POLLIN : POLLOUT; i++;
     }
     int n = poll(fds, (nfds_t)count, timeout);
     if (n < 0 && errno != EINTR) rt_panic("async poll failed");
@@ -2608,14 +2676,20 @@ static AsyncStream* stream_adopt(int fd) {
 #if defined(__unix__) || defined(__APPLE__)
     int socket_type;
     socklen_t type_len = sizeof(socket_type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_len) < 0 ||
-        socket_type != SOCK_STREAM) { close(fd); return NULL; }
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_len) < 0) {
+        int error = errno; close(fd); errno = error; return NULL;
+    }
+    if (socket_type != SOCK_STREAM) { close(fd); errno = EINVAL; return NULL; }
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return NULL; }
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        int error = errno; close(fd); errno = error; return NULL;
+    }
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
 #ifdef SO_NOSIGPIPE
     int one = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) < 0) { close(fd); return NULL; }
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) < 0) {
+        int error = errno; close(fd); errno = error; return NULL;
+    }
 #endif
     AsyncStream* stream = malloc(sizeof(*stream));
     if (!stream) { close(fd); rt_panic("async stream allocation failed"); }
@@ -2623,6 +2697,94 @@ static AsyncStream* stream_adopt(int fd) {
 #else
     (void)fd; return NULL;
 #endif
+}
+/* Numeric addresses avoid blocking name resolution on the scheduler thread. */
+#if defined(__unix__) || defined(__APPLE__)
+static int tcp_address(void* string, int32_t port, struct sockaddr_storage* out,
+                       socklen_t* size) {
+    StringVal value = rt_string_obj_value(string);
+    if (port < 0 || port > 65535 || value.len <= 0 || value.len >= INET6_ADDRSTRLEN)
+        return EINVAL;
+    char text[INET6_ADDRSTRLEN];
+    if (memchr(value.data, 0, (size_t)value.len)) return EINVAL;
+    memcpy(text, value.data, (size_t)value.len); text[value.len] = 0;
+    memset(out, 0, sizeof(*out));
+    struct sockaddr_in* v4 = (struct sockaddr_in*)out;
+    if (inet_pton(AF_INET, text, &v4->sin_addr) == 1) {
+        v4->sin_family = AF_INET; v4->sin_port = htons((uint16_t)port);
+        *size = sizeof(*v4); return 0;
+    }
+    struct sockaddr_in6* v6 = (struct sockaddr_in6*)out;
+    if (inet_pton(AF_INET6, text, &v6->sin6_addr) == 1) {
+        v6->sin6_family = AF_INET6; v6->sin6_port = htons((uint16_t)port);
+        *size = sizeof(*v6); return 0;
+    }
+    return EINVAL;
+}
+#endif
+TaskHandle* rt_async_connect_start(void* address, int32_t port) {
+    TaskHandle* task = task_new(); task->native_kind = 4;
+#if defined(__unix__) || defined(__APPLE__)
+    struct sockaddr_storage addr; socklen_t size;
+    int error = tcp_address(address, port, &addr, &size);
+    if (error) { task_native_result(task, -error); return task; }
+    int fd = socket(addr.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) { task_native_result(task, -errno); return task; }
+    task->stream = stream_adopt(fd);
+    if (!task->stream) { task_native_result(task, -errno); return task; }
+    if (connect(fd, (struct sockaddr*)&addr, size) == 0) {
+        task->result_stream = task->stream; task->result_stream->refs++;
+        task_native_result(task, 0);
+    } else if (errno != EINPROGRESS && errno != EINTR && errno != EALREADY)
+        task_native_result(task, -errno);
+#else
+    (void)address; (void)port; task_native_result(task, -ENOSYS);
+#endif
+    return task;
+}
+int32_t rt_async_listener_bind(void* address, int32_t port, int32_t backlog, void** out) {
+    *out = NULL;
+#if defined(__unix__) || defined(__APPLE__)
+    struct sockaddr_storage addr; socklen_t size;
+    int error = tcp_address(address, port, &addr, &size);
+    if (error || backlog <= 0) return -(error ? error : EINVAL);
+    int fd = socket(addr.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) return -errno;
+    AsyncStream* stream = stream_adopt(fd);
+    if (!stream) return -errno;
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0 ||
+        bind(fd, (struct sockaddr*)&addr, size) < 0 || listen(fd, backlog) < 0) {
+        error = errno; stream_release(stream); return -error;
+    }
+    *out = stream; return 0;
+#else
+    (void)address; (void)port; (void)backlog; return -ENOSYS;
+#endif
+}
+int32_t rt_async_listener_port(void* ptr) {
+#if defined(__unix__) || defined(__APPLE__)
+    if (!ptr) return -EBADF;
+    struct sockaddr_storage addr; socklen_t size = sizeof(addr);
+    if (getsockname(((AsyncStream*)ptr)->fd, (struct sockaddr*)&addr, &size) < 0)
+        return -errno;
+    return addr.ss_family == AF_INET ? ntohs(((struct sockaddr_in*)&addr)->sin_port)
+                                    : ntohs(((struct sockaddr_in6*)&addr)->sin6_port);
+#else
+    (void)ptr; return -ENOSYS;
+#endif
+}
+TaskHandle* rt_async_accept_start(void* ptr) {
+    TaskHandle* task = task_new(); task->native_kind = 5; task->stream = ptr;
+    if (ptr) task->stream->refs++; else task_native_result(task, -EBADF);
+    return task;
+}
+void* rt_async_take_stream(TaskHandle* task) {
+    rt_task_borrow_result(task);
+    if ((task->native_kind != 4 && task->native_kind != 5) || !task->result_stream)
+        rt_panic("stream result unavailable");
+    AsyncStream* stream = task->result_stream; task->result_stream = NULL;
+    return stream;
 }
 void* rt_async_stream_adopt(int32_t fd) { return stream_adopt(fd); }
 void* rt_async_stream_pair(void** other) {
@@ -4473,6 +4635,54 @@ void* rt_dir_list_handles(void* path_obj) {
     }
     free(old_vec);
     return new_vec;
+}
+
+/* Growable byte buffer for compiler diagnostics and generated source/IR. */
+typedef struct { char* data; size_t len, capacity; } StringBuilder;
+void* rt_string_builder_new(void) {
+    StringBuilder* b = calloc(1, sizeof(*b));
+    if (!b) rt_panic("string builder allocation failed");
+    return b;
+}
+static void string_builder_append(StringBuilder* b, const char* data, size_t len) {
+    if (!b) rt_panic("null string builder");
+    if (len > (size_t)INT64_MAX - b->len - 1) rt_panic("string builder too large");
+    size_t needed = b->len + len + 1;
+    if (needed > b->capacity) {
+        size_t capacity = b->capacity ? b->capacity : 64;
+        while (capacity < needed) {
+            if (capacity > (size_t)INT64_MAX / 2) { capacity = needed; break; }
+            capacity *= 2;
+        }
+        char* data_new = realloc(b->data, capacity);
+        if (!data_new) rt_panic("string builder allocation failed");
+        b->data = data_new; b->capacity = capacity;
+    }
+    if (len) memcpy(b->data + b->len, data, len);
+    b->len += len; b->data[b->len] = 0;
+}
+void rt_string_builder_append(void* ptr, void* text) {
+    StringVal value = rt_string_obj_value(text);
+    string_builder_append(ptr, value.data, (size_t)value.len);
+}
+void rt_string_builder_byte(void* ptr, uint8_t value) {
+    char byte = (char)value; string_builder_append(ptr, &byte, 1);
+}
+int64_t rt_string_builder_len(void* ptr) { return (int64_t)((StringBuilder*)ptr)->len; }
+void rt_string_builder_clear(void* ptr) {
+    StringBuilder* b = ptr; b->len = 0;
+    if (b->data) b->data[0] = 0;
+}
+void* rt_string_builder_text(void* ptr) {
+    StringBuilder* b = ptr;
+    char* copy = malloc(b->len + 1);
+    if (!copy) rt_panic("string builder allocation failed");
+    if (b->len) memcpy(copy, b->data, b->len);
+    copy[b->len] = 0;
+    return rt_string_handle_from_value((StringVal){copy, (int64_t)b->len});
+}
+void rt_string_builder_free(void* ptr) {
+    if (ptr) { StringBuilder* b = ptr; free(b->data); free(b); }
 }
 
 /* ============================================================================

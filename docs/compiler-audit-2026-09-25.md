@@ -67,7 +67,7 @@ rolangc --emit asm -O3 program.rl -o program.s
 
 Final follow-up validation: **767 passed, no skips**, in 301.70 seconds on Apple Silicon macOS. This includes 43 focused literal/function-value/output checks and the two newly enabled project build/run tests. Emitted assembly is independently assembled, linked, and executed at O0–O3; LLVM output is verified; callback tests check observable output and heap-object reclamation.
 
-The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). The subsequent [module implementation](separate-modules.md) adds independent native objects and generic source metadata. The subsequent [registry implementation](package-registries.md) adds static registry consumption. Hosted publishing and incremental front-end caching remain outstanding. Synchronous cycle collection remains an execution-time caveat.
+The next implementation adds [asynchronous socket I/O and task control](async-io-task-control.md). The subsequent [module implementation](separate-modules.md) adds independent native objects and generic source metadata. The subsequent [registry implementation](package-registries.md) adds static registry consumption. Hosted publishing remains outstanding. The subsequent [incremental build implementation](incremental-builds.md) reuses unchanged native targets; finer-grained incremental compilation remains future work. Synchronous cycle collection remains an execution-time caveat.
 
 
 ## Follow-up — separate native modules
@@ -106,3 +106,26 @@ archive code into `toolchain/versions.py`.
 
 Validation: **130 version/registry/toolchain tests passed**, including a compiled
 consumer installed from a prerelease package and restored offline from its lock.
+
+
+## Follow-up — incremental builds
+
+Added content-addressed native target caching to project build/run/test workflows.
+Validated import-search snapshots allow warm builds to skip parsing and all later
+compiler passes. Fingerprints cover source/import/module inputs, project settings,
+compiler/runtime implementation, and native toolchain configuration. Cache entries
+restore missing or damaged outputs; diagnostics and failed compilations are not
+cached. `--no-cache` bypasses reuse, and `rolang clean` removes cached artifacts.
+
+See [incremental builds](incremental-builds.md) for granularity and limitations.
+
+Validation: **155 incremental/toolchain/registry/output/module/import tests passed**
+in 105.08 seconds. A small local example measured 2.608 seconds cold and 0.038
+seconds warm; broader performance claims are not established by that measurement.
+
+## TCP async follow-up
+
+The async runtime now supports numeric IPv4/IPv6 TCP connect and listener/accept
+operations. See [the async implementation notes](async-io-task-control.md).
+Testing also fixed ARC release motion destroying an enum owner before retaining
+its extracted payload, which previously closed listeners prematurely at O1–O3.

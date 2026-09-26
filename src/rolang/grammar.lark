@@ -7,6 +7,7 @@
 start: top_level_item*
 
 top_level_item: import_decl
+              | type_alias_decl
               | struct_decl
               | enum_decl
               | protocol_decl
@@ -34,6 +35,8 @@ module_path: IDENT ("." IDENT)*
 //   * `static def __gc_trace__(payload, cb, ctx) -> Void`  — GC trace hook
 // They are normal methods syntactically; the compiler picks them up by
 // name during codegen and installs them in the type descriptor.
+type_alias_decl: [visibility] "typealias" IDENT "=" type _TERM
+
 struct_decl: [visibility] "struct" IDENT [generic_params] [type_constraints] "{" struct_member* "}"
 struct_member: property_decl
              | func_decl

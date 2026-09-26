@@ -17,6 +17,7 @@ from .types import TypeId, TypeTable
 class CalleeKind(Enum):
     """Kind of call target."""
 
+    INDIRECT = auto()  # Function value stored in a field
     STATIC = auto()    # Direct function call
     METHOD = auto()    # Method on concrete type
     VTABLE = auto()    # Dynamic dispatch (any P)

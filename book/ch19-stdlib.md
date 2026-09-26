@@ -306,3 +306,13 @@ A `Vec<u8>`-backed byte buffer for low-level string manipulation. Useful when yo
 | `panic.rl` | `panic` |
 | `test.rl` | `assert_eq_i32`, `assert_true`, … |
 | `bytestring.rl` | `ByteString` (Vec\<u8\> wrapper) |
+
+## Compiler-Oriented Utilities
+
+- `std.string_builder`: `StringBuilder` supports efficient text/byte appends,
+  reusable capacity, and independent `to_string()` snapshots.
+- `std.interner`: `StringInterner` maps strings to stable IDs and back.
+- `std.hash_map`: `HashMap<K,V>` accepts custom hashing and equality callbacks.
+
+See [compiler rewrite foundations](../docs/compiler-rewrite-foundations.md) and
+[the executable frontend example](../examples/compiler_frontend.rl).

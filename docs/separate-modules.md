@@ -60,7 +60,9 @@ module boundaries.
   executable output to link dependency objects automatically, or distribute a
   library with `--emit module`. Plain `.rl` imports retain unified compilation.
 - `rolang build` and the path/Git package manager retain their existing source
-  workflow. Automated artifact caching and registry distribution are future work.
+  workflow. [Incremental project builds](incremental-builds.md) now cache complete
+  native targets; automatic per-dependency `.rlm` builds and binary registry
+  distribution remain future work.
 - Validation currently targets the native Apple Silicon macOS host. Cross-target
   runtime linking is not established by these tests.
 

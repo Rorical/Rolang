@@ -101,7 +101,7 @@ pub def chars_of(s: String) -> CharIter {
 // and heap-typed keys (retaining heap references for the caller).
 // ============================================================================
 
-pub extern "C" def rt_dict_key_copy(dict: RawPtr, index: i64, out: RawPtr) -> Void;
+// Dictionary key copying is declared by dict.rl.
 
 // Holds the `Dict<K, V>` by value (like `VecIter` holds its `Vec<T>`) so ARC
 // keeps the dict alive for the whole iteration. The earlier `handle: RawPtr`
@@ -133,6 +133,8 @@ pub struct DictIter<K, V> {
 
 // Construct a key iterator for a Dict<K, V>.
 // Usage:  for k in dict_keys(my_dict) { ... }
+// Do not structurally mutate the dictionary during live iteration.
+// Use d.keys() or d.entries() snapshots when removing entries in a loop.
 pub def dict_keys<K, V>(d: Dict<K, V>) -> DictIter<K, V> {
     return DictIter<K, V> { dict: d, index: 0 };
 }

@@ -19,6 +19,10 @@ covers the subsequent async implementation.
   partial progress and backpressure. `AsyncPipe.create` provides a connected
   full-duplex socket pair. FFI can transfer an existing stream socket through
   unsafe `AsyncStream.adopt`.
+- `AsyncStream.connect(address, port)` connects to numeric IPv4/IPv6 addresses.
+  `AsyncListener.bind(address, port, backlog)` creates a listener; `accept()`
+  suspends until a connection arrives. `port()` reports the selected port when
+  binding port zero. Connect and accept return `Result<AsyncStream, i32>`.
 - Socket operations report positive POSIX errno values through `Result`.
   Descriptors remain owned until all pending operations release the stream.
 - VS Code syntax highlighting recognizes `spawn`.
@@ -45,7 +49,23 @@ The work also fixes Void Task awaits attempting to spill a Void local into a
 frame, and limits the synchronous spawn exemption to its outer call so that
 nested argument expressions cannot bypass async-context checking.
 
-## Validation
+## TCP follow-up validation
+
+`tests/test_async_tcp.py` covers IPv4 and IPv6 round trips, short reads/EOF,
+cancelled accepts, invalid inputs, and refused connections at O0–O3. A native
+ownership regression checks descriptor closure over 100 cycles, including
+unclaimed accepted connections, cancelled connects, transferred stream results,
+and listeners retained by pending accepts. All 39 combined TCP/ARC checks passed. The final full regression suite passed
+**946 tests, no skips**, in 463.67 seconds.
+Six O0/O3 TCP executions also passed with AddressSanitizer (`detect_leaks=0`).
+The TCP example emits optimized MIR, verified LLVM, and assembly at O0 and O3.
+
+These tests exposed premature destruction of enum payload owners during ARC
+release motion. Release motion now respects ownership operations and effects,
+so a result's listener remains alive until its borrowed payload is retained.
+Socket adoption also preserves the original errno across descriptor cleanup.
+
+## Original async validation
 
 The full regression run passed **806 tests, no skips**, in 366.58 seconds.
 After the final spawn-context check and MIR display adjustment, **12 focused
@@ -92,8 +112,9 @@ UV_CACHE_DIR=/private/tmp/rolang-uv-cache .venv/bin/pytest -q -n 4
 - Cancellation drops suspended continuations without running pending `defer`
   blocks. Managed resources still receive ARC destruction. In-flight writes may
   already have sent a prefix; cancellation cannot undo it.
-- Existing file and console APIs still block. No file worker pool, DNS,
-  connect/listen/accept convenience APIs, or TLS is included.
+- Existing file and console APIs still block. No file worker pool, DNS, or TLS
+  is included. TCP addresses must be numeric; IPv6 scope identifiers are not
+  supported. Use task cancellation to implement connection/accept deadlines.
 - `poll` scales by scanning pending operations; no epoll/kqueue backend yet.
 - Async closures and dynamic async protocol dispatch remain unsupported by
   `spawn`; use a statically resolved wrapper.

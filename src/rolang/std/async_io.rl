@@ -10,8 +10,23 @@ pub extern "C" def rt_async_read_start(stream: RawPtr, limit: i32) -> RawPtr;
 pub extern "C" def rt_async_write_start(stream: RawPtr, value: String) -> RawPtr;
 pub extern "C" def rt_async_read_data(task: RawPtr) -> RawPtr;
 
+pub extern "C" def rt_async_connect_start(address: String, port: i32) -> RawPtr;
+pub extern "C" def rt_async_take_stream(task: RawPtr) -> RawPtr;
+pub extern "C" def rt_async_listener_bind(address: String, port: i32, backlog: i32, out: RawPtr) -> i32;
+pub extern "C" def rt_async_listener_port(listener: RawPtr) -> i32;
+pub extern "C" def rt_async_accept_start(listener: RawPtr) -> RawPtr;
+
 pub struct AsyncStream {
     var handle: RawPtr;
+    // Numeric IPv4/IPv6 address. Name resolution is not performed.
+    pub static def connect(address: String, port: i32) async -> Result<AsyncStream, i32> {
+        unsafe {
+            let operation = Task<i32>.from_handle(rt_async_connect_start(address, port));
+            let status = await operation;
+            if status < 0 { return Result.err(error: -status); }
+            return Result.ok(value: AsyncStream { handle: rt_async_take_stream(operation.raw_handle()) });
+        }
+    }
 
     pub def __release__() -> Void {
         unsafe {
@@ -71,6 +86,38 @@ pub struct AsyncPipe {
                 first: AsyncStream { handle: first },
                 second: AsyncStream { handle: other }
             };
+        }
+    }
+}
+
+// Owns a nonblocking TCP listening socket. Pending accepts retain it.
+pub struct AsyncListener {
+    var handle: RawPtr;
+    pub def __release__() -> Void {
+        unsafe {
+            let handle = self.handle;
+            self.handle = 0 as RawPtr;
+            rt_async_stream_close(handle);
+        }
+    }
+    // Port zero asks the OS to select an available port.
+    pub static def bind(address: String, port: i32, backlog: i32) -> Result<AsyncListener, i32> {
+        unsafe {
+            var handle: RawPtr;
+            let status = rt_async_listener_bind(address, port, backlog, handle as RawPtr);
+            if status < 0 { return Result.err(error: -status); }
+            return Result.ok(value: AsyncListener { handle: handle });
+        }
+    }
+    pub def port() -> i32 {
+        unsafe { return rt_async_listener_port(self.handle); }
+    }
+    pub def accept() async -> Result<AsyncStream, i32> {
+        unsafe {
+            let operation = Task<i32>.from_handle(rt_async_accept_start(self.handle));
+            let status = await operation;
+            if status < 0 { return Result.err(error: -status); }
+            return Result.ok(value: AsyncStream { handle: rt_async_take_stream(operation.raw_handle()) });
         }
     }
 }

@@ -45,6 +45,7 @@ def build_project(
     check_only: bool = False,
     verbose: bool = False,
     targets: Optional[list[str]] = None,
+    use_cache: bool = True,
 ) -> BuildResult:
     """
     Build all (or the specified) targets in *manifest*.
@@ -115,6 +116,8 @@ def build_project(
             check_only=check_only,
             verbose=verbose,
             target_triple=manifest.build.target,
+            cache_dir=out_dir / '.rolang-cache' if use_cache and not check_only else None,
+            cache_context=manifest._to_toml() + lock._to_toml(),
         )
         if ok:
             if out is not None:
@@ -137,6 +140,8 @@ def _build_target(
     check_only: bool,
     verbose: bool,
     target_triple: Optional[str],
+    cache_dir: Optional[Path] = None,
+    cache_context: str = "",
 ) -> tuple[bool, Optional[Path], list[str]]:
     """
     Compile a single target.
@@ -166,6 +171,8 @@ def _build_target(
         include_paths=include_paths,
         verbose=verbose,
         use_color=True,
+        cache_dir=cache_dir,
+        cache_context=cache_context,
     )
 
     driver = CompilationDriver(opts)

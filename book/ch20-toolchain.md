@@ -391,3 +391,23 @@ prereleases of 1.2.0 and compatible stable releases, but excludes prereleases of
 other version cores. Build metadata is ignored in comparisons. The exact selected
 release and checksum remain pinned in the lockfile. No public default registry
 or publish service is configured; use your own static HTTPS host or a local directory.
+
+
+## Incremental Builds
+
+Project builds cache unchanged executables and library objects under
+`build/.rolang-cache/` (or the configured output directory). `rolang build -v`
+reports `Cached -> ...` on reuse. Missing or damaged outputs are restored from
+verified artifacts. A hit skips parsing through linking; a changed target rebuilds
+its complete import graph.
+
+Source contents, import resolution, dependency/manifest settings, compiler and
+runtime implementation, optimization/target options, and native toolchain settings
+participate in invalidation. New shadowing files and changed symlink targets are
+checked even on warm builds. Different targets can be reused independently.
+
+Use `--no-cache` with `build`, `run`, or `test` to bypass cache reads and writes.
+`rolang clean` clears both outputs and cache. Tests still execute on every run;
+`rolang check` does not reuse native build artifacts. Builds with diagnostics are
+not cached. Custom native headers/libraries and arbitrary compiler-wrapper inputs
+are not exhaustively tracked; bypass the cache after changing those inputs.

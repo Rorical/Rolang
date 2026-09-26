@@ -93,7 +93,7 @@ class NameResolver:
     # would compile but shadow language constructs and confuse readers.
     _RESERVED_ALIAS_WORDS = frozenset({
         "def", "let", "var", "if", "else", "while", "for", "return",
-        "import", "as", "in", "where", "struct", "enum", "protocol",
+        "import", "as", "in", "where", "struct", "enum", "protocol", "typealias",
         "extension", "extern", "init", "deinit", "self", "Self",
         "pub", "private", "internal", "async", "await", "try", "throws",
         "true", "false", "nil", "is", "switch", "case", "default",

@@ -86,7 +86,7 @@ class DeclChecker:
                         self._c._error(
                             TypeErrorKind.INVALID_OPERATION,
                             (
-                                f"public function '{func.name}' exposes "
+                                f"public {'type alias' if isinstance(func, ast.TypeAliasDecl) else 'function'} '{func.name}' exposes "
                                 f"non-public type '{sym.name}' in its {role}"
                             ),
                             node=func,
@@ -292,6 +292,10 @@ class DeclChecker:
                 self._c._check_struct_decl(item)
             elif isinstance(item, ast.EnumDecl):
                 self._c._check_enum_decl(item)
+            elif isinstance(item, ast.TypeAliasDecl):
+                target = self._c._resolve_type(item.aliased_type)
+                if item.visibility == "pub":
+                    self._inspect_type_for_privacy_leak(item, target, "aliased type", set())
             elif isinstance(item, ast.ExtensionDecl):
                 self._check_extension(item)
         finally:

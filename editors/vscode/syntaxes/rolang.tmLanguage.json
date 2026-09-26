@@ -60,6 +60,14 @@
           }
         },
         {
+          "comment": "Transparent type alias",
+          "match": "\\b(typealias)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.typealias.rolang" },
+            "2": { "name": "entity.name.type.rolang" }
+          }
+        },
+        {
           "comment": "Struct declaration: struct TypeName",
           "match": "\\b(struct)\\s+([A-Z][a-zA-Z0-9_]*)",
           "captures": {

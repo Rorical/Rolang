@@ -491,6 +491,16 @@ class ArcOptimizer:
             uses_in_block: Dict[LocalId, List[int]] = {}
             defs_in_block: Dict[LocalId, List[int]] = {}
             for op_idx, op in enumerate(block.ops):
+                # Destruction is observable and can invalidate borrowed fields
+                # or raw handles. In particular, a payload extraction must be
+                # retained before releasing its parent enum. Do not move a
+                # release across ownership operations, calls, stores, or other
+                # effects, even when they do not mention the parent directly.
+                if not isinstance(op, (Assign, Load, BinOp, CmpOp, UnaryOp,
+                                       CastOp, GetTag, ExtractField,
+                                       ExtractEnumPayload, ExtractClosureCapture)):
+                    for owner in ref_locals:
+                        uses_in_block.setdefault(owner, []).append(op_idx)
                 for u in self._uses_in_op(op):
                     if u in ref_locals:
                         uses_in_block.setdefault(u, []).append(op_idx)

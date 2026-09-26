@@ -68,6 +68,8 @@ class CompileOptions:
     include_paths: List[Path] = field(default_factory=list)
     verbose: bool = False
     use_color: Optional[bool] = None
+    cache_dir: Optional[Path] = None
+    cache_context: str = ""
 
 
 @dataclass
@@ -84,6 +86,8 @@ class CompilationDriver:
 
     def __init__(self, options: CompileOptions) -> None:
         self.options = options
+        self._cache_base_key = None
+        self._cache_watches = {}
         self.source_files: dict[Path, str] = {}
         self.context: Optional[CompilerContext] = None
         self.runner: Optional[PassRunner] = None
@@ -93,6 +97,72 @@ class CompilationDriver:
         self.stdlib_path: Path = Path(__file__).parent / "std"
 
     def compile_file(self, source_path: Path) -> CompileResult:
+        self._build_cache = None
+        self._cache_base_key = None
+        self._cache_watches = {}
+        self.cache_hit = False
+        result = self._compile_file(source_path)
+        if (self._build_cache is not None and result.success
+                and result.output_path and not (result.diagnostics and result.diagnostics.diagnostics)):
+            from .build_cache import snapshot, save_index
+            try:
+                # Do not associate an artifact with inputs edited during compilation.
+                if all(snapshot(Path(p)) == state for p, state in self._cache_watches.items()):
+                    if not self.cache_hit:
+                        self._build_cache.store(result.output_path)
+                    save_index(self.options.cache_dir, self._cache_base_key,
+                               self._build_cache, self._cache_watches)
+            except (OSError, RuntimeError):
+                pass  # Cache failures never make successful compilation fail.
+        return result
+
+    def _try_build_cache(self) -> Optional[CompileResult]:
+        if (self.options.cache_dir is None or self.options.output_path is None
+                or self.options.emit not in (EmitKind.EXECUTABLE, EmitKind.OBJECT, EmitKind.MODULE)
+                or self.context.diagnostics.diagnostics):
+            return None
+        if self._cache_base_key is None:
+            return None
+        from .build_cache import BuildCache, cache_key
+        try:
+            self._build_cache = BuildCache(self.options.cache_dir, cache_key(self))
+            if self._build_cache.restore(self.options.output_path):
+                self.cache_hit = True
+                if self.options.verbose:
+                    print(f"Cached -> {self.options.output_path}")
+                return CompileResult(True, self.options.output_path, diagnostics=self.context.diagnostics)
+        except (OSError, subprocess.SubprocessError):
+            self._build_cache = None
+        return None
+
+    def _watch_path(self, path: Path) -> Path:
+        if self._cache_base_key is not None:
+            from .build_cache import snapshot
+            name = str(path.absolute())
+            try:
+                if name not in self._cache_watches:
+                    self._cache_watches[name] = snapshot(path)
+            except (OSError, RuntimeError):
+                self._cache_base_key = None
+        return path
+
+    def _try_early_cache(self) -> Optional[CompileResult]:
+        if (self.options.cache_dir is None or self.options.output_path is None
+                or self.options.emit not in (EmitKind.EXECUTABLE, EmitKind.OBJECT, EmitKind.MODULE)):
+            return None
+        from .build_cache import cache_key, restore_index
+        try:
+            self._cache_base_key = cache_key(self, inputs=False)
+            if restore_index(self.options.cache_dir, self._cache_base_key, self.options.output_path):
+                self.cache_hit = True
+                if self.options.verbose:
+                    print(f"Cached -> {self.options.output_path}")
+                return CompileResult(True, self.options.output_path, diagnostics=self.context.diagnostics)
+        except (OSError, subprocess.SubprocessError):
+            self._cache_base_key = None
+        return None
+
+    def _compile_file(self, source_path: Path) -> CompileResult:
         """
         Compile a source file and any transitively imported files.
 
@@ -102,6 +172,7 @@ class CompilationDriver:
         self.source_files = {}
         self.module_sources = {}
         self.module_objects = {}
+        self.compile_order = []
         self._module_link_objects = []
         self.separate_modules = self.options.emit == EmitKind.MODULE
         self.entry_path = source_path.resolve()
@@ -113,6 +184,10 @@ class CompilationDriver:
         )
         self.runner = PassRunner(self.context, verbose=self.options.verbose)
 
+        cached = self._try_early_cache()
+        if cached is not None:
+            return cached
+        self._watch_path(source_path)
         # Read source file
         try:
             source_content = source_path.read_text(encoding="utf-8")
@@ -168,6 +243,9 @@ class CompilationDriver:
 
     def _compile_single(self, source_path: Path, ast_node, source_content: str) -> CompileResult:
         """Compile a single source file with no imports."""
+        cached = self._try_build_cache()
+        if cached is not None:
+            return cached
         # Resolve names
         if self.options.verbose:
             print("Resolving names...")
@@ -204,6 +282,9 @@ class CompilationDriver:
             print(f"Compiling {len(compile_order)} module(s): {[m.name for m in compile_order]}")
 
         self.compile_order = compile_order
+        cached = self._try_build_cache()
+        if cached is not None:
+            return cached
         if self.separate_modules:
             from .module_abi import mark_declarations, digest
             self.context.symbol_table.separate_modules = True
@@ -311,11 +392,11 @@ class CompilationDriver:
         """
         relative = Path(*module_name.split(".")).with_suffix(".rl")
         for root in self.options.include_paths:
-            full = (root / relative).resolve()
+            full = self._watch_path(root / relative).resolve()
             if full.exists():
                 return full
         if self.stdlib_path.exists():
-            full = (self.stdlib_path / relative).resolve()
+            full = self._watch_path(self.stdlib_path / relative).resolve()
             if full.exists():
                 return full
         return None
@@ -405,13 +486,13 @@ class CompilationDriver:
             if raw_path and dep_path is None:
                 import_path = raw_path
                 # 1. Relative to the importing module
-                candidate = (resolved.parent / import_path).resolve()
+                candidate = self._watch_path(resolved.parent / import_path).resolve()
                 if candidate.exists():
                     dep_path = candidate
                 # 2. Each configured include path
                 if dep_path is None:
                     for inc_path in self.options.include_paths:
-                        candidate = (inc_path / import_path).resolve()
+                        candidate = self._watch_path(inc_path / import_path).resolve()
                         if candidate.exists():
                             dep_path = candidate
                             break
@@ -420,7 +501,7 @@ class CompilationDriver:
                     stdlib_relative = Path(import_path)
                     if len(module_parts) > 1 and module_parts[0] == "std":
                         stdlib_relative = Path(*module_parts[1:]).with_suffix(".rl")
-                    candidate = (self.stdlib_path / stdlib_relative).resolve()
+                    candidate = self._watch_path(self.stdlib_path / stdlib_relative).resolve()
                     if candidate.is_file():
                         dep_path = candidate
                 if dep_path is None:
@@ -439,7 +520,7 @@ class CompilationDriver:
                     self.stdlib_path.exists()
                     and dep_path.parent != self.stdlib_path
                 ):
-                    stdlib_candidate = (self.stdlib_path / import_path).resolve()
+                    stdlib_candidate = self._watch_path(self.stdlib_path / import_path).resolve()
                     if stdlib_candidate.exists() and stdlib_candidate != dep_path:
                         self.context.diagnostics.add_warning(
                             f"Imported file '{import_path}' shadows the bundled "
@@ -548,7 +629,7 @@ class CompilationDriver:
             relative = Path(key[4:])
             if relative.is_absolute() or '..' in relative.parts:
                 raise ValueError('Invalid standard module path')
-            return (self.stdlib_path / relative).resolve()
+            return self._watch_path(self.stdlib_path / relative).resolve()
         if not key.startswith('user:') or not Path(key[5:]).is_absolute():
             raise ValueError('Invalid user module path')
         return Path(key[5:]).resolve()

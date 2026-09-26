@@ -10,6 +10,7 @@
 // retained on insert and released on overwrite/free.
 
 import "string.rl"
+import "vec.rl"
 
 pub extern "C" def rt_dict_new(capacity: i64, key_size: i64, value_size: i64,
                                key_kind: i32, key_type_id: i32, value_type_id: i32) -> RawPtr;
@@ -26,6 +27,15 @@ pub extern "C" def rt_dict_set_at(dict: RawPtr, index: i64, value: RawPtr) -> Vo
 // the dict's entry buffer and reports heap-typed key/value slots back
 // to the GC.
 pub extern "C" def rt_dict_gc_trace(payload: RawPtr, cb: RawPtr, ctx: RawPtr) -> Void;
+
+pub extern "C" def rt_dict_remove(dict: RawPtr, key: RawPtr, out: RawPtr) -> i32;
+pub extern "C" def rt_dict_clear(dict: RawPtr) -> Void;
+pub extern "C" def rt_dict_key_copy(dict: RawPtr, index: i64, out: RawPtr) -> Void;
+
+pub struct DictEntry<K, V> {
+    pub let key: K;
+    pub let value: V;
+}
 
 pub enum DictKeyKind {
     case BYTES
@@ -84,8 +94,7 @@ pub struct Dict<K, V> {
     //     let i = counts.entry_index(key, 0);
     //     counts.set_value_at(i, counts.value_at(i) + 1);
     //
-    // The index is valid until the next dict mutation (entries are append-only
-    // and survive resize in place; the dict has no remove).
+    // Treat the index as invalid after any dictionary mutation.
     pub def entry_index(key: K, default: V) -> i64 {
         var idx: i64 = 0;
         unsafe {
@@ -109,6 +118,56 @@ pub struct Dict<K, V> {
     pub def contains(key: K) -> Bool {
         var out: V;
         unsafe { return rt_dict_get(self.handle, key as RawPtr, out as RawPtr) != 0; }
+    }
+
+    // Removes a binding, transferring its value to the caller.
+    // Preserves insertion order; invalidates entry indices. O(n + capacity).
+    pub def remove(key: K) -> V? {
+        var out: V;
+        unsafe {
+            if rt_dict_remove(self.handle, key as RawPtr, out as RawPtr) != 0 {
+                return out;
+            }
+        }
+        return nil;
+    }
+
+    pub def clear() -> Void { unsafe { rt_dict_clear(self.handle); } }
+
+    // Snapshots remain valid when the dictionary is subsequently mutated.
+    // Referenced key/value objects are shared, not deeply copied.
+    pub def keys() -> Vec<K> {
+        let result = Vec<K>.new();
+        var i: i64 = 0;
+        while i < self.len() {
+            var key: K;
+            unsafe { rt_dict_key_copy(self.handle, i, key as RawPtr); }
+            result.push(key);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub def values() -> Vec<V> {
+        let result = Vec<V>.new();
+        var i: i64 = 0;
+        while i < self.len() {
+            result.push(self.value_at(i));
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub def entries() -> Vec<DictEntry<K, V>> {
+        let result = Vec<DictEntry<K, V>>.new();
+        var i: i64 = 0;
+        while i < self.len() {
+            var key: K;
+            unsafe { rt_dict_key_copy(self.handle, i, key as RawPtr); }
+            result.push(DictEntry<K, V> { key: key, value: self.value_at(i) });
+            i = i + 1;
+        }
+        return result;
     }
 
     pub def free() -> Void {

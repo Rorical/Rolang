@@ -238,6 +238,19 @@ class RoLangTransformer(Transformer):
         return ast.Constraint(subject=items[0], kind="equals", equal_type=items[1])
 
     # ========================= Declarations =========================
+    def type_alias_decl(self, items: list) -> ast.TypeAliasDecl:
+        visibility = "internal"
+        name = ""
+        target = None
+        for item in items:
+            if isinstance(item, str) and item in {"pub", "private", "internal"}:
+                visibility = item
+            elif isinstance(item, Token):
+                name = str(item)
+            elif isinstance(item, ast.Type):
+                target = item
+        return ast.TypeAliasDecl(name=name, aliased_type=target, visibility=visibility)
+
     def struct_decl(self, items: list) -> ast.StructDecl:
         visibility = "internal"
         name = ""

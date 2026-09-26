@@ -141,7 +141,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     print(f"Compiling {pkg_name} v{manifest.package.version if manifest.package else '?'}...")
 
     try:
-        result = build_project(manifest, release=release, verbose=verbose)
+        result = build_project(manifest, release=release, verbose=verbose, use_cache=not args.no_cache)
     except ToolchainError as exc:
         return _err(str(exc))
 
@@ -174,7 +174,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         result = build_project(
-            manifest, release=release, verbose=verbose, targets=targets
+            manifest, release=release, verbose=verbose, targets=targets, use_cache=not args.no_cache
         )
     except ToolchainError as exc:
         return _err(str(exc))
@@ -222,7 +222,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     for test in targets:
         print(f"test {test.name} ... ", end="", flush=True)
         try:
-            result = build_project(manifest, verbose=verbose, targets=[test.name])
+            result = build_project(manifest, verbose=verbose, targets=[test.name], use_cache=not args.no_cache)
         except ToolchainError as exc:
             print("FAILED")
             print(f"  build error: {exc}", file=sys.stderr)
@@ -511,6 +511,10 @@ Examples:
     p_test.add_argument("filter", nargs="?", default=None,
                         help="Only run tests whose name contains this string")
     p_test.add_argument("-v", "--verbose", action="store_true", default=False)
+
+    for build_parser in (p_build, p_run, p_test):
+        build_parser.add_argument('--no-cache', action='store_true',
+                                  help='Compile without reading or writing the build cache')
 
     # check ───────────────────────────────────────────────────────────────────
     p_check = sub.add_parser("check", help="Type-check without producing output files")

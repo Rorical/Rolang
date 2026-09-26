@@ -177,6 +177,7 @@ def hover(ls: LanguageServer, params: lsp.HoverParams) -> lsp.Hover | None:
             ast_module.StructDecl,
             ast_module.EnumDecl,
             ast_module.ProtocolDecl,
+            ast_module.TypeAliasDecl,
         ),
     ):
         name = getattr(node, "name", None)

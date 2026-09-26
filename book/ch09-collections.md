@@ -68,6 +68,9 @@ for item in v {
 | `.set(i, value)` | Replace element at index `i` |
 | `.len() -> i32` | Number of elements |
 | `.resize(n)` | Resize backing buffer |
+| `.remove(key) -> V?` | Remove and return a value; preserves insertion order |
+| `.clear()` | Release entries while retaining capacity |
+| `.keys()` / `.values()` / `.entries()` | Owned snapshots for traversal during mutation |
 | `.free()` | Explicitly release memory |
 
 ### Typed Convenience Constructors
@@ -213,3 +216,14 @@ def main() -> i32 {
 - `Dict<K, V>` is an insertion-ordered hash map: `.set`, `.get` (returns `T?`), `.contains`, `.len`
 - `Set<T>` stores unique values; requires `import "set.rl"`
 - Out-of-range array or vec access panics at runtime
+
+## Custom Hashing and Equality
+
+Import `std.hash_map` for `HashMap<K,V>.new(hash, equal)`, where `hash` has type
+`(K) -> i64` and `equal` has type `(K,K) -> Bool`. This supports structural keys.
+Equal keys must produce equal hashes. Do not mutate fields used by the callbacks
+while a key is stored. See [the API and complexity notes](../docs/compiler-rewrite-foundations.md).
+
+Dictionary removal is linear in length plus capacity and invalidates entry
+indices. Avoid structural mutation during live iteration; use snapshots instead.
+`Set<T>` also provides `remove`, `clear`, and `values` snapshots.

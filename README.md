@@ -61,6 +61,7 @@ rolang run
 | `rolang init [--lib]` | Initialise a project in the current directory |
 | `rolang build` | Compile all targets (output in `build/`) |
 | `rolang build --release` | Compile with optimizations |
+| `rolang build --no-cache` | Rebuild without reading or writing the build cache |
 | `rolang run` | Build and execute |
 | `rolang run -- <args>` | Pass extra arguments to the binary |
 | `rolang test [filter]` | Compile and run `[[test]]` targets |
@@ -76,6 +77,9 @@ rolang run
 Registry dependencies use a configured HTTPS or local static registry, with
 checksummed archives, transitive resolution, and lockfile pins. See
 [package registries](docs/package-registries.md) for setup and supported ranges.
+
+Project builds automatically reuse unchanged native targets. See
+[incremental builds](docs/incremental-builds.md) for invalidation rules and limits.
 
 ## Compiled Libraries
 
@@ -260,7 +264,7 @@ def main() async -> i32 {
 }
 ```
 
-Use `spawn work()` to start an async function from either synchronous or async code. Import `std.task` for task control, `sleep`, and `yield_now`; import `std.async_io` for nonblocking socket streams. See [Async/Await and Tasks](book/ch16-async-await.md) for ownership, cancellation, and platform limits.
+Use `spawn work()` to start an async function from either synchronous or async code. Import `std.task` for task control, `sleep`, and `yield_now`; import `std.async_io` for nonblocking socket streams, TCP connect, and TCP listeners. See [Async/Await and Tasks](book/ch16-async-await.md) for ownership, cancellation, and platform limits.
 
 ### Closures and Function Values
 
@@ -434,3 +438,10 @@ uv run pytest tests/test_checker.py            # type checker only
 uv run pytest tests/test_runtime_execution.py  # end-to-end execution tests
 uv run pytest tests/test_toolchain.py          # toolchain tests
 ```
+
+### Compiler rewrite foundations
+
+Transparent `typealias` declarations, dictionary removal/snapshots, custom-key
+`HashMap`, `StringBuilder`, and `StringInterner` support compiler workloads.
+See [the API guide](docs/compiler-rewrite-foundations.md) and
+[the frontend example](examples/compiler_frontend.rl).

@@ -84,7 +84,7 @@ handles and await the work whose completion is required before exit.
 
 ## Asynchronous socket streams
 
-Import `std.async_io` for `AsyncStream` and `AsyncPipe`. Import `std.task`
+Import `std.async_io` for `AsyncStream`, `AsyncListener`, and `AsyncPipe`. Import `std.task`
 explicitly when using its timer/task APIs.
 
 `AsyncPipe.create()` returns an optional pair of connected, full-duplex local
@@ -138,6 +138,26 @@ def main() async -> i32 {
 - Pending operations retain the stream. Its descriptor closes after both its
   managed wrapper and all pending operations release their references.
 
+### TCP connections and listeners
+
+`await AsyncStream.connect("127.0.0.1", 8080)` returns
+`Result<AsyncStream, i32>`. Connection setup suspends on socket readiness.
+`AsyncListener.bind("127.0.0.1", 8080, 128)` returns
+`Result<AsyncListener, i32>`; the third argument is a positive listen backlog.
+Binding is immediate. `await listener.accept()` suspends and returns a connected
+stream with the same read/write APIs. Both operations report positive POSIX errno
+values on failure.
+
+Use port `0` to request an available port and `listener.port()` to read it.
+IPv6 numeric addresses such as `"::1"` are also supported. Hostnames and IPv6
+scope identifiers are not resolved. Binding `"0.0.0.0"` or `"::"` exposes the
+listener on wildcard interfaces; loopback addresses keep it local.
+
+Connect and accept can be spawned and cancelled using `Task`. Pending accepts
+retain their listener. Completed connections remain owned by their result;
+dropping an unclaimed result closes the connection. No built-in timeout is
+applied. See [the TCP example](../examples/async_tcp_test.rl).
+
 For a connected socket obtained through FFI, `unsafe { AsyncStream.adopt(fd) }`
 transfers exclusive descriptor ownership, including on failure, and makes the
 socket nonblocking. The caller must stop using or closing that descriptor.
@@ -156,7 +176,7 @@ preserved in both cases.
 - Timer/socket I/O is implemented for POSIX hosts (Linux/macOS); validation here
   has been performed on Apple Silicon macOS.
 - Existing `std.fs` and console I/O remain blocking. Regular-file asynchronous
-  I/O, DNS, connect/listen/accept helpers, and TLS are not implemented.
+  I/O, DNS, and TLS are not implemented. TCP requires numeric IPv4/IPv6 addresses.
 - `poll` scans pending operations; this is not an epoll/kqueue scalability claim.
 - Cancellation does not unwind suspended `defer` blocks, and cycle collection
   remains synchronous.

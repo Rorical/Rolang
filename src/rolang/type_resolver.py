@@ -31,6 +31,7 @@ class TypeResolver:
         self.imported_symbols = imported_symbols if imported_symbols is not None else {}
         self.error_reporter = error_reporter
         self.allow_symbol_table_lookup = allow_symbol_table_lookup
+        self._resolving_aliases: set[SymbolId] = set()
 
     # ------------------------------------------------------------------
     # Std collection helpers
@@ -190,6 +191,21 @@ class TypeResolver:
             return self.type_table.error_type
 
         type_args = tuple(self.resolve(arg, subst) for arg in named.generic_args)
+
+        if symbol.kind == SymbolKind.TYPE_ALIAS:
+            if named.generic_args:
+                self._error("GENERIC_ARG_COUNT", f"Type alias '{symbol.name}' does not accept generic arguments", named)
+                return self.type_table.error_type
+            if symbol_id in self._resolving_aliases:
+                self._error("NOT_A_TYPE", f"Cyclic type alias '{symbol.name}'", named)
+                return self.type_table.error_type
+            self._resolving_aliases.add(symbol_id)
+            try:
+                # Resolve in the declaration's scope using its bound AST nodes;
+                # call-site generic substitutions must not capture alias names.
+                return self.resolve(symbol.decl_node.aliased_type)
+            finally:
+                self._resolving_aliases.remove(symbol_id)
 
         if symbol.kind == SymbolKind.STRUCT:
             expected = self._generic_arity(symbol)

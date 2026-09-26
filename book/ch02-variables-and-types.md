@@ -219,3 +219,18 @@ let sign = x >= 0 ? 1 : -1;
 - Integer types range from `i8` to `u64`; floating-point types are `f32` and `f64`
 - Small integers widen implicitly to larger compatible types; all other conversions use `as`
 - Tuples hold fixed collections of values; fields are accessed by index (`.0`, `.1`) or label
+
+## Type Aliases
+
+A top-level `typealias` gives an existing type another name:
+
+```rolang
+typealias SymbolId = i32;
+typealias SymbolList = Vec<SymbolId>;
+```
+
+Aliases are transparent: `SymbolId` is interchangeable with `i32`. They do not
+create distinct types or allocations. Aliases can target instantiated generics,
+optionals, and function types. Forward references work; cycles are errors.
+Use `pub typealias` to export an alias. Generic alias declarations are not yet
+supported. See [compiler rewrite foundations](../docs/compiler-rewrite-foundations.md).

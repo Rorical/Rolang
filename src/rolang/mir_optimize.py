@@ -411,6 +411,11 @@ class _Sroa:
 
     def _analyze_op(self, op) -> None:
         if isinstance(op, ExtractField):
+            # A struct obtained from another object's field is an existing
+            # heap reference, not a locally constructed scalar aggregate.
+            # Its fields would otherwise become uninitialized scalar locals.
+            if op.result in self.cands:
+                self._disqualify(op.result)
             agg = self._bare_struct_operand(op.aggregate)
             if agg is not None and agg in self.cands:
                 return  # plain field read of a candidate: always fine

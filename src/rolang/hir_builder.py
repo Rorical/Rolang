@@ -893,6 +893,13 @@ class HirBuilder:
 
         callee = self._build_expr(call.callee) if call.callee else self._error_expr()
 
+        # A function-valued field is invoked through its closure value;
+        # treating it as a method invents a nonexistent native symbol.
+        access_target = self.call_targets.get(id(call.callee))
+        if access_target and access_target.kind == CalleeKind.INDIRECT:
+            return HirCall(type_id=type_id, callee=callee, arguments=arguments,
+                           callee_symbol=None)
+
         # Check if this is a method call (callee is MemberAccess)
         if call.callee and isinstance(call.callee, ast.MemberAccess):
             # Check if this is an import-alias call (e.g., lib.get_value())

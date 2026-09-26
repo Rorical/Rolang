@@ -239,6 +239,8 @@ class ExprChecker:
         # Get type based on symbol kind
         if symbol.kind == SymbolKind.FUNCTION or symbol.kind == SymbolKind.EXTERN_FUNC:
             return self._c._get_function_type(symbol)
+        elif symbol.kind == SymbolKind.TYPE_ALIAS:
+            return self._c._resolve_type(symbol.decl_node.aliased_type)
         elif symbol.kind == SymbolKind.STRUCT:
             # Type as value - return the struct type
             return self._c.type_table.make_struct(symbol_id)
@@ -939,6 +941,8 @@ class ExprChecker:
                                 params.append(param_type)
                             ret_type = self._c._resolve_type(func.return_type) if func.return_type else self._c.type_table.void_type
                             return self._c.type_table.make_function(params=tuple(params), return_type=ret_type, is_async=func.is_async)
+                        if sym.kind == SymbolKind.TYPE_ALIAS:
+                            return self._c._resolve_type(sym.decl_node.aliased_type)
                         if sym.kind == SymbolKind.STRUCT:
                             return self._c.type_table.make_struct(symbol_id)
                         if sym.kind == SymbolKind.ENUM:
@@ -1019,6 +1023,7 @@ class ExprChecker:
             field = self._c.member_resolver.get_field(actual_type, access.member)
             if field:
                 self._enforce_field_visibility(field, access)
+                self._c.call_targets[id(access)] = CalleeId(kind=CalleeKind.INDIRECT)
                 return field.type_id
 
         method = self._c.member_resolver.get_method(
@@ -1267,6 +1272,7 @@ class ExprChecker:
             SymbolKind.STRUCT,
             SymbolKind.ENUM,
             SymbolKind.BUILTIN_TYPE,
+            SymbolKind.TYPE_ALIAS,
         }
 
     def _infer_static_method_owner_generics(
