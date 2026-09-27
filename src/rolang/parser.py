@@ -359,6 +359,18 @@ class RoLangTransformer(Transformer):
             elif item == "unsafe":
                 is_unsafe = True
 
+        # Prefer statement parsing for a switch in a block. Only a trailing
+        # switch in a value-returning function is an implicit value expression;
+        # a Void function must keep its side-effecting branches as statements.
+        if (body and body.statements and return_type is not None
+                and not (isinstance(return_type, ast.BuiltinType) and return_type.name == "Void")
+                and isinstance(body.statements[-1], ast.SwitchStmt)):
+            switch = body.statements[-1]
+            if switch.cases and all(len(c.body) == 1 and isinstance(c.body[0], ast.ExprStmt) for c in switch.cases):
+                body.statements[-1] = ast.ReturnStmt(
+                    value=ast.SwitchExpr(value=switch.value, cases=switch.cases, span=switch.span),
+                    implicit=True)
+
         return ast.FuncDecl(
             name=name,
             generic_params=generic_params,

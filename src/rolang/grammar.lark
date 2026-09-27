@@ -193,7 +193,7 @@ while_stmt: "while" expr block
 
 for_stmt: "for" pattern "in" expr block
 
-switch_stmt: "switch" expr "{" switch_case* "}"
+switch_stmt.1: "switch" expr "{" switch_case* "}"
 switch_case: "case" case_item_list ":" stmt* -> case_branch
            | "default" ":" stmt* -> default_branch
 case_item_list: case_item ("," case_item)*
@@ -208,12 +208,15 @@ pattern: primary_pattern ("|" primary_pattern)* -> or_pattern
 
 primary_pattern: "_" -> wildcard_pattern
                | literal -> literal_pattern
-               | "let" IDENT -> let_pattern
-               | "var" IDENT -> var_pattern
+               | _LET_PATTERN IDENT -> let_pattern
+               | _VAR_PATTERN IDENT -> var_pattern
                | IDENT -> ident_pattern
                | "(" pattern_list ")" -> tuple_pattern
                | "." IDENT ["(" [pattern_list] ")"] -> enum_case_pattern
                | "(" pattern ")" -> paren_pattern
+
+_LET_PATTERN: /let(?![a-zA-Z0-9_])/
+_VAR_PATTERN: /var(?![a-zA-Z0-9_])/
 
 pattern_list: pattern ("," pattern)*
 
