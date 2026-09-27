@@ -274,10 +274,47 @@ def normalized_binary(op, left, right):
     return ('binary', op, left, right)
 
 
+def reference_pattern(node):
+    from rolang import ast
+    if isinstance(node, ast.WildcardPattern): return ('wildcard',)
+    if isinstance(node, ast.IdentifierPattern): return ('binding', node.name, node.binding == 'var')
+    if isinstance(node, ast.LiteralPattern): return ('literal', reference_expr(node.value))
+    if isinstance(node, ast.EnumCasePattern): return ('case', node.case_name, [reference_pattern(p) for p in node.payload])
+    raise AssertionError(type(node))
+
+
+def native_pattern(tree, node):
+    kind = node['kind']
+    if kind == 1: return ('wildcard',)
+    if kind == 2: return ('binding', node['token']['text'], node['mutable'])
+    if kind == 3: return ('literal', native_expr(tree, node['expr']))
+    if kind == 4: return ('case', node['token']['text'], [native_pattern(tree, p) for p in node['children']])
+    raise AssertionError(kind)
+
+
+def reference_arms(cases, values):
+    result = []
+    for case in cases:
+        body = reference_expr(case.body[0].expr) if values else [reference_statement(s) for s in case.body]
+        if case.is_default:
+            result.append((('wildcard',), None, body))
+        else:
+            assert len(case.patterns) == 1
+            pattern, guard = case.patterns[0]
+            result.append((reference_pattern(pattern), reference_expr(guard), body))
+    return result
+
+
+def native_arms(tree, arms, values):
+    return [(native_pattern(tree, a['pattern']), native_expr(tree, a['guard']),
+             native_expr(tree, a['value']) if values else [native_statement(tree, s) for s in a['body']]) for a in arms]
+
+
 def reference_expr(node):
     from rolang import ast
     if node is None:
         return None
+    if isinstance(node, ast.SwitchExpr): return ('switch', reference_expr(node.value), reference_arms(node.cases, True))
     if isinstance(node, ast.Literal):
         return (node.kind, node.value)
     if isinstance(node, ast.Identifier):
@@ -326,6 +363,8 @@ def native_expr(tree, index):
     if kind == 12: return ('index', child('left'), child('right'))
     if kind == 13: return ('type', node['type_name'])
     if kind == 14: return ('call', child('left'), args)
+    if kind == 16: return ('switch', child('left'), native_arms(tree, node['arms'], True))
+    if kind == 17: return ('member', None, text)
     if kind == 15: return ('struct', 'IndexRange', [('start', child('left')), ('end', child('right')), ('inclusive', ('bool', text == '...'))])
     raise AssertionError(kind)
 
@@ -333,6 +372,7 @@ def native_expr(tree, index):
 def reference_statement(node):
     from rolang import ast
     block = lambda b: [reference_statement(s) for s in b.statements] if b else []
+    if isinstance(node, ast.SwitchStmt): return ('switch', reference_expr(node.value), reference_arms(node.cases, False))
     if isinstance(node, ast.ReturnStmt): return ('return', reference_expr(node.value))
     if isinstance(node, ast.VarDecl): return ('var', node.pattern.name, node.is_mutable, reference_type(node.type_annotation), reference_expr(node.initializer))
     if isinstance(node, ast.Assignment): return ('assign', reference_expr(node.target), reference_expr(node.value))
@@ -361,6 +401,7 @@ def native_statement(tree, index):
     expr = native_expr(tree, node['expr'])
     body = [native_statement(tree, i) for i in node['body']]
     alternative = [native_statement(tree, i) for i in node['alternative']]
+    if kind == 16: return ('switch', expr, native_arms(tree, node['arms'], False))
     if kind == 1: return ('return', expr)
     if kind == 2: return ('var', name, node['mutable'], node['annotation'], expr)
     if kind in (3, 13): return ('assign', native_expr(tree, node['target']), expr)
@@ -395,6 +436,14 @@ def assert_tree_matches_reference(tree, source):
             methods = [m for m in item.members if isinstance(m, ast.FuncDecl)]
             assert [tree['functions'][i]['token']['text'] for i in actual['methods']] == [m.name for m in methods]
             assert actual['generics'] == [g.name for g in item.generic_params]
+            functions.extend((item.name, m) for m in methods)
+        elif isinstance(item, ast.EnumDecl):
+            declarations.append((4, item.name))
+            actual = tree['declarations'][len(declarations) - 1]
+            variants = [v for m in item.members if isinstance(m, ast.EnumCaseDecl) for v in m.cases]
+            assert [(v['token']['text'], [(p['token']['text'], p['type_name']) for p in v['payload']]) for v in actual['variants']] == [(v.name, [(label or '', reference_type(t)) for label, t in v.payload]) for v in variants]
+            methods = [m for m in item.members if isinstance(m, ast.FuncDecl)]
+            assert [tree['functions'][i]['token']['text'] for i in actual['methods']] == [m.name for m in methods]
             functions.extend((item.name, m) for m in methods)
         elif isinstance(item, ast.ImportDecl):
             declarations.append((1, item.alias or 'import'))
@@ -1393,7 +1442,7 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
         flags = ('-fsanitize=address,undefined', '-fno-sanitize-recover=all') if stage == 2 else ()
         compile_c_executable(next_c, compiler, level, flags)
     # The rebuilt compiler emits and runs representative programs and full AST JSON.
-    for sample, expected in (PROGRAMS[1], DICT_PROGRAMS[3], BUILDER_PROGRAMS[0]):
+    for sample, expected in (PROGRAMS[1], DICT_PROGRAMS[3], BUILDER_PROGRAMS[0], ENUM_PROGRAMS[0], ENUM_PROGRAMS[1]):
         result, path, output = emit(compiler, tmp_path, sample)
         assert result.returncode == 0, result.stdout
         assert execute_c(output, 3).returncode == expected
@@ -2072,3 +2121,176 @@ def test_modern_control(bootstrap, tmp_path, source):
 ])
 def test_modern_control_errors(bootstrap, tmp_path, body, diagnostic):
     test_errors_preserve_output(bootstrap, tmp_path, 'def main() -> i32 {'+body+'}', diagnostic)
+
+
+ENUM_PROGRAMS = [
+    ((ROOT / 'selfhost/examples/enums.rl').read_text(), 42),
+    ('''enum Token { case number(i32); case end; }
+struct State { var count: i32; }
+def next(s: State) -> Token { s.count = s.count + 1; return Token.number(s.count); }
+def main() -> i32 {
+    let state = State { count: 0 };
+    let n = switch next(state) {
+        case .number(let v) where v < 0: 90;
+        case .number(var v): switch v { case 1: 40; default: 0; };
+        case .end: 99;
+    };
+    let end: Token = Token.end;
+    switch end { case .number(let x): return 3; case .end: return n + state.count + 1; }
+}''', 42),
+    ('''enum Box { case item(text: String, code: i64); case empty; }
+struct Holder { var value: Box; }
+def create() -> Box { return Box.item(text: "λ\\0", code: 9223372036854775807); }
+def main() -> i32 {
+    let values = Vec<Box>.new(); values.push(create()); values.push(Box.empty);
+    let holder = Holder { value: values[0] };
+    let copy = holder.value; holder.value = Box.empty;
+    switch copy {
+        case .item(let text, let code):
+            if !text.equals("λ\\0") || code != 9223372036854775807 { return 1; }
+        case .empty: return 2;
+    }
+    var maybe: Box? = values[1];
+    guard let present = maybe else { return 3; }
+    return switch present { case .item(_, _): 4; case .empty: 42; };
+}''', 42),
+    ('''enum Item { case pair(i32, i32); case other; }
+struct Counter { var count: i32; def next() -> i32 { self.count = self.count + 1; return self.count; } }
+def main() -> i32 {
+    let c = Counter { count: 0 }; let item = Item.pair(c.next(), c.next());
+    var total = 0;
+    for i in 0..<5 {
+        switch i { case 1: continue; case 4: break; default: total = total + i; }
+    }
+    switch item {
+        case .pair(var a, let b): a = a + b; return total + a + 34;
+        case .other: return 1;
+    }
+}''', 42),
+    ('''def main() -> i32 {
+    let n: i64 = switch true { case true: 9223372036854775807; case false: 0; };
+    let s = switch false { case true: "bad"; case false: "λ\\0"; };
+    let yes: i32? = switch true { case true: 42; case false: nil; };
+    if n != 9223372036854775807 || !s.equals("λ\\0") { return 1; }
+    guard let value = yes else { return 2; } return value;
+}''', 42),
+]
+
+
+@pytest.mark.parametrize('source, expected', ENUM_PROGRAMS)
+def test_native_enum_switch_differential(bootstrap, tmp_path, source, expected):
+    result, path, output = emit(bootstrap, tmp_path, source)
+    assert (result.returncode, result.stderr) == (0, ''), result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (expected, '', '')
+    reference = tmp_path / 'reference'
+    compiled = compile_source(path, CompileOptions(opt_level=OptLevel.O3, output_path=reference))
+    assert compiled.success, [d.message for d in compiled.diagnostics.diagnostics]
+    run = subprocess.run([str(reference)], capture_output=True, text=True, timeout=10)
+    assert (run.returncode, run.stdout, run.stderr) == (expected, '', '')
+    parsed = parse_native(bootstrap, path)
+    assert parsed.returncode == 0, parsed.stdout
+    assert_tree_matches_reference(json.loads(parsed.stdout), source)
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('enum E { case a; case a; } def main() -> i32 { return 0; }', 'duplicate enum case'),
+    ('enum E { case a(Void); } def main() -> i32 { return 0; }', 'C backend supports'),
+    ('enum E<T> { case a(T); } def main() -> i32 { return 0; }', 'declaration unsupported'),
+    ('enum E { case a; def a() -> Void {} } def main() -> i32 { return 0; }', 'duplicate member'),
+    ('enum E { case a; } def main() -> i32 { let e = E.missing; return 0; }', 'unknown enum case'),
+    ('enum E { case a(i32); } def main() -> i32 { let e = E.a; return 0; }', 'wrong enum payload count'),
+    ('enum E { case a(i32); } def main() -> i32 { let e = E.a(true); return 0; }', 'expected i32'),
+    ('enum E { case a(x: i32); } def main() -> i32 { let e = E.a(y: 1); return 0; }', 'unknown enum payload label'),
+    ('enum E { case a(x: i32, y: i32); } def main() -> i32 { let e = E.a(x: 1, x: 2); return 0; }', 'duplicate enum payload'),
+    ('enum E { case a; case b; } def main() -> i32 { switch E.a { case .a: return 1; } }', 'exhaustive'),
+    ('enum E { case a(i32); } def main() -> i32 { return switch E.a(1) { case .a(1): 1; }; }', 'exhaustive'),
+    ('enum E { case a; } def main() -> i32 { return switch E.a { case .a where false: 1; }; }', 'exhaustive'),
+    ('enum E { case a; } def main() -> i32 { return switch E.a { case .b: 1; default: 0; }; }', 'unknown enum case in pattern'),
+    ('enum E { case a(i32); } def main() -> i32 { return switch E.a(1) { case .a: 1; }; }', 'wrong enum pattern payload count'),
+    ('enum E { case a(i32, i32); } def main() -> i32 { return switch E.a(1, 2) { case .a(let x, let x): x; }; }', 'duplicate pattern binding'),
+    ('enum E { case a; } def main() -> i32 { let x = E {}; return 0; }', 'enum requires a case constructor'),
+    ('def main() -> i32 { return switch true { case true: 1; }; }', 'exhaustive'),
+    ('def main() -> i32 { return switch true { case true: 1; case false: "bad"; }; }', 'expected i32'),
+    ('def main() -> i32 { return switch true { case true where 1: 1; default: 0; }; }', 'expected Bool'),
+    ('def main() -> i32 { switch true { case let x: x = false; } return 0; }', 'cannot assign to let'),
+    ('def main() -> i32 { switch true { case let x: } return x; }', 'unknown variable'),
+    ('def main() -> i32 { return switch 1 { case 1: 1; }; }', 'exhaustive'),
+    ('def main() -> i32 { let x = .unknown; return 0; }', 'contextual type'),
+    ('def f(x: i32) -> i32 { return x; } def main() -> i32 { return f(x: 1); }', 'named arguments'),
+])
+def test_native_enum_switch_errors(bootstrap, tmp_path, source, diagnostic):
+    test_errors_preserve_output(bootstrap, tmp_path, source, diagnostic)
+
+
+def test_native_enum_modules(bootstrap, tmp_path):
+    (tmp_path / 'types.rl').write_text('''pub enum Expr {
+    case number(i32); case plus(Expr, Expr);
+    pub def evaluate() -> i32 { return switch self {
+        case .number(let n): n;
+        case .plus(let a, let b): a.evaluate() + b.evaluate();
+    }; }
+}
+pub typealias Tree = Expr;
+pub def make() -> Tree { return Expr.plus(Expr.number(20), Expr.number(22)); }
+''')
+    (tmp_path / 'api.rl').write_text('pub import "types.rl" as Trees\n')
+    source = '''import "api.rl" as API
+def main() -> i32 {
+    let tree: API.Trees.Tree = API.Trees.make();
+    let values = Vec<API.Trees.Expr>.new(); values.push(tree);
+    let empty = API.Trees.Tree.number(0);
+    return values[0].evaluate() + empty.evaluate();
+}'''
+    result, path, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert execute_c(output, 3).returncode == 42
+    reference = tmp_path / 'reference'
+    compiled = compile_source(path, CompileOptions(opt_level=OptLevel.O3, output_path=reference))
+    assert compiled.success, [d.message for d in compiled.diagnostics.diagnostics]
+    assert subprocess.run([str(reference)]).returncode == 42
+    (tmp_path / 'types.rl').write_text('enum Secret { case value; }')
+    result, _, _ = emit(bootstrap, tmp_path, 'import "types.rl" as T\ndef main() -> i32 { let x: T.Secret = T.Secret.value; return 0; }')
+    assert result.returncode == 1
+
+
+def test_native_enum_contextual_construction(bootstrap, tmp_path):
+    # The primary frontend still requires qualified constructors; exercise this
+    # native contextual form directly, including source-order labeled arguments.
+    source = '''enum E { case pair(first: i32, second: i32); case empty; }
+struct State { var n: i32; def next() -> i32 { self.n = self.n + 1; return self.n; } }
+def make() -> E { return .empty; }
+def consume(e: E) -> i32 { return switch e { case .pair(let a, let b): a * 10 + b; case .empty: 0; }; }
+def main() -> i32 {
+    let state = State { n: 0 };
+    let e: E = .pair(second: state.next(), first: state.next());
+    let result = consume(e) + consume(.pair(first: 2, second: 1)) + consume(make());
+    return switch result { default: result; };
+}'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
+
+
+def test_native_enum_inactive_payload_and_guard_order(bootstrap, tmp_path):
+    source = '''enum Inner { case number(i32); case empty; }
+enum Outer { case wrap(Inner); case absent; }
+struct State { var calls: i32; }
+def positive(s: State, n: i32) -> Bool { s.calls = s.calls + 1; return n > 0; }
+def main() -> i32 {
+    let values = Vec<Outer>.new();
+    values.push(Outer.absent); values.push(Outer.wrap(Inner.empty));
+    values.push(Outer.wrap(Inner.number(0))); values.push(Outer.wrap(Inner.number(40)));
+    let state = State { calls: 0 }; var sum = 0;
+    for value in values {
+        switch value {
+            case .wrap(.number(let n)) where positive(state, n): sum = sum + n;
+            default: {}
+        }
+    }
+    return sum + state.calls;
+}'''
+    test_native_enum_switch_differential(bootstrap, tmp_path, source, 42)

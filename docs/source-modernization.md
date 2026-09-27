@@ -16,6 +16,11 @@ worklists, reverse searches, and i64 benchmark counters keep explicit while loop
   still participate in the three-generation bootstrap, with no Python in child
   processes. Its remaining syntax subset is documented in `selfhost/README.md`.
 
+The subsequent [native enum milestone](selfhost-enums.md) represents the
+pattern AST with a recursive associated-value enum. Its
+parser, module remapping, serializer and matcher use the new constructors and
+switch syntax directly.
+
 ## Standard library and applications
 
 - Result helpers return switch expressions.

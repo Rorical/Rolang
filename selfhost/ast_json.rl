@@ -69,6 +69,46 @@ pub struct AstJson {
         for value in values { if !first { self.out.append(","); } first = false; self.field(value); }
         self.out.append("]");
     }
+    pub def pattern_fields(token: Token, kind: i32, mutable: Bool, expr: i32, children: Vec<Pattern>) -> Void {
+        self.out.append("{"); self.key("token"); self.token(token);
+        self.out.append(","); self.key("kind"); self.number(kind);
+        self.out.append(","); self.key("mutable"); self.boolean(mutable);
+        self.out.append(","); self.key("expr"); self.number(expr);
+        self.out.append(","); self.key("children"); self.out.append("[");
+        var first = true;
+        for child in children { if !first { self.out.append(","); } first = false; self.pattern(child); }
+        self.out.append("]}");
+    }
+    pub def pattern(value: Pattern) -> Void {
+        let empty = Vec<Pattern>.new();
+        switch value {
+            case .wildcard(let token): self.pattern_fields(token, 1, false, -1, empty);
+            case .binding(let token, let mutable): self.pattern_fields(token, 2, mutable, -1, empty);
+            case .literal(let token, let expr): self.pattern_fields(token, 3, false, expr, empty);
+            case .variant(let token, let children): self.pattern_fields(token, 4, false, -1, children);
+        }
+    }
+    pub def arms(values: Vec<SwitchArm>) -> Void {
+        self.out.append("["); var first = true;
+        for arm in values {
+            if !first { self.out.append(","); } first = false;
+            self.out.append("{"); self.key("token"); self.token(arm.token);
+            self.out.append(","); self.key("pattern"); self.pattern(arm.pattern);
+            self.out.append(","); self.key("guard"); self.number(arm.guard_expr);
+            self.out.append(","); self.key("value"); self.number(arm.value);
+            self.out.append(","); self.key("body"); self.indices(arm.body); self.out.append("}");
+        }
+        self.out.append("]");
+    }
+    pub def variants(values: Vec<Variant>) -> Void {
+        self.out.append("["); var first = true;
+        for variant in values {
+            if !first { self.out.append(","); } first = false;
+            self.out.append("{"); self.key("token"); self.token(variant.token);
+            self.out.append(","); self.key("payload"); self.parameters(variant.payload); self.out.append("}");
+        }
+        self.out.append("]");
+    }
     pub def expression(value: Expression) -> Void {
         self.out.append("{");
         self.key("token"); self.token(value.token);
@@ -82,6 +122,7 @@ pub struct AstJson {
         self.key("args"); self.indices(value.args);
         self.out.append(",");
         self.key("labels"); self.strings(value.labels);
+        self.out.append(","); self.key("arms"); self.arms(value.arms);
         self.out.append(",");
         self.key("type_name"); self.quoted(value.type_name);
         self.out.append("}");
@@ -108,6 +149,7 @@ pub struct AstJson {
         self.key("body"); self.indices(value.body);
         self.out.append(",");
         self.key("alternative"); self.indices(value.alternative);
+        self.out.append(","); self.key("arms"); self.arms(value.arms);
         self.out.append("}");
     }
     pub def statements(values: Vec<Statement>) -> Void {
@@ -150,6 +192,7 @@ pub struct AstJson {
         self.key("generics"); self.strings(value.generics);
         self.out.append(",");
         self.key("fields"); self.fields(value.fields);
+        self.out.append(","); self.key("variants"); self.variants(value.variants);
         self.out.append(",");
         self.key("methods"); self.indices(value.methods);
         self.out.append("}");

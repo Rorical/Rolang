@@ -11,6 +11,7 @@ import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
 pub struct Value { pub var code: String; pub var type_name: String; }
+pub struct SwitchResult { pub var value: Value; pub var returned: Bool; }
 pub struct Backend {
     pub var program: Program;
     pub var functions: Dict<String, i32>;
@@ -59,6 +60,11 @@ pub struct Backend {
     pub def expression_as(id: i32, expected: String, token: Token) -> Value {
         let expr = self.program.expressions.get(id); var inner = expected;
         if self.is_optional(inner) { inner = self.optional_inner(inner); }
+        if expr.kind == 16 { return self.switch_value(expr.left, expr.arms, expected, true, token).value; }
+        if expr.kind == 17 { return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels), expected, token); }
+        if expr.kind == 14 && self.program.expressions.get(expr.left).kind == 17 {
+            return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels), expected, token);
+        }
         if self.numeric(inner) {
             if expr.kind == 1 { return self.coerce(self.integer_value(expr.token, false, inner), expected, token); }
             if expr.kind == 5 && expr.token.text.equals("-") {
@@ -122,6 +128,8 @@ pub struct Backend {
     pub def emit_expression(id: i32) -> Value {
         let expr = self.program.expressions.get(id);
         let token = expr.token;
+        if expr.kind == 16 { return self.switch_value(expr.left, expr.arms, "", true, token).value; }
+        if expr.kind == 17 { self.fail(token, "enum shorthand requires a contextual type"); return self.invalid(); }
         if expr.kind == 8 { return Value { code: "NULL", type_name: "nil" }; }
         if expr.kind == 15 {
             let start = self.expression_as(expr.left, "i32", token);
@@ -176,6 +184,7 @@ pub struct Backend {
             return self.value("i32", f"rl_neg({value.code})");
         }
         if expr.kind == 6 {
+            self.positional_arguments(expr);
             if let local = self.lookup(token.text) { self.fail(token, "local variable is not callable"); }
             var name = token.text;
             if !expr.type_name.is_empty() { name = expr.type_name; }
@@ -186,6 +195,8 @@ pub struct Backend {
             self.fail(token, f"unknown function '{token.text}'"); return self.invalid();
         }
         if expr.kind == 9 {
+            let owner = self.static_owner(expr.left);
+            if self.is_enum(owner) { return self.enum_construct(owner, token, expr.args, expr.labels); }
             let object = self.expression(expr.left);
             let field = self.field_index(object.type_name, token);
             if field < 0 { return self.invalid(); }
@@ -259,6 +270,7 @@ pub struct Backend {
     pub def statement(id: i32) -> Bool {
         let statement = self.program.statements.get(id);
         let token = statement.token;
+        if statement.kind == 16 { return self.switch_value(statement.expr, statement.arms, "", false, token).returned; }
         if statement.kind == 7 || statement.kind == 12 {
             self.output.append_line("{");
             if statement.kind == 12 { self.unsafe_depth = self.unsafe_depth + 1; }
@@ -394,7 +406,7 @@ pub struct Backend {
         for declaration in self.program.declarations {
             if declaration.kind == 1 && self.builtin_module(declaration.value) { index = index + 1; continue; }
             if declaration.kind == 3 { index = index + 1; continue; }
-            if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
+            if (declaration.kind != 2 && declaration.kind != 4) || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
                 if self.structs.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") || name.equals("Dict") || name.equals("StringBuilder") || name.equals("IndexRange") { self.fail(declaration.token, "duplicate or reserved struct name"); }
@@ -405,6 +417,19 @@ pub struct Backend {
         for declaration in self.program.declarations {
             if declaration.kind == 3 && !declaration.value.equals("Void") { self.supported_type(declaration.token, declaration.value); }
             let names = Dict<String, i32>.with_capacity(8, 1);
+            if declaration.kind == 4 && declaration.variants.len() == 0 { self.fail(declaration.token, "enum must declare at least one case"); }
+            for variant in declaration.variants {
+                if names.contains(variant.token.text) { self.fail(variant.token, "duplicate enum case"); }
+                names.set(variant.token.text, 1);
+                let labels = Dict<String, Bool>.with_capacity(8, 1);
+                for param in variant.payload {
+                    self.supported_type(param.token, param.type_name);
+                    if !param.token.text.is_empty() {
+                        if labels.contains(param.token.text) { self.fail(param.token, "duplicate enum payload label"); }
+                        labels.set(param.token.text, true);
+                    }
+                }
+            }
             for field in declaration.fields {
                 self.supported_type(field.token, field.type_name);
                 if names.contains(field.token.text) { self.fail(field.token, "duplicate field"); }
@@ -425,7 +450,7 @@ pub struct Backend {
             if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
-            if expression.kind > 6 && expression.kind != 7 && expression.kind != 8 && expression.kind != 11 && expression.kind != 12 && expression.kind != 13 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 && expression.kind != 15 { self.fail(expression.token, "expression unsupported by C backend"); }
+            if expression.kind > 6 && expression.kind != 7 && expression.kind != 8 && expression.kind != 11 && expression.kind != 12 && expression.kind != 13 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 && expression.kind != 15 && expression.kind != 16 && expression.kind != 17 { self.fail(expression.token, "expression unsupported by C backend"); }
         }
         for statement in self.program.statements {
             if statement.expr < 0 && ((statement.kind == 2 && !self.is_optional(statement.annotation)) || statement.kind == 9 || statement.kind == 3 || statement.kind == 4 || statement.kind == 5 || statement.kind == 6 || statement.kind == 8 || statement.kind == 13) { self.fail(statement.token, "C backend requires an expression or initializer"); }
@@ -566,7 +591,13 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
     }
     pub def method_call(expr: Expression) -> Value {
         let member = self.program.expressions.get(expr.left);
+        if member.kind == 17 { self.fail(member.token, "enum shorthand requires a contextual type"); return self.invalid(); }
         if member.kind != 9 { self.fail(expr.token, "call target unsupported by C backend"); return self.invalid(); }
+        let enum_owner = self.static_owner(member.left);
+        if self.is_enum(enum_owner) && self.variant_index(enum_owner, member.token.text) >= 0 {
+            return self.enum_construct(enum_owner, member.token, expr.args, expr.labels);
+        }
+        self.positional_arguments(expr);
         let root = self.reference_root(expr.left);
         var shadowed = false;
         if !root.is_empty() { if let local = self.lookup(root) { shadowed = true; } }
@@ -619,6 +650,7 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
         let index = self.struct_index(expr.type_name);
         if index < 0 { self.fail(expr.token, f"unknown struct '{expr.type_name}'"); return self.invalid(); }
         let declaration = self.program.declarations.get(index);
+        if declaration.kind != 2 { self.fail(expr.token, "enum requires a case constructor"); return self.invalid(); }
         let seen = Dict<String, i32>.with_capacity(8, 1);
         let result = self.value(expr.type_name, f"rl_allocate(sizeof(rl_s{index}))");
         var i = 0;
@@ -644,12 +676,21 @@ static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation
 """);
         var i = 0;
         while i < self.program.declarations.len() {
-            if self.program.declarations.get(i).kind == 2 { self.output.append_line(f"typedef struct rl_s{i} rl_s{i};"); } i = i + 1;
+            if self.program.declarations.get(i).kind == 2 || self.program.declarations.get(i).kind == 4 { self.output.append_line(f"typedef struct rl_s{i} rl_s{i};"); } i = i + 1;
         }
         i = 0;
         for declaration in self.program.declarations {
-            if declaration.kind != 2 { i = i + 1; continue; }
+            if declaration.kind != 2 && declaration.kind != 4 { i = i + 1; continue; }
             self.output.append_line(f"struct rl_s{i} {{");
+            if declaration.kind == 4 {
+                self.output.append_line("int32_t rl_tag;");
+                for tag in 0..<declaration.variants.len() {
+                    let variant = declaration.variants.get(tag);
+                    for payload in 0..<variant.payload.len() {
+                        self.output.append_line(f"{self.c_type(variant.payload.get(payload).type_name)} rl_v{tag}_{payload};");
+                    }
+                }
+            }
             var field = 0;
             for property in declaration.fields {
                 self.output.append_line(f"{self.c_type(property.type_name)} rl_m{field};"); field = field + 1;
@@ -659,6 +700,150 @@ static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation
         }
     }
 
+    pub def positional_arguments(expr: Expression) -> Void {
+        for label in expr.labels { if !label.is_empty() { self.fail(expr.token, "named arguments are supported only for enum constructors"); } }
+    }
+    pub def is_enum(name: String) -> Bool {
+        let index = self.struct_index(name);
+        return index >= 0 && self.program.declarations.get(index).kind == 4;
+    }
+    pub def static_owner(id: i32) -> String {
+        if id < 0 { return ""; }
+        let root = self.reference_root(id);
+        if !root.is_empty() { if let local = self.lookup(root) { return ""; } }
+        let node = self.program.expressions.get(id);
+        if node.kind != 3 && node.kind != 9 { return ""; }
+        if !node.type_name.is_empty() { return node.type_name; }
+        if node.kind == 3 { return node.token.text; }
+        return "";
+    }
+    pub def variant_index(owner: String, name: String) -> i32 {
+        if !self.is_enum(owner) { return -1; }
+        let variants = self.program.declarations.get(self.struct_index(owner)).variants;
+        for i in 0..<variants.len() { if variants.get(i).token.text.equals(name) { return i; } }
+        return -1;
+    }
+    pub def enum_construct(owner: String, token: Token, args: Vec<i32>, labels: Vec<String>) -> Value {
+        let tag = self.variant_index(owner, token.text);
+        if tag < 0 { self.fail(token, "unknown enum case or enum type"); return self.invalid(); }
+        let index = self.struct_index(owner);
+        let variant = self.program.declarations.get(index).variants.get(tag);
+        if args.len() != variant.payload.len() { self.fail(token, "wrong enum payload count"); return self.invalid(); }
+        let result = self.value(owner, f"rl_allocate(sizeof(rl_s{index}))");
+        self.output.append_line(f"{result.code}->rl_tag = {tag};");
+        let seen = Dict<i32, Bool>.with_capacity(8, 0);
+        for i in 0..<args.len() {
+            var target = i; var label = "";
+            if i < labels.len() { label = labels.get(i); }
+            if !label.is_empty() {
+                target = -1;
+                for j in 0..<variant.payload.len() { if variant.payload.get(j).token.text.equals(label) { target = j; } }
+            }
+            if target < 0 || target >= variant.payload.len() { self.fail(token, "unknown enum payload label"); return self.invalid(); }
+            if seen.contains(target) { self.fail(token, "duplicate enum payload argument"); return self.invalid(); }
+            seen.set(target, true);
+            let value = self.expression_as(args.get(i), variant.payload.get(target).type_name, token);
+            self.output.append_line(f"{result.code}->rl_v{tag}_{target} = {value.code};");
+        }
+        return result;
+    }
+    // Each failed test jumps past this arm's scope. Payloads are loaded only
+    // after testing the containing tag, including nested recursive patterns.
+    pub def match_pattern(pattern: Pattern, value: Value, next: String) -> Void {
+        if !self.error.is_empty() { return; }
+        switch pattern {
+        case .wildcard(_): return;
+        case .binding(let token, let mutable):
+            let scope = self.scopes.get(self.scopes.len() - 1); let name = token.text;
+            if scope.contains(name) { self.fail(token, "duplicate pattern binding"); return; }
+            let bound = self.value(value.type_name, value.code);
+            scope.set(name, Binding { code: bound.code, type_name: value.type_name, mutable: mutable }); return;
+        case .literal(let token, let literal_id):
+            let expr = self.program.expressions.get(literal_id);
+            if expr.kind == 8 && self.is_optional(value.type_name) {
+                self.output.append_line(f"if ({value.code} != NULL) goto {next};"); return;
+            }
+            if expr.kind != 1 && expr.kind != 2 && expr.kind != 7 && !(expr.kind == 5 && expr.token.text.equals("-") && self.program.expressions.get(expr.left).kind == 1) {
+                self.fail(token, "pattern requires a literal"); return;
+            }
+            if !self.numeric(value.type_name) && !value.type_name.equals("Bool") && !value.type_name.equals("String") {
+                self.fail(token, "literal pattern incompatible with subject"); return;
+            }
+            let literal = self.expression_as(literal_id, value.type_name, token);
+            if value.type_name.equals("String") { self.output.append_line(f"if (rl_string_compare({value.code}, {literal.code}) != 0) goto {next};"); }
+            else { self.output.append_line(f"if ({value.code} != {literal.code}) goto {next};"); }
+            return;
+        case .variant(let token, let children):
+        let tag = self.variant_index(value.type_name, token.text);
+        if tag < 0 { self.fail(token, "unknown enum case in pattern"); return; }
+        let variant = self.program.declarations.get(self.struct_index(value.type_name)).variants.get(tag);
+        if children.len() != variant.payload.len() { self.fail(token, "wrong enum pattern payload count"); return; }
+        self.output.append_line(f"if ({value.code}->rl_tag != {tag}) goto {next};");
+        for i in 0..<children.len() {
+            let payload = self.value(variant.payload.get(i).type_name, f"{value.code}->rl_v{tag}_{i}");
+            self.match_pattern(children.get(i), payload, next);
+        }
+        }
+    }
+    pub def irrefutable(pattern: Pattern) -> Bool {
+        return switch pattern {
+            case .wildcard(_): true;
+            case .binding(_, _): true;
+            default: false;
+        };
+    }
+    pub def coverage(pattern: Pattern) -> String {
+        if self.irrefutable(pattern) { return "*"; }
+        switch pattern {
+            case .variant(let token, let children):
+                for child in children { if !self.irrefutable(child) { return ""; } }
+                return f"case:{token.text}";
+            case .literal(_, let index):
+                let literal = self.program.expressions.get(index);
+                if literal.kind == 2 { return literal.token.text; }
+            default: {}
+        }
+        return "";
+    }
+    pub def switch_value(subject: i32, arms: Vec<SwitchArm>, expected: String, values: Bool, token: Token) -> SwitchResult {
+        let value = self.expression(subject); let outer = self.output; self.output = StringBuilder.new();
+        let result = self.fresh(); let end = self.fresh(); var result_type = expected;
+        let covered = Dict<String, Bool>.with_capacity(8, 1); var returned = arms.len() > 0;
+        for arm in arms {
+            let next = self.fresh(); self.output.append_line("{");
+            self.scopes.push(Dict<String, Binding>.with_capacity(8, 1));
+            self.match_pattern(arm.pattern, value, next);
+            if arm.guard_expr >= 0 {
+                let guard_value = self.expression_as(arm.guard_expr, "Bool", arm.token);
+                self.output.append_line(f"if (!{guard_value.code}) goto {next};");
+            } else { let key = self.coverage(arm.pattern); if !key.is_empty() { covered.set(key, true); } }
+            if values {
+                var branch = self.invalid();
+                if result_type.is_empty() { branch = self.expression(arm.value); result_type = branch.type_name; }
+                else { branch = self.expression_as(arm.value, result_type, arm.token); }
+                if result_type.equals("Void") || result_type.equals("nil") { self.fail(arm.token, "switch branches must produce a concrete value"); }
+                self.output.append_line(f"{result} = {branch.code};");
+            } else { if !self.block(arm.body, false) { returned = false; } }
+            self.output.append_line(f"goto {end};");
+            self.scopes.pop(); self.output.append_line(f"}}
+{next}:;");
+        }
+        var exhaustive = covered.contains("*");
+        if value.type_name.equals("Bool") { exhaustive = exhaustive || (covered.contains("true") && covered.contains("false")); }
+        if self.is_enum(value.type_name) {
+            var complete = true;
+            for variant in self.program.declarations.get(self.struct_index(value.type_name)).variants {
+                if !covered.contains(f"case:{variant.token.text}") { complete = false; }
+            }
+            exhaustive = exhaustive || complete;
+        }
+        if !exhaustive && (values || self.is_enum(value.type_name) || value.type_name.equals("Bool")) { self.fail(token, "switch must be exhaustive; add an unguarded case or default"); }
+        self.output.append_line(f"{end}:;");
+        let body = self.output.to_string(); self.output = outer;
+        if values { self.output.append_line(f"{self.c_type(result_type)} {result};"); }
+        self.output.append(body);
+        return SwitchResult { value: Value { code: result, type_name: result_type }, returned: returned && exhaustive };
+    }
     pub def numeric(name: String) -> Bool { return name.equals("u8") || name.equals("i32") || name.equals("i64"); }
     pub def string_literal(token: Token) -> Value {
         let text = StringBuilder.new(); text.append_byte(34 as u8);

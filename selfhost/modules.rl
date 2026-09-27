@@ -41,6 +41,33 @@ pub struct Modules {
     pub def offset(ids: Vec<i32>, amount: i32) -> Void {
         for i in 0..<ids.len() { ids.set(i, ids.get(i) + amount); }
     }
+    pub def offset_pattern(pattern: Pattern, expressions: i32) -> Pattern {
+        switch pattern {
+            case .literal(let token, let index): return Pattern.literal(token, index + expressions);
+            case .variant(_, let children):
+                for i in 0..<children.len() { children.set(i, self.offset_pattern(children[i], expressions)); }
+            default: {}
+        }
+        return pattern;
+    }
+    pub def offset_arms(arms: Vec<SwitchArm>, expressions: i32, statements: i32) -> Void {
+        for arm in arms {
+            arm.pattern = self.offset_pattern(arm.pattern, expressions);
+            if arm.guard_expr >= 0 { arm.guard_expr = arm.guard_expr + expressions; }
+            if arm.value >= 0 { arm.value = arm.value + expressions; }
+            self.offset(arm.body, statements);
+        }
+    }
+    pub def source_pattern(pattern: Pattern, source: String) -> Void {
+        let token = pattern.position(); token.source = source;
+        switch pattern {
+            case .variant(_, let children): for child in children { self.source_pattern(child, source); }
+            default: {}
+        }
+    }
+    pub def source_arms(arms: Vec<SwitchArm>, source: String) -> Void {
+        for arm in arms { arm.token.source = source; self.source_pattern(arm.pattern, source); }
+    }
     pub def merge(part: Program) -> Void {
         let expressions = self.program.expressions.len();
         let statements = self.program.statements.len();
@@ -48,12 +75,12 @@ pub struct Modules {
         for expr in part.expressions {
             if expr.left >= 0 { expr.left = expr.left + expressions; }
             if expr.right >= 0 { expr.right = expr.right + expressions; }
-            self.offset(expr.args, expressions); self.program.expressions.push(expr);
+            self.offset_arms(expr.arms, expressions, statements); self.offset(expr.args, expressions); self.program.expressions.push(expr);
         }
         for stmt in part.statements {
             if stmt.expr >= 0 { stmt.expr = stmt.expr + expressions; }
             if stmt.target >= 0 { stmt.target = stmt.target + expressions; }
-            self.offset(stmt.body, statements); self.offset(stmt.alternative, statements);
+            self.offset_arms(stmt.arms, expressions, statements); self.offset(stmt.body, statements); self.offset(stmt.alternative, statements);
             self.program.statements.push(stmt);
         }
         for fn in part.functions { self.offset(fn.body, statements); self.program.functions.push(fn); }
@@ -72,11 +99,12 @@ pub struct Modules {
         self.paths.set(canonical, self.paths.len() as i32);
         let imports = Vec<ModuleImport>.new(); self.imports.set(canonical, imports);
         // Tokens are shared by AST nodes and can be tagged after parsing.
-        for expr in part.expressions { expr.token.source = canonical; }
-        for stmt in part.statements { stmt.token.source = canonical; }
+        for expr in part.expressions { expr.token.source = canonical; self.source_arms(expr.arms, canonical); }
+        for stmt in part.statements { stmt.token.source = canonical; self.source_arms(stmt.arms, canonical); }
         for fn in part.functions { fn.token.source = canonical; for param in fn.params { param.token.source = canonical; } }
         for declaration in part.declarations {
             declaration.token.source = canonical;
+            for variant in declaration.variants { variant.token.source = canonical; for param in variant.payload { param.token.source = canonical; } }
             for field in declaration.fields { field.token.source = canonical; }
             if declaration.kind != 1 { continue; }
             var alias = declaration.token.text;
@@ -261,7 +289,7 @@ pub struct Modules {
             if !needed { return; }
         }
         for declaration in self.program.declarations {
-            if declaration.kind == 2 || declaration.kind == 3 {
+            if declaration.kind == 2 || declaration.kind == 3 || declaration.kind == 4 {
                 if declaration.kind == 3 && declaration.modifiers.contains("static") { self.error = location(declaration.token, "static typealias unsupported"); return; }
                 self.register(declaration.token, declaration.modifiers, 2);
                 if declaration.kind == 3 { self.aliases.set(self.resolve(declaration.token.text, declaration.token, 2), declaration); }
@@ -306,7 +334,8 @@ pub struct Modules {
         }
         for declaration in self.program.declarations {
             for field in declaration.fields { field.type_name = self.type_name(field.type_name, field.token); }
-            if declaration.kind == 2 { declaration.token.text = self.resolve(declaration.token.text, declaration.token, 2); }
+            for variant in declaration.variants { for param in variant.payload { param.type_name = self.type_name(param.type_name, param.token); } }
+            if declaration.kind == 2 || declaration.kind == 4 { declaration.token.text = self.resolve(declaration.token.text, declaration.token, 2); }
         }
     }
 }
