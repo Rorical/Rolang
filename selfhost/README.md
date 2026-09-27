@@ -1,13 +1,15 @@
-# Rolang-written bootstrap compiler — self-parsing milestone
+# Rolang-written bootstrap compiler — struct code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
-Rolang code: it reads source, lexes, parses, resolves local/function names, checks
-types, and emits standalone C11. It does not invoke Python, Lark, or llvmlite.
+Rolang code: it reads source, lexes, parses, resolves names, checks types, and
+emits standalone C11 for the supported subset. It does not invoke Python, Lark,
+or llvmlite.
 
 **This is not full self-hosting yet.** The existing Python compiler builds this
-compiler. Its frontend now parses every `.rl` file in this directory and exposes the syntax
-tree as JSON. Its C backend cannot yet compile those files: lowering structs,
-generics, imports, strings, and standard-library calls remains to be implemented. Here, “stage 0”
+compiler. Its frontend parses every `.rl` file in this directory and exposes the
+syntax tree as JSON. Its C backend cannot yet compile those files: generic
+specialization, imports, strings, collections, and standard-library calls remain
+to be implemented. Non-generic structs and methods now emit C. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
 
 ## Build and run
@@ -37,25 +39,58 @@ that resolve to the same path are rejected, including symlink aliases.
 
 | Area | Supported |
 |---|---|
-| Functions | `def name(parameters) -> i32/Bool`, forward calls, recursion, mutual recursion |
+| Functions | `def name(parameters) -> i32/Bool/Struct/Void`, forward calls, recursion, mutual recursion |
 | Entry point | Exactly one `def main() -> i32` |
-| Variables | Initialized `let`/`var`, optional explicit `i32`/`Bool` annotation, lexical block scopes, assignment to `var` |
+| Variables | Initialized `let`/`var`, optional explicit `i32`/`Bool`/struct annotation, lexical block scopes, assignment to `var` |
 | Statements | `return`, `if { } else { }`, `while { }`, expression statements |
 | Expressions | Decimal i32 integers, Boolean literals, variables, calls, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
+| Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
 | Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
 
 Function arguments are immutable. Conditions require Bool. Arguments, assignments,
 annotations, and return values are checked for type compatibility. Parameters and
 locals cannot be duplicated in the same scope; nested blocks may shadow names.
-Every function must have a provable return on every path; a loop alone is not
-accepted as proof of a return.
+Every non-`Void` function must have a provable return on every path; a loop alone
+is not accepted as proof of a return. `Void` functions permit bare returns and
+fallthrough.
 
 Integer arithmetic follows the existing compiler's wrapping i32 behavior,
 including `INT32_MIN / -1` and `% -1`. Out-of-range literals are rejected. Division
 by zero terminates the generated program with an error. The C backend avoids
 signed-overflow undefined behavior, emits explicit temporaries for left-to-right
 evaluation, preserves Boolean short-circuiting, and mangles all source names.
+
+## Structs and methods
+
+```sh
+build/rolang-stage0 selfhost/examples/structs.rl build/structs.c
+cc -std=c11 -O3 build/structs.c -o build/structs
+build/structs
+# Exit status: 42.
+```
+
+Struct values are heap references. Assignment, parameters, and returns preserve
+aliasing; nested fields can hold other structs. Forward type declarations, static
+factories, instance `self`, and recursive methods are supported. As in the current
+compiler, `let` prevents rebinding local references; writes through object fields
+remain allowed. Struct equality is rejected, matching the existing compiler for
+structs without comparison support.
+
+Every stored field must be explicitly initialized exactly once. Field and method
+names, initializer types, receivers, call arity, and argument/return types are
+checked. Generic structs, default field values, and lifecycle hooks are rejected.
+No strings, collections, imports, or type aliases are lowered yet.
+
+The standalone generated C tracks allocations in a program-wide arena and frees
+them at normal process exit (including runtime division-by-zero exits). Objects
+are retained until exit, so allocation-heavy, long-running programs can consume
+more memory than the existing ARC compiler. This is an intermediate ownership
+model for the bootstrap backend. Destructors and other `__` hooks are rejected
+rather than given incorrect destruction timing. ARC remains a future milestone.
+
+Evaluation preserves source argument/initializer order. Field assignment follows
+the existing compiler: evaluate the right-hand side, then resolve the target.
 
 ## Self-parsing frontend
 
@@ -68,7 +103,7 @@ resolve imports or check types, names, assignment mutability, or return paths.
 A library file does not need `main`. Successful parsing does **not** mean that a
 program can be compiled by this backend.
 
-The syntax supported beyond the C subset includes:
+The extended syntax represented by the frontend includes:
 
 - Quoted strings (raw spelling retained), `nil`, member access, method calls,
   indexed access, struct literals with field labels, and numeric `as` syntax.
@@ -114,7 +149,10 @@ UV_CACHE_DIR=/private/tmp/rolang-uv-cache .venv/bin/pytest -q tests/test_selfhos
 The tests build the Rolang-written compiler at O0 and O3, then:
 
 - compare generated programs with the existing compiler for arithmetic, control
-  flow, recursion, scopes, and Boolean behavior;
+  flow, recursion, scopes, Booleans, struct aliasing, fields, and methods;
+- exercise nested assignment order, forward struct types, empty structs, `Void`,
+  and a 10,000-object allocation workload;
+- run generated struct programs under AddressSanitizer and UndefinedBehaviorSanitizer;
 - compile emitted C at both O0 and O3;
 - exercise seeded random arithmetic and signed boundary cases;
 - check generated arithmetic with UndefinedBehaviorSanitizer;
@@ -133,7 +171,7 @@ The tests build the Rolang-written compiler at O0 and O3, then:
 The frontend still accepts a subset. Enums, protocols, extensions, constraints,
 closures, labeled/default call parameters, collection literals, tuple types,
 optional chaining, additional numeric literal forms, bitwise operators, async,
-FFI declarations, and implicit returns are not implemented here. Struct fields
+FFI declarations, and implicit value returns are not implemented here. Struct fields
 and statements require semicolons. `else if` must be written as `else { if ... }`.
 Generic expression receivers currently use unqualified names (`Vec<T>.new()`).
 The existing compiler continues to provide the complete language.
@@ -146,8 +184,8 @@ Next steps toward actual self-compilation:
 
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
-2. Add semantic analysis and lowering for structs/enums, strings/collections,
-   imports, and generic specialization.
+2. **In progress:** non-generic structs/methods now have type checking and C
+   lowering. Add strings/collections, imports, enums, and generic specialization.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
 5. Compare bootstrap generations and run the broader language regression suite.
@@ -160,14 +198,16 @@ from achieving compiler self-hosting.
 
 On Apple Silicon macOS, this milestone passed:
 
-- **162 tests** in 115.10 seconds, including O0/O3 self-parsing, complete tree
-  comparisons, differential program execution, and emitted-C UBSan checks.
-- **86 AddressSanitizer checks** in 54.98 seconds, covering the expanded frontend,
-  its own sources, malformed input, precedence, JSON output, and execution with
-  Python/backend tools absent from PATH. The bootstrap runtime is instrumented;
-  `detect_leaks=0` means these checks do not validate leaks.
+- **250 bootstrap tests** in 239.70 seconds, including O0/O3 self-parsing,
+  complete tree comparisons, differential struct/method execution, and
+  generated-C AddressSanitizer/UndefinedBehaviorSanitizer checks.
+- **104 sanitizer checks** in 177.60 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These include
+  self-parsing, struct programs, malformed declarations, invalid field/method
+  access, and the allocation workload. `detect_leaks=0` means these checks
+  do not validate leaks.
 
 See the test command above to reproduce the standard suite.
 
-No existing compiler/runtime implementation is changed by this milestone; the
-new compiler is entirely source-level Rolang code using the existing library.
+No existing Python compiler/runtime implementation is changed by this milestone.
+The new compiler is source-level Rolang code using the existing library.

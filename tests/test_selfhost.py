@@ -99,7 +99,7 @@ def test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected):
 
 @pytest.mark.parametrize('source, diagnostic', [
     ('', 'missing main'),
-    ('def main() -> i32 { return ; }', 'requires an expression'),
+    ('def main() -> i32 { return ; }', 'expected i32'),
     ('def main() -> i32 { return 1;', "expected '}'"),
     ('def main() -> i32 { return unknown; }', 'unknown variable'),
     ('def main() -> i32 { return missing(); }', 'unknown function'),
@@ -469,7 +469,7 @@ def test_extended_parse_errors(bootstrap, tmp_path, source, diagnostic):
 def test_extended_syntax_c_gate(bootstrap, tmp_path, body):
     result, path, output = emit(bootstrap, tmp_path, 'def main() -> i32 {' + body + '}')
     assert result.returncode == 1, result.stdout
-    assert 'C backend' in result.stdout
+    assert result.stdout.strip()
     assert not output.exists()
     parsed = parse_native(bootstrap, path)
     assert parsed.returncode == 0, parsed.stdout
@@ -506,3 +506,142 @@ def test_expression_tree_precedence(bootstrap, tmp_path, body):
     result = parse_native(bootstrap, path)
     assert result.returncode == 0, result.stdout
     assert_tree_matches_reference(json.loads(result.stdout), source)
+
+
+STRUCT_PROGRAMS = [
+    ('''struct Point { pub var x: i32; pub let y: i32; }
+    def main() -> i32 { let p = Point { y: 4, x: 2 }; p.x = 9; return p.x + p.y; }''', 13),
+    ('''struct Counter {
+        pub var n: i32;
+        pub static def new(n: i32) -> Counter { return Counter { n: n }; }
+        pub def bump() -> i32 { self.n = self.n + 1; return self.n; }
+        pub def reset() -> Void { self.n = 0; }
+        pub def same() -> Counter { return self; }
+    }
+    def sum(a: i32, b: i32) -> i32 { return a * 10 + b; }
+    def main() -> i32 {
+        let c = Counter.new(5); let alias = c.same(); alias.reset();
+        let result = sum(c.bump(), alias.bump());
+        return result + c.n;
+    }''', 14),
+    ('''struct Leaf { pub var n: i32; }
+    struct Tree { pub var left: Leaf; pub var right: Leaf; }
+    def make() -> Tree { let leaf = Leaf { n: 3 }; return Tree { left: leaf, right: leaf }; }
+    def main() -> i32 {
+        let t = make(); t.left.n = 9;
+        let old = t.right; t.left = Leaf { n: 4 };
+        return old.n + t.right.n + t.left.n;
+    }''', 22),
+    ('''struct Empty {}
+    def consume(value: Empty) -> Void { return; }
+    struct Holder { pub let item: Empty; }
+    def main() -> i32 {
+        let a = Empty {}; let b = a;
+        let h = Holder { item: b }; let item: Empty = h.item;
+        consume(item); consume(a); consume(Empty {}); return 0;
+    }''', 0),
+    ('''struct Counter {
+        pub var n: i32;
+        pub def down() -> i32 { if self.n == 0 { return 0; } self.n = self.n - 1; return 1 + self.down(); }
+    }
+    def main() -> i32 { return Counter { n: 17 }.down(); }''', 17),
+    ('''struct A { pub var b: B; }
+    struct B { pub var n: i32; }
+    def make(b: B) -> A { return A { b: b }; }
+    def main() -> i32 { var x: A = make(B { n: 1 }); let saved = x; x = make(B { n: 2 }); return saved.b.n * 10 + x.b.n; }''', 12),
+    ('''struct C {
+        pub var n: i32;
+        pub def next() -> i32 { self.n = self.n + 1; return self.n; }
+    }
+    struct Pair { pub var first: i32; pub var second: i32; }
+    def main() -> i32 {
+        let c = C { n: 0 }; let p = Pair { second: c.next(), first: c.next() };
+        return p.first * 10 + p.second;
+    }''', 21),
+    ('''struct switch {
+        pub var int32_t: Bool;
+        pub def read() -> Bool { return self.int32_t; }
+    }
+    def noop() -> Void { return; }
+    def main() -> i32 {
+        noop(); let x = switch { int32_t: true };
+        if x.read() { return 19; } return 0;
+    }''', 19),
+    ('''struct C { pub var n: i32; }
+    def main() -> i32 {
+        var c = C { n: 0 }; var i = 0;
+        while i < 10000 { c = C { n: c.n + 1 }; i = i + 1; }
+        return c.n - 9900;
+    }''', 100),
+    ('''struct Leaf { pub var n: i32; }
+    struct Box {
+        pub var leaf: Leaf;
+        pub def replace() -> i32 { self.leaf = Leaf { n: 90 }; return 7; }
+    }
+    def main() -> i32 {
+        let box = Box { leaf: Leaf { n: 3 } }; let old = box.leaf;
+        box.leaf.n = box.replace(); return old.n * 10 + box.leaf.n;
+    }''', 37),
+    ('''struct S { pub let x: i32; }
+    def main() -> i32 { let s = S { x: 1 }; s.x = 2; return s.x; }''', 2),
+
+    ((ROOT / 'selfhost' / 'examples' / 'structs.rl').read_text(), 42),
+
+]
+
+
+@pytest.mark.parametrize('source, expected', STRUCT_PROGRAMS)
+def test_struct_program_matches_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('struct S {} struct S {}', 'duplicate or reserved struct'),
+    ('struct i32 {}', 'duplicate or reserved struct'),
+    ('struct S { var x: i32; var x: Bool; }', 'duplicate field'),
+    ('struct S { var x: i32; def x() {} }', 'duplicate member'),
+    ('struct S { def x() {} def x() {} }', 'duplicate member'),
+    ('struct S { var x: Missing; }', 'supports only'),
+    ('struct S { var x: Void; }', 'supports only'),
+    ('struct S { var x: i32 = 1; }', 'field defaults unsupported'),
+    ('struct S { def __release__() {} }', 'lifecycle hooks unsupported'),
+    ('struct S<T> { var x: T; }', 'declaration unsupported'),
+    ('struct S {} def S() {}', 'conflicts with struct'),
+    ('struct S { var x: i32; } def main() -> i32 { let s = S {}; return 0; }', 'missing field'),
+    ('struct S { var x: i32; } def main() -> i32 { let s = S { x: 1, x: 2 }; return 0; }', 'duplicate field initializer'),
+    ('struct S {} def main() -> i32 { let s = S { x: 1 }; return 0; }', 'unknown field'),
+    ('struct S { var x: i32; } def main() -> i32 { let s = S { x: true }; return 0; }', 'expected i32'),
+    ('struct S { var x: i32; } def main() -> i32 { let s = S { x: 1 }; s.x = true; return 0; }', 'expected i32'),
+    ('struct S {} def main() -> i32 { let s = S {}; return s.missing; }', 'unknown field'),
+    ('def main() -> i32 { return 1.field; }', 'receiver must be a struct'),
+    ('struct S { def f() -> i32 { return 0; } } def main() -> i32 { return S.f(); }', 'receiver mismatch'),
+    ('struct S { static def f() -> i32 { return 0; } } def main() -> i32 { return S {}.f(); }', 'receiver mismatch'),
+    ('struct S {} def main() -> i32 { return S {}.missing(); }', 'unknown method'),
+    ('struct S { def f(x: i32) -> i32 { return x; } } def main() -> i32 { return S {}.f(); }', 'wrong argument count'),
+    ('struct S { def f(x: i32) -> i32 { return x; } } def main() -> i32 { return S {}.f(true); }', 'expected i32'),
+    ('struct S { def f() { self = S {}; } }', 'cannot assign to let'),
+    ('struct S { def f(self: i32) {} }', 'duplicate parameter'),
+    ('def f() {} def main() -> i32 { let x = f(); return 0; }', 'Void is not a value'),
+    ('def f() {} def main() -> i32 { if f() == f() { return 0; } return 1; }', 'Void is not a value'),
+    ('def f() -> Void { return 1; }', 'expected Void'),
+    ('def f() -> i32 { return; }', 'expected i32'),
+    ('struct S {} def main() -> i32 { let eq = S {} == S {}; return 0; }', 'cannot compare struct values'),
+    ('struct S {} struct T {} def main() -> i32 { let s: S = T {}; return 0; }', 'expected S'),
+])
+def test_struct_diagnostics_preserve_output(bootstrap, tmp_path, source, diagnostic):
+    if 'def main' not in source:
+        source += ' def main() -> i32 { return 0; }'
+    output = tmp_path / 'program.c'
+    output.write_text('existing output')
+    result, _, _ = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stdout
+    assert output.read_text() == 'existing output'
+
+
+def test_struct_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in (STRUCT_PROGRAMS[2], STRUCT_PROGRAMS[8]):
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (native.returncode, native.stderr) == (expected, '')

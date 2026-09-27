@@ -1,5 +1,6 @@
 import "lexer.rl"
 import "ast.rl"
+import "parser.rl"
 import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
@@ -8,6 +9,7 @@ pub struct Backend {
     pub var program: Program;
     pub var functions: Dict<String, i32>;
     pub var scopes: Vec<Dict<String, Binding>>;
+    pub var structs: Dict<String, i32>;
     pub var output: StringBuilder;
     pub var error: String;
     pub var next_id: i32;
@@ -16,7 +18,7 @@ pub struct Backend {
 
     pub static def new(program: Program) -> Backend {
         return Backend { program: program, functions: Dict<String, i32>.with_capacity(16, 1),
-            scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, return_type: "i32" };
+            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, return_type: "i32" };
     }
     pub def fail(token: Token, message: String) -> Void {
         if self.error.is_empty() { self.error = location(token, message); }
@@ -28,7 +30,11 @@ pub struct Backend {
     }
     pub def value(type_name: String, expression: String) -> Value {
         let name = self.fresh();
-        self.output.append_line("int32_t " + name + " = " + expression + ";");
+        if type_name.equals("Void") {
+            self.output.append_line(expression + ";");
+            return Value { code: "", type_name: "Void" };
+        }
+        self.output.append_line(self.c_type(type_name) + " " + name + " = " + expression + ";");
         return Value { code: name, type_name: type_name };
     }
     pub def lookup(name: String) -> Binding? {
@@ -94,23 +100,19 @@ pub struct Backend {
         }
         if expr.kind == 6 {
             if let local = self.lookup(token.text) { self.fail(token, "local variable is not callable"); }
-            if let index = self.functions.get(token.text) {
-                let function = self.program.functions.get(index);
-                if function.params.len() != expr.args.len() { self.fail(token, "wrong argument count"); }
-                let args = StringBuilder.new();
-                var i = 0;
-                while i < expr.args.len() {
-                    let value = self.expression(expr.args.get(i));
-                    if i < function.params.len() { self.require_type(token, value.type_name, function.params.get(i).type_name); }
-                    if i > 0 { args.append(", "); }
-                    args.append(value.code);
-                    i = i + 1;
-                }
-                return self.value(function.return_type, "rl_f" + index.to_string() + "(" + args.to_string() + ")");
-            }
-            self.fail(token, "unknown function '" + token.text + "'");
-            return Value { code: "0", type_name: "i32" };
+            if let index = self.functions.get(token.text) { return self.call(index, expr.args, "", token); }
+            self.fail(token, "unknown function '" + token.text + "'"); return self.invalid();
         }
+        if expr.kind == 9 {
+            let object = self.expression(expr.left);
+            let field = self.field_index(object.type_name, token);
+            if field < 0 { return self.invalid(); }
+            let declaration = self.program.declarations.get(self.struct_index(object.type_name));
+            return self.value(declaration.fields.get(field).type_name, object.code + "->rl_m" + field.to_string());
+        }
+        if expr.kind == 10 { return self.construct(expr); }
+        if expr.kind == 14 { return self.method_call(expr); }
+        if expr.kind != 4 { self.fail(token, "expression unsupported by C backend"); return self.invalid(); }
         let left = self.expression(expr.left);
         let op = token.text;
         if op.equals("&&") || op.equals("||") {
@@ -126,6 +128,8 @@ pub struct Backend {
         let right = self.expression(expr.right);
         if op.equals("==") || op.equals("!=") {
             self.require_type(token, right.type_name, left.type_name);
+            if left.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
+            if self.structs.contains(left.type_name) { self.fail(token, "cannot compare struct values"); }
             return self.value("Bool", left.code + " " + op + " " + right.code);
         }
         self.require_type(token, left.type_name, "i32");
@@ -150,6 +154,22 @@ pub struct Backend {
     pub def statement(id: i32) -> Bool {
         let statement = self.program.statements.get(id);
         let token = statement.token;
+        if statement.kind == 13 {
+            let target = self.program.expressions.get(statement.target);
+            if target.kind != 9 { self.fail(token, "assignment unsupported by C backend"); return false; }
+            // Rolang evaluates an assignment's RHS before resolving its target.
+            let value = self.expression(statement.expr);
+            let object = self.expression(target.left);
+            let field = self.field_index(object.type_name, target.token);
+            if field < 0 { return false; }
+            let property = self.program.declarations.get(self.struct_index(object.type_name)).fields.get(field);
+            self.require_type(token, value.type_name, property.type_name);
+            self.output.append_line(object.code + "->rl_m" + field.to_string() + " = " + value.code + ";");
+            return false;
+        }
+        if statement.kind == 1 && statement.expr < 0 {
+            self.require_type(token, "Void", self.return_type); self.output.append_line("return;"); return true;
+        }
         if statement.kind == 5 {
             self.output.append_line("while (1) {");
             let condition = self.expression(statement.expr);
@@ -169,8 +189,9 @@ pub struct Backend {
             let scope = self.scopes.get(self.scopes.len() - 1);
             if scope.contains(token.text) { self.fail(token, "duplicate local '" + token.text + "'"); }
             if !statement.annotation.is_empty() { self.require_type(token, value.type_name, statement.annotation); }
+            if value.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
             let name = self.fresh();
-            self.output.append_line("int32_t " + name + " = " + value.code + ";");
+            self.output.append_line(self.c_type(value.type_name) + " " + name + " = " + value.code + ";");
             scope.set(token.text, Binding { code: name, type_name: value.type_name, mutable: statement.mutable });
         }
         if statement.kind == 3 {
@@ -194,34 +215,63 @@ pub struct Backend {
     pub def signature(index: i32) -> String {
         let function = self.program.functions.get(index);
         let text = StringBuilder.new();
-        text.append("static int32_t rl_f" + index.to_string() + "(");
+        text.append("static " + self.c_type(function.return_type) + " rl_f" + index.to_string() + "(");
+        let instance = !function.owner.is_empty() && !function.modifiers.contains("static");
+        if instance { text.append(self.c_type(function.owner) + " rl_self"); }
         var i = 0;
         while i < function.params.len() {
-            if i > 0 { text.append(", "); }
-            text.append("int32_t rl_p" + i.to_string());
+            if i > 0 || instance { text.append(", "); }
+            text.append(self.c_type(function.params.get(i).type_name) + " rl_p" + i.to_string());
             i = i + 1;
         }
-        if i == 0 { text.append("void"); }
+        if i == 0 && !instance { text.append("void"); }
         text.append(")");
         return text.to_string();
     }
-    // Validate the whole tree, including unreachable nodes, before C emission.
+    // Validate every node, including unreachable constructs, before emission.
     pub def supported_type(token: Token, type_name: String) -> Void {
-        if !type_name.equals("i32") && !type_name.equals("Bool") { self.fail(token, "C backend supports only i32 and Bool types"); }
+        if !type_name.equals("i32") && !type_name.equals("Bool") && !self.structs.contains(type_name) {
+            self.fail(token, "C backend supports only i32 and Bool types or declared non-generic structs");
+        }
     }
     pub def validate_subset() -> Void {
-        for declaration in self.program.declarations { self.fail(declaration.token, "declaration unsupported by C backend"); }
+        var index = 0;
+        for declaration in self.program.declarations {
+            if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
+            else {
+                let name = declaration.token.text;
+                if self.structs.contains(name) || primitive_type(name) || name.equals("String") { self.fail(declaration.token, "duplicate or reserved struct name"); }
+                self.structs.set(name, index);
+            }
+            index = index + 1;
+        }
+        for declaration in self.program.declarations {
+            let names = Dict<String, i32>.with_capacity(8, 1);
+            for field in declaration.fields {
+                self.supported_type(field.token, field.type_name);
+                if names.contains(field.token.text) { self.fail(field.token, "duplicate field"); }
+                names.set(field.token.text, 1);
+                if field.expr >= 0 { self.fail(field.token, "field defaults unsupported by C backend"); }
+            }
+            for method in declaration.methods {
+                let function = self.program.functions.get(method);
+                if names.contains(function.token.text) { self.fail(function.token, "duplicate member"); }
+                names.set(function.token.text, 1);
+                if function.token.text.starts_with("__") { self.fail(function.token, "lifecycle hooks unsupported by C backend"); }
+            }
+        }
         for function in self.program.functions {
-            if !function.owner.is_empty() || function.generics.len() != 0 || function.modifiers.contains("static") { self.fail(function.token, "function unsupported by C backend"); }
-            self.supported_type(function.token, function.return_type);
+            if function.generics.len() != 0 || (function.owner.is_empty() && function.modifiers.contains("static")) { self.fail(function.token, "function unsupported by C backend"); }
+            if !function.return_type.equals("Void") { self.supported_type(function.token, function.return_type); }
             for param in function.params { self.supported_type(param.token, param.type_name); }
+            if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
-            if expression.kind > 6 { self.fail(expression.token, "expression unsupported by C backend"); }
+            if expression.kind > 6 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
         }
         for statement in self.program.statements {
-            if statement.kind > 6 { self.fail(statement.token, "statement unsupported by C backend"); }
-            if statement.expr < 0 { self.fail(statement.token, "C backend requires an expression or initializer"); }
+            if statement.kind > 6 && statement.kind != 13 { self.fail(statement.token, "statement unsupported by C backend"); }
+            if statement.expr < 0 && statement.kind != 1 { self.fail(statement.token, "C backend requires an expression or initializer"); }
             if !statement.annotation.is_empty() { self.supported_type(statement.token, statement.annotation); }
         }
     }
@@ -231,8 +281,10 @@ pub struct Backend {
         var i = 0;
         while i < self.program.functions.len() {
             let function = self.program.functions.get(i);
-            if self.functions.contains(function.token.text) { self.fail(function.token, "duplicate function"); }
-            self.functions.set(function.token.text, i);
+            var key = function.token.text;
+            if !function.owner.is_empty() { key = function.owner + "." + key; }
+            if self.functions.contains(key) { self.fail(function.token, "duplicate function"); }
+            self.functions.set(key, i);
             i = i + 1;
         }
         if let index = self.functions.get("main") {
@@ -241,6 +293,7 @@ pub struct Backend {
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
         self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
+        self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
         self.output.append_line("static int32_t rl_add(int32_t a,int32_t b) { return rl_bits((uint32_t)a+(uint32_t)b); }");
         self.output.append_line("static int32_t rl_sub(int32_t a,int32_t b) { return rl_bits((uint32_t)a-(uint32_t)b); }");
@@ -257,6 +310,9 @@ pub struct Backend {
             self.return_type = function.return_type;
             let scope = Dict<String, Binding>.with_capacity(8, 1);
             self.scopes.push(scope);
+            if !function.owner.is_empty() && !function.modifiers.contains("static") {
+                scope.set("self", Binding { code: "rl_self", type_name: function.owner, mutable: false });
+            }
             var p = 0;
             for param in function.params {
                 if scope.contains(param.token.text) { self.fail(param.token, "duplicate parameter"); }
@@ -264,11 +320,108 @@ pub struct Backend {
                 p = p + 1;
             }
             self.output.append_line(self.signature(i) + " {");
-            if !self.block(function.body, false) { self.fail(function.token, "function must return on every path"); }
+            if !self.block(function.body, false) && !function.return_type.equals("Void") { self.fail(function.token, "function must return on every path"); }
             self.output.append_line("}");
             self.scopes.pop();
             i = i + 1;
         }
-        if let index = self.functions.get("main") { self.output.append_line("int main(void) { return (int)rl_f" + index.to_string() + "(); }"); }
+        if let index = self.functions.get("main") { self.output.append_line("int main(void) { if (atexit(rl_cleanup)) return 1; return (int)rl_f" + index.to_string() + "(); }"); }
+    }
+
+    pub def invalid() -> Value { return Value { code: "0", type_name: "i32" }; }
+    pub def struct_index(name: String) -> i32 {
+        if let index = self.structs.get(name) { return index; }
+        return -1;
+    }
+    pub def c_type(name: String) -> String {
+        if name.equals("Void") { return "void"; }
+        let index = self.struct_index(name);
+        if index >= 0 { return "rl_s" + index.to_string() + "*"; }
+        return "int32_t";
+    }
+    pub def field_index(owner: String, token: Token) -> i32 {
+        let index = self.struct_index(owner);
+        if index < 0 { self.fail(token, "field receiver must be a struct"); return -1; }
+        let fields = self.program.declarations.get(index).fields;
+        var i = 0;
+        while i < fields.len() {
+            if fields.get(i).token.text.equals(token.text) { return i; }
+            i = i + 1;
+        }
+        self.fail(token, "unknown field '" + token.text + "'"); return -1;
+    }
+    pub def call(index: i32, values: Vec<i32>, receiver: String, token: Token) -> Value {
+        let function = self.program.functions.get(index);
+        if function.params.len() != values.len() { self.fail(token, "wrong argument count"); }
+        let args = StringBuilder.new(); args.append(receiver);
+        var i = 0;
+        while i < values.len() {
+            let value = self.expression(values.get(i));
+            if i < function.params.len() { self.require_type(token, value.type_name, function.params.get(i).type_name); }
+            if i > 0 || !receiver.is_empty() { args.append(", "); }
+            args.append(value.code); i = i + 1;
+        }
+        return self.value(function.return_type, "rl_f" + index.to_string() + "(" + args.to_string() + ")");
+    }
+    pub def method_call(expr: Expression) -> Value {
+        let member = self.program.expressions.get(expr.left);
+        if member.kind != 9 { self.fail(expr.token, "call target unsupported by C backend"); return self.invalid(); }
+        let receiver = self.program.expressions.get(member.left);
+        var owner = ""; var code = ""; var static_call = false;
+        if receiver.kind == 3 && self.structs.contains(receiver.token.text) {
+            if let local = self.lookup(receiver.token.text) { static_call = false; }
+            else { static_call = true; owner = receiver.token.text; }
+        }
+        if !static_call {
+            let object = self.expression(member.left); owner = object.type_name; code = object.code;
+        }
+        if let index = self.functions.get(owner + "." + member.token.text) {
+            let function = self.program.functions.get(index);
+            if function.modifiers.contains("static") != static_call { self.fail(member.token, "static/instance method receiver mismatch"); return self.invalid(); }
+            return self.call(index, expr.args, code, member.token);
+        }
+        self.fail(member.token, "unknown method '" + member.token.text + "'"); return self.invalid();
+    }
+    pub def construct(expr: Expression) -> Value {
+        let index = self.struct_index(expr.type_name);
+        if index < 0 { self.fail(expr.token, "unknown struct '" + expr.type_name + "'"); return self.invalid(); }
+        let declaration = self.program.declarations.get(index);
+        let seen = Dict<String, i32>.with_capacity(8, 1);
+        let result = self.value(expr.type_name, "rl_allocate(sizeof(rl_s" + index.to_string() + "))");
+        var i = 0;
+        while i < expr.args.len() && self.error.is_empty() {
+            let label = expr.labels.get(i);
+            let token = Token { text: label, kind: 1, line: expr.token.line, column: expr.token.column };
+            let field = self.field_index(expr.type_name, token);
+            if field < 0 { return self.invalid(); }
+            if seen.contains(label) { self.fail(token, "duplicate field initializer"); }
+            seen.set(label, 1);
+            let value = self.expression(expr.args.get(i));
+            self.require_type(token, value.type_name, declaration.fields.get(field).type_name);
+            self.output.append_line(result.code + "->rl_m" + field.to_string() + " = " + value.code + ";");
+            i = i + 1;
+        }
+        if seen.len() != declaration.fields.len() { self.fail(expr.token, "missing field initializer"); }
+        return result;
+    }
+    pub def emit_structs() -> Void {
+        self.output.append_line("typedef struct rl_allocation { void *object; struct rl_allocation *next; } rl_allocation;");
+        self.output.append_line("static rl_allocation *rl_allocations;");
+        self.output.append_line("static void rl_cleanup(void) { while (rl_allocations) { rl_allocation *p = rl_allocations; rl_allocations = p->next; free(p->object); free(p); } }");
+        self.output.append_line("static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation *a = malloc(sizeof(*a)); if (!p || !a) { free(p); free(a); fputs(\"allocation failed\\n\", stderr); exit(1); } a->object = p; a->next = rl_allocations; rl_allocations = a; return p; }");
+        var i = 0;
+        while i < self.program.declarations.len() {
+            self.output.append_line("typedef struct rl_s" + i.to_string() + " rl_s" + i.to_string() + ";"); i = i + 1;
+        }
+        i = 0;
+        for declaration in self.program.declarations {
+            self.output.append_line("struct rl_s" + i.to_string() + " {");
+            var field = 0;
+            for property in declaration.fields {
+                self.output.append_line(self.c_type(property.type_name) + " rl_m" + field.to_string() + ";"); field = field + 1;
+            }
+            if field == 0 { self.output.append_line("unsigned char rl_empty;"); }
+            self.output.append_line("};"); i = i + 1;
+        }
     }
 }
