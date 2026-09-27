@@ -1,4 +1,4 @@
-# Rolang-written bootstrap compiler — vector code generation milestone
+# Rolang-written bootstrap compiler — optional value code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
@@ -8,9 +8,9 @@ or llvmlite.
 **This is not full self-hosting yet.** The existing Python compiler builds this
 compiler. Its frontend parses every `.rl` file in this directory and exposes the
 syntax tree as JSON. Its C backend cannot yet compile those files: generic
-specialization, imports, dictionaries, optional values, and some standard-library
+specialization, imports, dictionaries, and some standard-library
 calls remain to be implemented. Non-generic structs, methods, core strings, and
-typed vectors now emit C. Here, “stage 0”
+typed vectors and optional values now emit C. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
 
 ## Build and run
@@ -43,7 +43,7 @@ that resolve to the same path are rejected, including symlink aliases.
 | Functions | `def name(parameters) -> i32/i64/Bool/String/Struct/Void`, forward calls, recursion, mutual recursion |
 | Entry point | Exactly one `def main() -> i32` |
 | Variables | Initialized `let`/`var`, optional explicit `i32`/`i64`/`Bool`/`String`/struct annotation, lexical block scopes, assignment to `var` |
-| Statements | `return`, `if { } else { }`, `while`, `for` over vectors, `break`/`continue`, nested/unsafe blocks, expression statements |
+| Statements | `if let`, `return`, `if { } else { }`, `while`, `for` over vectors, `break`/`continue`, nested/unsafe blocks, expression statements |
 | Expressions | Decimal i32 integers, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
 | Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
@@ -248,7 +248,7 @@ optional chaining, additional numeric literal forms, bitwise operators, async,
 FFI declarations, and implicit value returns are not implemented here. Struct fields
 and statements require semicolons. `else if` must be written as `else { if ... }`.
 Generic expression receivers currently use unqualified names (`Vec<T>.new()`).
-The existing compiler continues to provide the complete language.
+The existing compiler remains the primary compiler for the broader language.
 
 Expression/block/type nesting is limited to 128; source length is limited to the
 scanner's signed 32-bit indexing range. Identifiers are ASCII; strings may contain
@@ -259,7 +259,7 @@ Next steps toward actual self-compilation:
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
 2. **In progress:** non-generic structs/methods, core strings, signed widths,
-   and typed vectors now have C lowering. Add dictionaries, optional values,
+   typed vectors, and optional values now have C lowering. Add dictionaries,
    imports, enums, and general generic specialization.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
@@ -269,18 +269,41 @@ A C backend and the existing C runtime can remain dependencies during those
 bootstrap generations. Porting the package manager and language server is separate
 from achieving compiler self-hosting.
 
+## Optional values
+
+The C backend supports `T?` for supported value types, typed `nil`, implicit
+wrapping at assignments, calls, returns, field initializers and vector writes,
+and `if let` with a scoped immutable binding. Optional locals without an
+initializer start as `nil`. Presence is independent of the payload: zero,
+`false`, and empty strings remain present values. A scrutinee is evaluated once.
+
+`selfhost/examples/optionals.rl` demonstrates compiler-style binding lookup
+with a `Binding?` return type and exits with status 42.
+
+Use `if let` to unwrap values. Optional comparisons, chaining, and coalescing
+are not implemented. A bare inferred `let x = nil` requires a type annotation.
+Optional boxes use the same process-lifetime arena as other generated objects.
+
+The Python reference compiler currently fails LLVM code generation for
+`Vec<i32?>` push/set calls (optional aggregate argument type mismatches).
+The native C implementation is tested directly at O0/O3 and with sanitizers
+for this case; other optional programs are compared against the reference.
+
 ## Validation
 
-On Apple Silicon macOS, this milestone passed:
+On Apple Silicon macOS, validation covered 398 bootstrap cases:
 
-- **366 bootstrap tests** in 441.41 seconds, including O0/O3 self-parsing,
-  differential execution of vectors/loops, strings, structs and numeric
-  operations, diagnostics, and generated-C sanitizer checks.
-- **90 sanitizer checks** in 161.91 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. These cover native
-  self-parsing, typed/nested vectors, bounds failures, aliasing, iteration,
-  token scanning, and malformed vector operations. `detect_leaks=0` means
-  these do not validate leaks.
+- The broad run completed **393 passing checks** in 445.82 seconds, with one
+  diagnostic-wording failure from an O0 compiler built before its correction.
+- After that correction, **66 checks passed** in 41.67 seconds: all struct
+  diagnostics at O0/O3 (including the failed case), plus four new optional
+  comparison checks. Together these runs cover all 398 current cases.
+- **28 focused optional checks passed** in 96.82 seconds with the bootstrap
+  runtime instrumented using AddressSanitizer and payload checks. Generated C
+  also runs with AddressSanitizer and UndefinedBehaviorSanitizer.
+  `detect_leaks=0` means these checks do not validate leaks.
+- The binding-lookup example independently matched the Python reference and
+  generated C at O0/O3, returning 42.
 
 See the test command above to reproduce the standard suite.
 

@@ -51,6 +51,20 @@ pub struct Backend {
     pub def require_type(token: Token, actual: String, expected: String) -> Void {
         if !actual.equals(expected) && !(actual.equals("i32") && expected.equals("i64")) { self.fail(token, "expected " + expected + ", got " + actual); }
     }
+    pub def is_optional(name: String) -> Bool { return name.ends_with("?"); }
+    pub def optional_inner(name: String) -> String { return name.substring(0, (name.len() as i32) - 1); }
+    // Presence is boxed separately from the payload, including zero and nested nil.
+    pub def coerce(value: Value, expected: String, token: Token) -> Value {
+        if value.type_name.equals(expected) { return value; }
+        if self.is_optional(expected) {
+            if value.type_name.equals("nil") { return self.value(expected, "NULL"); }
+            let inner = self.optional_inner(expected);
+            if value.type_name.equals(inner) || (value.type_name.equals("i32") && inner.equals("i64")) {
+                return self.value(expected, "rl_some(" + self.slot(value) + ")");
+            }
+        }
+        self.require_type(token, value.type_name, expected); return value;
+    }
     pub def integer(token: Token, allow_min: Bool) -> String {
         var n: i64 = 0;
         var i = 0;
@@ -82,6 +96,7 @@ pub struct Backend {
     pub def emit_expression(id: i32) -> Value {
         let expr = self.program.expressions.get(id);
         let token = expr.token;
+        if expr.kind == 8 { return Value { code: "NULL", type_name: "nil" }; }
         if expr.kind == 7 { return self.string_literal(token); }
         if expr.kind == 11 {
             let value = self.expression(expr.left);
@@ -150,6 +165,7 @@ pub struct Backend {
             if !(self.numeric(left.type_name) && self.numeric(right.type_name)) { self.require_type(token, right.type_name, left.type_name); }
             if left.type_name.equals("String") { self.fail(token, "use String.equals for string comparison"); }
             if left.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
+            if self.is_optional(left.type_name) || left.type_name.equals("nil") { self.fail(token, "optional comparison unsupported; use if let"); }
             if self.structs.contains(left.type_name) || self.is_vector(left.type_name) { self.fail(token, "cannot compare struct values"); }
             return self.value("Bool", left.code + " " + op + " " + right.code);
         }
@@ -185,24 +201,25 @@ pub struct Backend {
             return false;
         }
         if statement.kind == 8 { return self.for_loop(statement); }
+        if statement.kind == 9 { return self.if_let(statement); }
         if statement.kind == 13 {
             let target = self.program.expressions.get(statement.target);
             if target.kind == 12 {
                 // Indexed assignment follows method-call order: receiver, index, RHS.
                 let object = self.expression(target.left); let index = self.expression(target.right);
-                let value = self.expression(statement.expr);
+                var value = self.expression(statement.expr);
                 if !self.is_vector(object.type_name) { self.fail(token, "index receiver must be a Vec"); return false; }
-                self.require_type(token, index.type_name, "i32"); self.require_type(token, value.type_name, self.vector_element(object.type_name));
+                self.require_type(token, index.type_name, "i32"); value = self.coerce(value, self.vector_element(object.type_name), token);
                 self.output.append_line("rl_vec_set(" + object.code + ", " + index.code + ", " + self.slot(value) + ");"); return false;
             }
             if target.kind != 9 { self.fail(token, "assignment unsupported by C backend"); return false; }
             // Rolang evaluates an assignment's RHS before resolving its target.
-            let value = self.expression(statement.expr);
+            var value = self.expression(statement.expr);
             let object = self.expression(target.left);
             let field = self.field_index(object.type_name, target.token);
             if field < 0 { return false; }
             let property = self.program.declarations.get(self.struct_index(object.type_name)).fields.get(field);
-            self.require_type(token, value.type_name, property.type_name);
+            value = self.coerce(value, property.type_name, token);
             self.output.append_line(object.code + "->rl_m" + field.to_string() + " = " + value.code + ";");
             return false;
         }
@@ -220,17 +237,19 @@ pub struct Backend {
             self.output.append_line("}");
             return false;
         }
-        let value = self.expression(statement.expr);
+        var value = Value { code: "NULL", type_name: "nil" };
+        if statement.expr >= 0 { value = self.expression(statement.expr); }
         if statement.kind == 1 {
-            self.require_type(token, value.type_name, self.return_type);
+            value = self.coerce(value, self.return_type, token);
             self.output.append_line("return " + value.code + ";");
             return true;
         }
         if statement.kind == 2 {
             let scope = self.scopes.get(self.scopes.len() - 1);
             if scope.contains(token.text) { self.fail(token, "duplicate local '" + token.text + "'"); }
-            if !statement.annotation.is_empty() { self.require_type(token, value.type_name, statement.annotation); }
+            if !statement.annotation.is_empty() { value = self.coerce(value, statement.annotation, token); }
             if value.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
+            if value.type_name.equals("nil") { self.fail(token, "nil requires a concrete type annotation"); }
             var type_name = value.type_name;
             if !statement.annotation.is_empty() { type_name = statement.annotation; }
             let name = self.fresh();
@@ -240,7 +259,7 @@ pub struct Backend {
         if statement.kind == 3 {
             if let binding = self.lookup(token.text) {
                 if !binding.mutable { self.fail(token, "cannot assign to let binding"); }
-                self.require_type(token, value.type_name, binding.type_name);
+                value = self.coerce(value, binding.type_name, token);
                 self.output.append_line(binding.code + " = " + value.code + ";");
             } else { self.fail(token, "unknown variable '" + token.text + "'"); }
         }
@@ -273,6 +292,7 @@ pub struct Backend {
     }
     // Validate every node, including unreachable constructs, before emission.
     pub def supported_type(token: Token, type_name: String) -> Void {
+        if self.is_optional(type_name) { self.supported_type(token, self.optional_inner(type_name)); return; }
         if self.is_vector(type_name) { self.supported_type(token, self.vector_element(type_name)); return; }
         if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !self.structs.contains(type_name) {
             self.fail(token, "C backend supports only i32, i64, Bool, String, or declared non-generic structs");
@@ -311,11 +331,10 @@ pub struct Backend {
             if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
-            if expression.kind > 6 && expression.kind != 7 && expression.kind != 11 && expression.kind != 12 && expression.kind != 13 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
+            if expression.kind > 6 && expression.kind != 7 && expression.kind != 8 && expression.kind != 11 && expression.kind != 12 && expression.kind != 13 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
         }
         for statement in self.program.statements {
-            if statement.kind == 9 { self.fail(statement.token, "statement unsupported by C backend"); }
-            if statement.expr < 0 && (statement.kind == 2 || statement.kind == 3 || statement.kind == 4 || statement.kind == 5 || statement.kind == 6 || statement.kind == 8 || statement.kind == 13) { self.fail(statement.token, "C backend requires an expression or initializer"); }
+            if statement.expr < 0 && ((statement.kind == 2 && !self.is_optional(statement.annotation)) || statement.kind == 9 || statement.kind == 3 || statement.kind == 4 || statement.kind == 5 || statement.kind == 6 || statement.kind == 8 || statement.kind == 13) { self.fail(statement.token, "C backend requires an expression or initializer"); }
             if !statement.annotation.is_empty() { self.supported_type(statement.token, statement.annotation); }
         }
     }
@@ -337,7 +356,7 @@ pub struct Backend {
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
         self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
-        self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec;");
+        self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec; typedef struct rl_optional rl_optional;");
         self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
         self.output.append_line("static int32_t rl_add(int32_t a,int32_t b) { return rl_bits((uint32_t)a+(uint32_t)b); }");
@@ -349,6 +368,8 @@ pub struct Backend {
         self.output.append_line("static int32_t rl_rem(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return 0; return a%b; }");
         emit_string_runtime(self.output);
         emit_vector_runtime(self.output);
+        self.output.append_line("struct rl_optional { rl_slot value; };");
+        self.output.append_line("static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof(*p)); p->value = value; return p; }");
         i = 0;
         while i < self.program.functions.len() { self.output.append_line(self.signature(i) + ";"); i = i + 1; }
         i = 0;
@@ -381,6 +402,7 @@ pub struct Backend {
         return -1;
     }
     pub def c_type(name: String) -> String {
+        if self.is_optional(name) { return "rl_optional*"; }
         if name.equals("Void") { return "void"; }
         if name.equals("i64") { return "int64_t"; }
         if name.equals("String") { return "rl_string*"; }
@@ -406,8 +428,8 @@ pub struct Backend {
         let args = StringBuilder.new(); args.append(receiver);
         var i = 0;
         while i < values.len() {
-            let value = self.expression(values.get(i));
-            if i < function.params.len() { self.require_type(token, value.type_name, function.params.get(i).type_name); }
+            var value = self.expression(values.get(i));
+            if i < function.params.len() { value = self.coerce(value, function.params.get(i).type_name, token); }
             if i > 0 || !receiver.is_empty() { args.append(", "); }
             args.append(value.code); i = i + 1;
         }
@@ -453,8 +475,7 @@ pub struct Backend {
             if field < 0 { return self.invalid(); }
             if seen.contains(label) { self.fail(token, "duplicate field initializer"); }
             seen.set(label, 1);
-            let value = self.expression(expr.args.get(i));
-            self.require_type(token, value.type_name, declaration.fields.get(field).type_name);
+            let value = self.coerce(self.expression(expr.args.get(i)), declaration.fields.get(field).type_name, token);
             self.output.append_line(result.code + "->rl_m" + field.to_string() + " = " + value.code + ";");
             i = i + 1;
         }
@@ -529,7 +550,7 @@ pub struct Backend {
         let code = StringBuilder.new(); code.append(helper + "(" + receiver);
         var i = 0;
         while i < args.len() {
-            let value = self.expression(args.get(i)); self.require_type(token, value.type_name, expected.get(i));
+            let value = self.coerce(self.expression(args.get(i)), expected.get(i), token);
             code.append(", " + value.code); i = i + 1;
         }
         code.append(")");
@@ -575,13 +596,27 @@ pub struct Backend {
         }
         if args.len() != expected.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
         let values = Vec<Value>.new(); var i = 0;
-        while i < args.len() { let value = self.expression(args.get(i)); self.require_type(token, value.type_name, expected.get(i)); values.push(value); i = i + 1; }
+        while i < args.len() { let value = self.coerce(self.expression(args.get(i)), expected.get(i), token); values.push(value); i = i + 1; }
         if name.equals("len") { return self.value("i32", receiver + "->length"); }
         if name.equals("pop") { return self.unpack(element, "rl_vec_pop(" + receiver + ")"); }
         if name.equals("get") { return self.unpack(element, "rl_vec_get(" + receiver + ", " + values.get(0).code + ")"); }
         if name.equals("push") { return self.value("Void", "rl_vec_push(" + receiver + ", " + self.slot(values.get(0)) + ")"); }
         if name.equals("set") { return self.value("Void", "rl_vec_set(" + receiver + ", " + values.get(0).code + ", " + self.slot(values.get(1)) + ")"); }
         return self.value("Void", "rl_vec_resize(" + receiver + ", " + values.get(0).code + ")");
+    }
+    pub def if_let(statement: Statement) -> Bool {
+        let optional = self.expression(statement.expr);
+        if !self.is_optional(optional.type_name) { self.fail(statement.token, "if let requires an optional value"); return false; }
+        self.output.append_line("if (" + optional.code + " != NULL) {");
+        let inner = self.optional_inner(optional.type_name);
+        let value = self.unpack(inner, optional.code + "->value");
+        let scope = Dict<String, Binding>.with_capacity(8, 1);
+        scope.set(statement.token.text, Binding { code: value.code, type_name: inner, mutable: false });
+        self.scopes.push(scope);
+        let yes = self.block(statement.body, false);
+        self.scopes.pop(); self.output.append_line("} else {");
+        let no = self.block(statement.alternative, true);
+        self.output.append_line("}"); return yes && no;
     }
     pub def for_loop(statement: Statement) -> Bool {
         let object = self.expression(statement.expr);

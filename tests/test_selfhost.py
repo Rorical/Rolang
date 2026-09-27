@@ -877,3 +877,112 @@ def test_vector_c_sanitizers(bootstrap, tmp_path):
         assert result.returncode == 0, result.stdout
         native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
         assert (native.returncode, native.stderr) == (expected, '')
+
+
+OPTIONAL_PROGRAMS = [
+    ('''def choose(flag: Bool) -> i32? { if flag { return 0; } return nil; }
+    def main() -> i32 {
+        var value: i32?;
+        if let x = value { return 1; }
+        value = choose(true);
+        if let x = value { if x != 0 { return 2; } } else { return 3; }
+        value = nil;
+        if let x = value { return 4; }
+        if let x = choose(false) { return 5; } else { return 42; }
+    }''', 42),
+    ('''def read(value: i64?) -> i32 { if let x = value { return x as i32; } else { return 9; } }
+    def main() -> i32 {
+        let flag: Bool? = false;
+        if let x = flag { if x { return 1; } } else { return 2; }
+        let text: String? = "";
+        if let x = text { if !x.is_empty() { return 3; } } else { return 4; }
+        return read(33) + read(nil);
+    }''', 42),
+    ('''struct Box { var value: i32?; }
+    def read(box: Box?) -> i32 {
+        if let b = box { if let v = b.value { return v; } return 3; } return 4;
+    }
+    def main() -> i32 {
+        let box = Box { value: nil };
+        if read(box) != 3 { return 1; }
+        box.value = 42;
+        if read(nil) != 4 { return 2; }
+        return read(box);
+    }''', 42),
+    ('''def main() -> i32 {
+        let values = Vec<i32?>.new(); values.push(nil); values.push(10);
+        values[0] = 20; values.set(1, 22);
+        var total = 0;
+        for value in values { if let x = value { total = total + x; } }
+        values[0] = nil;
+        if let x = values.get(0) { return 1; }
+        if let x = values.pop() { if x != 22 { return 2; } } else { return 3; }
+        return total;
+    }''', 42),
+    ('''def main() -> i32 {
+        let values: Vec<i32>? = Vec<i32>.new();
+        if let v = values { v.push(42); }
+        if let v = values { return v[0]; } else { return 1; }
+    }''', 42),
+    ('''struct Counter { var n: i32; }
+    def next(c: Counter) -> i32? { c.n = c.n + 1; return c.n; }
+    def main() -> i32 {
+        let c = Counter { n: 0 }; let x = 40;
+        if let x = next(c) { if x != 1 { return 1; } }
+        if c.n != 1 { return 2; }
+        return x + 2;
+    }''', 42),
+]
+
+
+@pytest.mark.parametrize('source, expected', OPTIONAL_PROGRAMS[:3] + OPTIONAL_PROGRAMS[4:])
+def test_optional_values_match_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('def main() -> i32 { if let x = 3 { return x; } return 0; }', 'requires an optional'),
+    ('def main() -> i32 { let x: i32? = true; return 0; }', 'expected i32?'),
+    ('def main() -> i32 { let x: i32? = 1; return x; }', 'expected i32'),
+    ('def main() -> i32 { let x: i32? = 1; if let y = x { y = 2; } return 0; }', 'cannot assign'),
+    ('def main() -> i32 { let x: i32? = nil; if let y = x {} return y; }', 'unknown variable'),
+    ('def main() -> i32 { let x: i32? = nil; if let y = x { return y; } }', 'return on every path'),
+    ('def main() -> i32 { let x: Void? = nil; return 0; }', 'supports only'),
+])
+def test_optional_errors_preserve_output(bootstrap, tmp_path, source, diagnostic):
+    output = tmp_path / 'program.c'
+    output.write_text('preserved')
+    result, _, _ = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 1
+    assert diagnostic in result.stdout
+    assert output.read_text() == 'preserved'
+
+
+def test_optional_generated_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in OPTIONAL_PROGRAMS:
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        run = execute_c(output, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert run.returncode == expected
+        assert run.stderr == ''
+
+
+def test_optional_vector_values(bootstrap, tmp_path):
+    # The reference LLVM backend currently fails to compile Vec<i32?> calls.
+    # Exercise the native backend against explicit results until that is fixed.
+    source, expected = OPTIONAL_PROGRAMS[3]
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level)
+        assert (run.returncode, run.stdout, run.stderr) == (expected, '', '')
+
+
+@pytest.mark.parametrize('body', [
+    'let x: i32? = 1; if x == x { return 1; } return 0;',
+    'if nil == nil { return 1; } return 0;',
+])
+def test_optional_comparison_rejected(bootstrap, tmp_path, body):
+    test_optional_errors_preserve_output(
+        bootstrap, tmp_path, 'def main() -> i32 {' + body + '}',
+        'optional comparison unsupported')
