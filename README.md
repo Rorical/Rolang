@@ -456,7 +456,7 @@ three native generations with identical generated C; rebuilt executables also
 pass program, AST JSON, diagnostic, and output-preservation checks.
 
 The native module loader supports module-scoped names, private declarations,
-and public exports through direct imports.
+import aliases, and public re-exports while retaining declaration identity.
 Full module semantics, broader language coverage, and ownership lowering remain unfinished,
 so the existing Python compiler remains primary. Differential and sanitizer tests
 validate the native compiler as the rewrite progresses.

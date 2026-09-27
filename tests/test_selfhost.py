@@ -1373,6 +1373,10 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
         assert result.returncode == 0, result.stdout
         assert execute_c(output, 3).returncode == expected
         assert parse_native(compiler, path).stdout == parse_native(bootstrap, path).stdout
+    modules = tmp_path / 'modules'
+    modules.mkdir()
+    test_native_module_reexport_alias_chains(compiler, modules)
+    test_native_module_std_aliases_and_reexports(compiler, modules)
     # Keep the existing protection against overwriting the input, including symlinks.
     alias = tmp_path / 'source-alias.rl'
     alias.symlink_to(path)
@@ -1446,7 +1450,7 @@ def test_native_file_bytes_sanitizers(bootstrap, tmp_path):
     ('import std.fs\ndef main() -> i32 { fs_open(1, 0); return 0; }', 'expected String'),
     ('import std.fs\ndef main() -> i32 { fs_close(0); return 0; }', 'expected RawPtr'),
     ('import std.io\ndef main() -> i32 { println(1); return 0; }', 'expected String'),
-    ('import std.io as IO\ndef main() -> i32 { return 0; }', 'declaration unsupported'),
+    ('import std.io as IO\ndef main() -> i32 { println("hidden"); return 0; }', 'requires import std.io'),
     ('def main() -> i32 { let p = 0 as RawPtr; return 0; }', 'RawPtr casts require unsafe'),
     ('def main() -> i32 { unsafe { let p = 0 as RawPtr; } let p = 0 as RawPtr; return 0; }', 'RawPtr casts require unsafe'),
     ('unsafe def raw() -> RawPtr { unsafe { return 0 as RawPtr; } } def main() -> i32 { raw(); return 0; }', 'unsafe function call requires unsafe'),
@@ -1512,7 +1516,6 @@ def test_native_modules_merge_and_deduplicate(bootstrap, tmp_path):
     ('pub def value() -> i32 { return ); }', 'import "dep.rl"', 'expected expression'),
     ('/*', 'import "dep.rl"', 'unterminated block comment'),
     ('pub def main() -> i32 { return 1; }', 'import "dep.rl"', 'imported main unsupported'),
-    ('pub def value() -> i32 { return 1; }', 'import "dep.rl" as D', 'aliases unsupported'),
     ('', 'import "missing.rl"', 'cannot open import'),
     ('', 'import ""', 'empty or escaped import paths'),
     ('', r'import "dep\x2erl"', 'empty or escaped import paths'),
@@ -1651,12 +1654,6 @@ def test_native_module_local_shadows_ambiguous_type(bootstrap, tmp_path):
     assert execute_c(output, 3).returncode == 42
 
 
-def test_native_module_reexports_explicitly_rejected(bootstrap, tmp_path):
-    (tmp_path / 'dep.rl').write_text('pub def answer() -> i32 { return 42; }')
-    test_errors_preserve_output(bootstrap, tmp_path,
-        'pub import "dep.rl"\ndef main() -> i32 { return 0; }', 'public re-exports unsupported')
-
-
 def test_native_module_distinct_type_identity(bootstrap, tmp_path):
     (tmp_path / 'a.rl').write_text('''pub struct Item { pub var n: i32; }
     pub def accept(x: Item) -> i32 { return x.n; }''')
@@ -1664,3 +1661,170 @@ def test_native_module_distinct_type_identity(bootstrap, tmp_path):
     pub def create() -> Item { return Item { n: 42 }; }''')
     test_errors_preserve_output(bootstrap, tmp_path,
         'import "a.rl"\nimport "b.rl"\ndef main() -> i32 { return accept(create()); }', 'expected')
+
+
+ALIAS_LIBRARY = '''pub struct Box { pub var n: i32;
+    pub static def new(n: i32) -> Box { return Box { n: n }; }
+    pub def read() -> i32 { return self.n; }
+    static def secret() -> i32 { return 99; }
+}
+pub def answer() -> i32 { return 42; }
+pub def accept(x: Box) -> i32 { return x.read(); }
+def hidden() -> i32 { return 99; }
+struct Hidden { var n: i32; }
+'''
+
+
+def test_native_module_aliases(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
+    (tmp_path / 'other.rl').write_text('pub def answer() -> i32 { return 2; }')
+    source = '''import "lib.rl" as A
+    import "other.rl" as B
+    def optional(x: A.Box?) -> A.Box? { return x; }
+    def main() -> i32 {
+        let boxes: Vec<A.Box?> = Vec<A.Box?>.new();
+        boxes.push(optional(A.Box.new(A.answer())));
+        if let box = boxes[0] { if A.accept(box) != 42 { return 1; } } else { return 2; }
+        let literal = A.Box { n: 40 };
+        return literal.read() + B.answer();
+    }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        assert execute_c(output, level).returncode == 42
+    # LLVM currently conflates equal function names across imported modules.
+    # Compare an equivalent with distinct names, retaining the native collision case.
+    (tmp_path / 'other.rl').write_text('pub def extra() -> i32 { return 2; }')
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source.replace('B.answer()', 'B.extra()'), 42)
+
+
+def test_native_module_reexport_alias_chains(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
+    (tmp_path / 'inner.rl').write_text('pub import "lib.rl" as Leaf')
+    (tmp_path / 'outer.rl').write_text('pub import "inner.rl" as Middle')
+    source = '''import "outer.rl" as API
+    def read(x: API.Middle.Leaf.Box) -> i32 { return x.read(); }
+    def main() -> i32 {
+        let x = API.Middle.Leaf.Box.new(API.Middle.Leaf.answer());
+        let literal: API.Middle.Leaf.Box = API.Middle.Leaf.Box { n: read(x) };
+        return API.Middle.Leaf.accept(literal);
+    }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        assert execute_c(output, level).returncode == 42
+
+
+def test_native_module_reexport_cycles_and_diamonds(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
+    (tmp_path / 'left.rl').write_text('pub import "right.rl"\npub import "lib.rl"')
+    (tmp_path / 'right.rl').write_text('pub import "left.rl"\npub import "lib.rl"')
+    source = '''import "left.rl"
+    import "right.rl"
+    import "lib.rl" as Original
+    def main() -> i32 { let x: Box = Original.Box.new(answer()); return Original.accept(x); }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert execute_c(output, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all')).returncode == 42
+
+
+def test_native_module_alias_shadowing(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY.replace('return 42;', 'return 99;'))
+    source = '''import "lib.rl" as A
+    struct Local { def answer() -> i32 { return 42; } }
+    struct Holder { var Box: Local; }
+    def main() -> i32 {
+        let A = Local {}; if A.answer() != 42 { return 1; }
+        { let A = Holder { Box: Local {} }; return A.Box.answer(); }
+    }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert execute_c(output, 3).returncode == 42
+
+
+def test_native_module_std_aliases_and_reexports(bootstrap, tmp_path):
+    (tmp_path / 'std_api.rl').write_text('''pub import std.process
+    pub import std.path as Paths
+    pub import std.string_builder as Text
+    pub import std.io as Console''')
+    source = '''import "std_api.rl"
+    import "std_api.rl" as API
+    import std.process as Process
+    def main() -> i32 {
+        if Process.argc() != 1 || argc() != 1 || API.argc() != 1 { return 1; }
+        let b: API.Text.StringBuilder = API.Text.StringBuilder.new();
+        b.append(Paths.path_basename("/tmp/file.rl"));
+        if !b.to_string().equals("file.rl") { return 2; }
+        API.Console.print(""); return 42;
+    }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert execute_c(output, 3).returncode == 42
+
+
+@pytest.mark.parametrize('imports, body, diagnostic', [
+    ('import "lib.rl" as A', 'return answer();', 'unknown function'),
+    ('import "lib.rl" as A', 'return A.hidden();', 'unknown variable'),
+    ('import "lib.rl" as A', 'let x: A.Hidden = nil; return 0;', 'declared non-generic structs'),
+    ('import "lib.rl" as A', 'return A.Box.secret();', 'private to its module'),
+    ('import "lib.rl" as A\nimport "other.rl" as A', 'return 0;', 'duplicate import alias'),
+    ('import "private.rl" as API', 'return API.A.answer();', 'unknown variable'),
+    ('import "public.rl" as API', 'return API.hidden();', 'unknown variable'),
+    ('import "left.rl"\nimport "other.rl"', 'return answer();', 'ambiguous imported function'),
+    ('import "left.rl" as API\nimport "other.rl" as API', 'return API.answer();', 'duplicate import alias'),
+    ('import "cycle_a.rl"', 'return absent();', 'unknown function'),
+    ('import "private_std.rl"', 'return argc();', 'requires import std.process'),
+])
+def test_native_module_alias_reexport_errors(bootstrap, tmp_path, imports, body, diagnostic):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
+    (tmp_path / 'other.rl').write_text('pub def answer() -> i32 { return 1; }')
+    (tmp_path / 'private.rl').write_text('import "lib.rl" as A')
+    (tmp_path / 'public.rl').write_text('pub import "lib.rl"')
+    (tmp_path / 'left.rl').write_text('pub import "lib.rl"')
+    (tmp_path / 'cycle_a.rl').write_text('pub import "cycle_b.rl"')
+    (tmp_path / 'cycle_b.rl').write_text('pub import "cycle_a.rl"')
+    (tmp_path / 'private_std.rl').write_text('import std.process')
+    test_errors_preserve_output(bootstrap, tmp_path, imports + '\ndef main() -> i32 {' + body + '}', diagnostic)
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('import "lib.rl" as i32\ndef main() -> i32 { return 0; }', 'built-in type'),
+    ('import "lib.rl" as A\nstruct A {}\ndef main() -> i32 { return 0; }', 'already defined'),
+    ('import "lib.rl" as A\ndef A() -> i32 { return 1; }\ndef main() -> i32 { return 0; }', 'already defined'),
+    ('import "lib.rl" as A\ndef main() -> i32 { let x: Box = nil; return 0; }', 'declared non-generic structs'),
+])
+def test_native_module_alias_conflicts(bootstrap, tmp_path, source, diagnostic):
+    (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
+    test_errors_preserve_output(bootstrap, tmp_path, source, diagnostic)
+
+
+def test_native_module_simple_reexport_matches_reference(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text('pub def answer() -> i32 { return 42; }')
+    (tmp_path / 'api.rl').write_text('pub import "lib.rl" as L')
+    test_bootstrap_matches_reference(bootstrap, tmp_path,
+        'import "api.rl" as API\ndef main() -> i32 { return API.L.answer(); }', 42)
+
+
+def test_native_module_reexport_ambiguity(bootstrap, tmp_path):
+    for name in ('a', 'b'):
+        (tmp_path / f'{name}.rl').write_text(ALIAS_LIBRARY)
+    (tmp_path / 'api.rl').write_text('pub import "a.rl"\npub import "b.rl"')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "api.rl" as API\ndef main() -> i32 { return API.answer(); }', 'ambiguous imported function')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "api.rl" as API\ndef main() -> i32 { let x: API.Box = nil; return 0; }', 'ambiguous imported type')
+
+
+def test_native_module_private_declaration_hides_reexport(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text('pub def answer() -> i32 { return 42; }')
+    (tmp_path / 'api.rl').write_text('pub import "lib.rl"\ndef answer() -> i32 { return 1; }')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "api.rl"\ndef main() -> i32 { return answer(); }', 'unknown function')
+
+
+def test_native_module_alias_resolution_preserves_member_receivers(bootstrap, tmp_path):
+    source = """struct Box { def read() -> i32 { return 42; } }
+    struct Holder { var Box: Box; }
+    def make() -> Holder { return Holder { Box: Box {} }; }
+    def main() -> i32 { return make().Box.read(); }"""
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)

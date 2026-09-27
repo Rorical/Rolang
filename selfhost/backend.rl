@@ -173,8 +173,9 @@ pub struct Backend {
             var name = token.text;
             if !expr.type_name.is_empty() { name = expr.type_name; }
             if name.starts_with("$ambiguous$") { self.fail(token, "ambiguous imported function"); return self.invalid(); }
+            if name.starts_with("$std$") { return self.stdlib_call(token, expr.args, true); }
             if let index = self.functions.get(name) { return self.call(index, expr.args, "", token); }
-            if !self.stdlib_module(token.text).is_empty() { return self.stdlib_call(token, expr.args); }
+            if !self.stdlib_module(token.text).is_empty() { return self.stdlib_call(token, expr.args, false); }
             self.fail(token, "unknown function '" + token.text + "'"); return self.invalid();
         }
         if expr.kind == 9 {
@@ -379,7 +380,7 @@ pub struct Backend {
     pub def validate_subset() -> Void {
         var index = 0;
         for declaration in self.program.declarations {
-            if declaration.kind == 1 && self.builtin_module(declaration.value) && declaration.token.text.equals("import") { index = index + 1; continue; }
+            if declaration.kind == 1 && self.builtin_module(declaration.value) { index = index + 1; continue; }
             if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
@@ -529,9 +530,27 @@ pub struct Backend {
         }
         return self.value(function.return_type, "rl_f" + index.to_string() + "(" + args.to_string() + ")");
     }
+    pub def reference_root(id: i32) -> String {
+        var current = id;
+        while current >= 0 {
+            let node = self.program.expressions.get(current);
+            if node.kind == 3 { return node.token.text; }
+            if node.kind != 9 { return ""; }
+            current = node.left;
+        }
+        return "";
+    }
     pub def method_call(expr: Expression) -> Value {
         let member = self.program.expressions.get(expr.left);
         if member.kind != 9 { self.fail(expr.token, "call target unsupported by C backend"); return self.invalid(); }
+        let root = self.reference_root(expr.left);
+        var shadowed = false;
+        if !root.is_empty() { if let local = self.lookup(root) { shadowed = true; } }
+        if !shadowed && !expr.type_name.is_empty() {
+            if expr.type_name.starts_with("$ambiguous$") { self.fail(expr.token, "ambiguous imported function"); return self.invalid(); }
+            if expr.type_name.starts_with("$std$") { return self.stdlib_call(member.token, expr.args, true); }
+            if let index = self.functions.get(expr.type_name) { return self.call(index, expr.args, "", member.token); }
+        }
         let receiver = self.program.expressions.get(member.left);
         if receiver.kind == 13 {
             self.supported_type(receiver.token, receiver.type_name);
@@ -542,8 +561,8 @@ pub struct Backend {
         var owner = ""; var code = ""; var static_call = false;
         var receiver_type = receiver.token.text;
         if !receiver.type_name.is_empty() { receiver_type = receiver.type_name; }
-        if receiver.kind == 3 && (self.structs.contains(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
-            if let local = self.lookup(receiver.token.text) { static_call = false; }
+        if (receiver.kind == 3 || (receiver.kind == 9 && !receiver.type_name.is_empty())) && (self.structs.contains(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
+            if shadowed { static_call = false; }
             else {
                 if receiver_type.starts_with("$ambiguous$") { self.fail(receiver.token, "ambiguous imported type"); return self.invalid(); }
                 static_call = true; owner = receiver_type;
@@ -726,16 +745,10 @@ pub struct Backend {
         for declaration in self.program.declarations { if declaration.kind == 1 && declaration.value.equals(name) && declaration.token.text.equals("import") && declaration.token.source.equals(source) { return true; } }
         return false;
     }
-    pub def stdlib_module(name: String) -> String {
-        if name.equals("argc") || name.equals("argv") { return "std.process"; }
-        if name.equals("print") || name.equals("println") || name.equals("print_i32") || name.equals("println_i32") || name.equals("println_i64") { return "std.io"; }
-        if name.equals("fs_open") || name.equals("fs_close") || name.equals("fs_read_all") || name.equals("fs_read_line") || name.equals("fs_write_str") || name.equals("fs_flush") || name.equals("fs_seek") || name.equals("fs_tell") || name.equals("fs_eof") { return "std.fs"; }
-        if name.equals("path_join") || name.equals("path_dirname") || name.equals("path_basename") || name.equals("path_extension") || name.equals("path_exists") || name.equals("path_is_dir") || name.equals("path_is_file") || name.equals("path_resolve") { return "std.path"; }
-        return "";
-    }
-    pub def stdlib_call(token: Token, args: Vec<i32>) -> Value {
+    pub def stdlib_module(name: String) -> String { return native_stdlib_module(name); }
+    pub def stdlib_call(token: Token, args: Vec<i32>, resolved: Bool) -> Value {
         let module = self.stdlib_module(token.text); let name = token.text;
-        if !self.has_module(module, token.source) { self.fail(token, name + " requires import " + module); return self.invalid(); }
+        if !resolved && !self.has_module(module, token.source) { self.fail(token, name + " requires import " + module); return self.invalid(); }
         let expected = Vec<String>.new(); var result = "i32"; var helper = "";
         if module.equals("std.process") {
             if name.equals("argc") { helper = "argc"; }

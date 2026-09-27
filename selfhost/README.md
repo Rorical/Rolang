@@ -25,22 +25,31 @@ primary compiler. Native compiler-core and frontend tests remain in place.
 
 ## Native local imports
 
-Unaliased quoted imports are resolved relative to their source file. Shared
+Quoted imports are resolved relative to their source file. Shared
 dependencies, symlink aliases, and cycles are loaded once. Diagnostics carry the
 originating file and position. Compilation refuses to overwrite any loaded source;
 `--parse` remains a single-file syntax operation and does not read imports.
 
 Declarations have module-scoped identities: separate files can define the same
 private functions or structs, and public functions can use private implementation
-types. Unaliased imports expose only the directly imported module's public names.
-Local declarations take precedence; conflicting public imports are diagnosed when
-used. Standard library free-function calls also require their import in the calling
-file. Fields and methods without `pub` are accessible only within their source file.
+types. Imports expose public declarations and explicit public re-exports;
+ordinary transitive imports stay private. Local declarations take precedence over
+unaliased imports; conflicting public names are diagnosed when used. Standard
+library free-function calls require a direct import or public re-export. Fields and methods without `pub` are accessible only within their source file.
 Type resolution preserves identity through nested vectors, dictionaries, optionals,
 parameters, return values, field types, constructors, and static receivers.
 
-Import aliases, public re-exports, escaped import paths, and imported entrypoints
-remain unsupported and are rejected. Import depth is limited to 128. Output path
+`import "library.rl" as L` exposes names as `L.name`, including function calls,
+nested type annotations, struct literals, and static methods. Bare names do not
+leak from aliased imports. `pub import` forwards public names, retaining an optional
+alias; downstream aliases compose (`API.Inner.Box`). Re-export lookup preserves
+original declaration identities through diamonds and terminates on cycles.
+
+Duplicate aliases for different modules, aliases colliding with local declarations
+or built-in types, and access to private exports are rejected. Local variables can
+shadow an alias in expressions. Aliases and re-exports also work for the supported
+standard-library built-ins. Escaped import paths and imported entrypoints remain
+unsupported. Import and re-export traversal depth are limited to 128. Output path
 protection uses canonical paths, not hard-link identity.
 
 ## Build and run
@@ -388,13 +397,13 @@ buffer so later appends/clears do not mutate an existing snapshot; `clear` keeps
 capacity for reuse. Buffer growth checks length and allocation-size overflow.
 Allocations follow the same process-lifetime arena as other native objects.
 
-The unaliased `import std.string_builder` is accepted as a built-in module.
-Local imports use the module subset described above; import aliases remain unsupported.
+`import std.string_builder` is accepted as a built-in module, including aliases
+and public re-exports through the module loader.
 Private builder fields, explicit release, and StringBuilder equality are rejected.
 
 ## Native OS bridge and unsafe operations
 
-Unaliased imports of `std.process`, `std.fs`, `std.io`, and `std.path` select these
+Imports of `std.process`, `std.fs`, `std.io`, and `std.path` select these
 built-in calls:
 
 | Module | Supported calls |
@@ -424,22 +433,25 @@ its body also needs explicit unsafe blocks for pointer casts, matching the prima
 compiler. Casting a stored value to RawPtr means address-of-storage in the existing
 compiler; the native backend rejects that operation until address-of is implemented.
 General memory access, FFI declarations, File wrapper objects, process spawning,
-environment APIs, stdin, directory listing, and import aliases are not lowered yet.
+environment APIs, stdin, and directory listing are not lowered yet.
 
 ## Validation
 
 On Apple Silicon macOS, this milestone passed:
 
-- **212 regression checks passed** in 372.45 seconds across O0/O3 bootstrap
-  builds, covering existing struct behavior, diagnostics, parsing the compiler's
-  own sources, and native frontend/core compilation.
-- **64 focused checks passed** in 89.32 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. These cover module-local
-  identities, direct-import visibility, private member rejection, ambiguity,
-  shadowing, nested type resolution, loader protections, and native self-rebuilds.
+- **116 regression checks passed** in 201.60 seconds across O0/O3 bootstrap
+  builds, covering struct execution and diagnostics, generated-C sanitizers,
+  parsing the compiler's source files, and standard-library I/O.
+- **136 focused checks passed** in 109.56 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These cover module
+  identities, visibility, aliases, re-exports, cycles, ambiguity, shadowing,
+  standard-library calls, source protections, and native self-rebuilds.
+- **4 final checks passed** in 70.26 seconds after fixing computed member receivers:
+  the new member/type-name collision regression and direct project self-rebuilds
+  at both bootstrap optimization levels.
 - Rebuild tests compile the actual CLI through three C generations with identical
-  C output and no Python/tools on the rebuilding executable's PATH. Stage 2 is
-  compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
+  C output and no Python/tools on the rebuilding executable's PATH. Stage 3 also
+  compiles nested aliases and standard-library re-exports. Stage 2 is compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
   Generated file-byte tests also use both sanitizers. `detect_leaks=0` means these
   checks do not validate leaks.
 - The preceding I/O milestone also passed **5 primary-runtime regressions**
@@ -463,5 +475,6 @@ The namespace tests also expose an unresolved limitation in the Python/LLVM
 compiler: two imported modules with private structs named `Cell` can produce
 `Cannot assign Cell to Cell`. The native compiler checks that collision case
 against an explicit expected result at C O0/O3; other module/type cases retain
-differential checks against LLVM. Import aliases and public re-exports remain
-next steps for native module coverage.
+differential checks against LLVM. The reference also conflates some identically
+named functions reached through different import aliases. Native collision tests
+retain explicit expected results; renamed equivalents provide LLVM comparisons.

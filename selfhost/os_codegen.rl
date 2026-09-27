@@ -1,5 +1,13 @@
 import std.string_builder
 
+pub def native_stdlib_module(name: String) -> String {
+    if name.equals("argc") || name.equals("argv") { return "std.process"; }
+    if name.equals("print") || name.equals("println") || name.equals("print_i32") || name.equals("println_i32") || name.equals("println_i64") { return "std.io"; }
+    if name.equals("fs_open") || name.equals("fs_close") || name.equals("fs_read_all") || name.equals("fs_read_line") || name.equals("fs_write_str") || name.equals("fs_flush") || name.equals("fs_seek") || name.equals("fs_tell") || name.equals("fs_eof") { return "std.fs"; }
+    if name.equals("path_join") || name.equals("path_dirname") || name.equals("path_basename") || name.equals("path_extension") || name.equals("path_exists") || name.equals("path_is_dir") || name.equals("path_is_file") || name.equals("path_resolve") { return "std.path"; }
+    return "";
+}
+
 // Minimal standard-library bridge needed by the native compiler CLI.
 pub def emit_os_runtime(output: StringBuilder) -> Void {
     output.append_line("static int32_t rl_argc; static char **rl_argv;");
