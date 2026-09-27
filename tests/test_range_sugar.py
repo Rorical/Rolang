@@ -52,3 +52,14 @@ def test_invalid_ranges_and_destructuring(tmp_path, body):
     path = tmp_path/'main.rl'; path.write_text('def main() -> i32 { '+body+' return 0; }')
     result = compile_source(path, CompileOptions(output_path=tmp_path/'program'))
     assert not result.success
+
+
+@pytest.mark.parametrize('filename', ['range.rl', 'vec.rl', 'dict.rl', 'string.rl'])
+def test_core_named_source_does_not_import_itself(tmp_path, filename):
+    from rolang.driver import CompileOptions, compile_source
+    import subprocess
+    path = tmp_path/filename
+    path.write_text('def main() -> i32 { var sum = 0; for i in 0..<4 { sum = sum + i; } return sum - 6; }')
+    result = compile_source(path, CompileOptions(output_path=tmp_path/'program'))
+    assert result.success, [d.message for d in result.diagnostics.diagnostics]
+    assert subprocess.run([str(result.output_path)], timeout=10).returncode == 0

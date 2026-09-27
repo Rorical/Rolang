@@ -237,7 +237,11 @@ class CompilationDriver:
         implicit = []
         for path in ("vec.rl", "dict.rl", "string.rl", "range.rl"):
             if path not in existing:
-                implicit.append(ast_module.ImportDecl(path=path))
+                # Prelude imports are compiler-selected stdlib dependencies.
+                # A user program named range.rl (or vec.rl) must not import itself.
+                declaration = ast_module.ImportDecl(path=str((self.stdlib_path / path).resolve()))
+                declaration._implicit_core = True
+                implicit.append(declaration)
         if implicit:
             ast_node.items = implicit + list(ast_node.items)
 
@@ -467,7 +471,7 @@ class CompilationDriver:
 
             # Warn on absolute paths in imports. They are almost never
             # what the user actually wants and they are a common copy-paste artefact.
-            if raw_path and Path(raw_path).is_absolute():
+            if raw_path and Path(raw_path).is_absolute() and not getattr(item, "_implicit_core", False):
                 self.context.diagnostics.add_warning(
                     f"Imported absolute path '{raw_path}'; consider a "
                     f"relative path or an -I include root",
