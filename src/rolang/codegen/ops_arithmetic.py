@@ -22,11 +22,17 @@ class OpsArithmeticMixin:
         right = self.emit_operand(op.right)
 
         # Coerce operands to common type
-        left, right = self._coerce_binop_operands(left, right)
-
         left_type = operand_type(op.left)
+        right_type = operand_type(op.right)
+        left_signed = self.type_cache.is_signed_integer(left_type)
+        right_signed = self.type_cache.is_signed_integer(right_type)
+        left, right = self._coerce_binop_operands(
+            left, right, left_signed=left_signed, right_signed=right_signed,
+            target_type=self.type_cache.get_llvm_type(op.result_type),
+        )
+
         is_float = self.type_cache.is_float(left_type)
-        is_signed = self.type_cache.is_signed_integer(left_type)
+        is_signed = self.type_cache.is_signed_integer(op.result_type)
 
         match op.op:
             # Float ops carry the `contract` fast-math flag (and ONLY that
@@ -148,11 +154,16 @@ class OpsArithmeticMixin:
             return result
 
         # Coerce operands to common type
-        left, right = self._coerce_binop_operands(left, right)
-
         left_type = operand_type(op.left)
+        right_type = operand_type(op.right)
+        left_signed = self.type_cache.is_signed_integer(left_type)
+        right_signed = self.type_cache.is_signed_integer(right_type)
+        left, right = self._coerce_binop_operands(
+            left, right, left_signed=left_signed, right_signed=right_signed,
+        )
+
         is_float = self.type_cache.is_float(left_type)
-        is_signed = self.type_cache.is_signed_integer(left_type)
+        is_signed = left_signed or right_signed
 
         if is_float:
             # NaN is unequal to every value, including itself. All other

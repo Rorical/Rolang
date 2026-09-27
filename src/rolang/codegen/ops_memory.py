@@ -420,21 +420,28 @@ class OpsMemoryMixin:
             return self.type_table.is_signed_integer(type_id)
         return True
 
-    def _coerce_binop_operands(self, left: ir.Value, right: ir.Value) -> tuple[ir.Value, ir.Value]:
-        """Coerce binary operation operands to a common type."""
-        if left.type == right.type:
-            return left, right
+    def _coerce_binop_operands(
+        self, left: ir.Value, right: ir.Value, *,
+        left_signed: bool = True, right_signed: bool = True,
+        target_type: ir.Type | None = None,
+    ) -> tuple[ir.Value, ir.Value]:
+        """Widen integers using each source's signedness, never the destination's.
 
-        # Both must be integers for integer coercion
+        Arithmetic supplies the checker-selected result type. Comparisons use
+        the checker's integer promotion rule: a wider signed operand covers an
+        unsigned operand; other mixed pairs promote to i64.
+        """
         if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-            left_bits = left.type.width
-            right_bits = right.type.width
-
-            if left_bits > right_bits:
-                right = self._coerce_int(right, left.type)
-            elif right_bits > left_bits:
-                left = self._coerce_int(left, right.type)
-
+            if target_type is None:
+                width = max(left.type.width, right.type.width)
+                if left_signed != right_signed:
+                    signed_width = left.type.width if left_signed else right.type.width
+                    unsigned_width = right.type.width if left_signed else left.type.width
+                    if signed_width <= unsigned_width:
+                        width = max(width, 64)
+                target_type = ir.IntType(width)
+            left = self._coerce_int(left, target_type, signed=left_signed)
+            right = self._coerce_int(right, target_type, signed=right_signed)
         return left, right
 
     def _store_local(self, local_id: LocalId, value: ir.Value) -> None:
