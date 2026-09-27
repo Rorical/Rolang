@@ -1186,7 +1186,7 @@ class MirExpressionLowerer:
         )
 
         # Generate unique name for the lambda function
-        lambda_name = f"__lambda_{self._b._next_value_id}"
+        lambda_name = f"__lambda_{self._b.func.symbol_id.id}_{self._b.func.name}_{self._b._next_value_id}"
         self._b._next_value_id += 1
 
         # Lower captured values to operands

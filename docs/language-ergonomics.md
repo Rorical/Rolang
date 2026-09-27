@@ -28,3 +28,22 @@ unwraps a `T?` or returns `nil`, evaluating once and running defers.
 
 Completed core validation: 36 targeted checks covering propagation, generic
 ASTs, enum matching, existing switch regressions, and error diagnostics passed.
+
+## Collections and composition
+
+`import std.collections` provides `map_vec`, `filter_vec`, `fold_vec`,
+`find_vec`, `any_vec`, `all_vec`, `slice_vec` and `join_strings`.
+Transforms return new vectors; elements retain normal reference semantics.
+Slices use clamped half-open bounds. `find_vec` returns `T?`; `any_vec` and
+`all_vec` short-circuit (empty inputs return false and true respectively).
+Callbacks must not structurally mutate the traversed vector.
+
+`import std.option` provides `option_map`, `option_and_then` and
+`option_filter` on the existing `T?` type. `std.result` adds `map_err` and
+`and_then` alongside its existing `map` and `unwrap_or` functions.
+
+Callback parameter and return types now participate in generic inference.
+Specialized call signatures preserve optional argument wrapping. Closure names
+include their enclosing function identity, avoiding collisions between functions
+and generic specializations. Collection execution and monomorphization checks:
+39 passed with AddressSanitizer and runtime payload checking enabled.

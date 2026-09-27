@@ -43,3 +43,18 @@ pub def map<T, U, E>(r: Result<T, E>, f: (T) -> U) -> Result<U, E> {
         case .err(let e): return Result<U, E>.err(error: e);
     }
 }
+
+// Transform errors while preserving a successful value.
+pub def map_err<T, E, F>(r: Result<T, E>, transform: (E) -> F) -> Result<T, F> {
+    switch r {
+        case .ok(let value): return Result<T, F>.ok(value: value);
+        case .err(let error): return Result<T, F>.err(error: transform(error));
+    }
+}
+
+pub def and_then<T, U, E>(r: Result<T, E>, transform: (T) -> Result<U, E>) -> Result<U, E> {
+    switch r {
+        case .ok(let value): return transform(value);
+        case .err(let error): return Result<U, E>.err(error: error);
+    }
+}

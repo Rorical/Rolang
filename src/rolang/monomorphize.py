@@ -1264,8 +1264,14 @@ class Monomorphizer:
                     mangled_name,
                 )
                 if isinstance(specialized_callee, HirVar):
+                    call_subst = TypeSubstitution(dict(zip(
+                        self._get_generic_params(call.callee_symbol), type_args)))
+                    signature = self.type_table.make_function(
+                        tuple(self._specialize_type(p.type_id, call_subst) for p in original_func.params),
+                        self._specialize_type(original_func.return_type, call_subst),
+                        original_func.is_async)
                     specialized_callee = HirVar(
-                        type_id=specialized_callee.type_id,
+                        type_id=signature,
                         name=mangled_name,
                         symbol_id=callee_symbol,
                     )
@@ -1574,6 +1580,13 @@ class Monomorphizer:
                     self._unify_for_inference(
                         type_node.value, data.type_args[1], inferred, params
                     )
+
+        elif isinstance(type_node, ast.FunctionType):
+            info = self.type_table.get_type(concrete_type)
+            if info and isinstance(info.data, FunctionTypeData):
+                for node_param, concrete_param in zip(type_node.params, info.data.params):
+                    self._unify_for_inference(node_param, concrete_param, inferred, params)
+                self._unify_for_inference(type_node.return_type, info.data.return_type, inferred, params)
 
         elif isinstance(type_node, ast.OptionalType):
             info = self.type_table.get_type(concrete_type)

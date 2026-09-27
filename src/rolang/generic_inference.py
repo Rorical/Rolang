@@ -132,6 +132,15 @@ class GenericInference:
                     )
             return
 
+        if isinstance(type_node, ast.FunctionType):
+            info = self._c.type_table.get_type(concrete_type)
+            if info and isinstance(info.data, FunctionTypeData):
+                for node_param, concrete_param in zip(type_node.params, info.data.params):
+                    self._infer_type_node_generics(node_param, concrete_param, generic_names, inferred)
+                self._infer_type_node_generics(type_node.return_type, info.data.return_type,
+                                               generic_names, inferred)
+            return
+
         if isinstance(type_node, ast.OptionalType):
             info = self._c.type_table.get_type(concrete_type)
             if info and info.kind == TypeKind.OPTIONAL and isinstance(info.data, OptionalTypeData):
