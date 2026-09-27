@@ -116,7 +116,10 @@ class MirPatternLowerer:
             condition=cond, true_target=payload_bb, false_target=merge_bb))
         self._b.switch_to_block(payload_bb)
         for i, sub_pattern in enumerate(pattern.payload):
-            payload_type = getattr(sub_pattern, "type_id", None)
+            if isinstance(sub_pattern, (HirWildcardPattern, HirBindingPattern)):
+                continue  # Irrefutable payloads require no loads or tests.
+            payload_type = (sub_pattern.enum_type if isinstance(sub_pattern, HirEnumCasePattern)
+                            else getattr(sub_pattern, "type_id", None))
             if payload_type is None or self._b.type_table.is_error(payload_type):
                 payload_type = self._get_enum_payload_type(
                     pattern.enum_type, pattern.case_name, i,
@@ -279,8 +282,11 @@ class MirPatternLowerer:
         """Bind variables in an enum pattern."""
         if isinstance(pattern, HirEnumCasePattern):
             for i, sub_pattern in enumerate(pattern.payload):
+                if isinstance(sub_pattern, HirWildcardPattern):
+                    continue
                 # Extract payload element
-                payload_type = getattr(sub_pattern, "type_id", None)
+                payload_type = (sub_pattern.enum_type if isinstance(sub_pattern, HirEnumCasePattern)
+                                else getattr(sub_pattern, "type_id", None))
                 if payload_type is None or self._b.type_table.is_error(payload_type):
                     payload_type = self._get_enum_payload_type(pattern.enum_type, pattern.case_name, i)
                 if payload_type is not None:
@@ -315,12 +321,22 @@ class MirPatternLowerer:
         if symbol is None or not isinstance(symbol.decl_node, ast.EnumDecl):
             return None
 
+        # Specialized symbols retain the original generic declaration. Resolve
+        # its payload using the recorded concrete arguments, including nested
+        # enum patterns whose HIR node has no type_id attribute.
+        origin = self._b.symbol_table.specialization_origin.get(data.symbol_id)
+        type_args = origin[1] if origin else data.type_args
+        subst = {
+            param.name: arg
+            for param, arg in zip(symbol.decl_node.generic_params, type_args)
+        }
         for member in symbol.decl_node.members:
             if isinstance(member, ast.EnumCaseDecl):
                 for case in member.cases:
                     if case.name == case_name and index < len(case.payload):
                         _, type_node = case.payload[index]
-                        return self._resolve_payload_type(type_node)
+                        payload_type = self._b.type_resolver.resolve_type_node(type_node, subst)
+                        return self._b.member_resolver._monomorphize_nested(payload_type)
 
         return None
 

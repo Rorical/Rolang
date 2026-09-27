@@ -1557,6 +1557,15 @@ class Monomorphizer:
         param_set: Set[str] = set(params)
         inferred: Dict[str, TypeId] = dict(initial or {})
 
+        # Match the checker's contextual inference priority. In particular,
+        # identity(2) in an optional context may have T = i32?, with an
+        # argument conversion inserted later. Inferring T = i32 here would
+        # give the call and the specialized function incompatible ABIs.
+        if return_type is not None and decl.return_type is not None:
+            self._unify_for_inference(
+                decl.return_type, return_type, inferred, param_set
+            )
+
         # Infer from arguments
         for i, (_, arg_expr) in enumerate(arguments):
             if i >= len(decl.params):
@@ -1568,13 +1577,6 @@ class Monomorphizer:
             # Try to unify the parameter type with the argument type
             self._unify_for_inference(
                 param.type_annotation, arg_type, inferred, param_set
-            )
-
-        # Infer from return type if still missing params
-        missing_params = {p for p in params if p not in inferred}
-        if missing_params and return_type is not None and decl.return_type is not None:
-            self._unify_for_inference(
-                decl.return_type, return_type, inferred, param_set
             )
 
         # Build type_args tuple in parameter order

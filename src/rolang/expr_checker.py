@@ -39,6 +39,7 @@ class ExprChecker:
     def __init__(self, checker: "TypeChecker") -> None:
         self._c = checker
         self._spawn_call: Optional[ast.Call] = None
+        self._callee: Optional[ast.Expr] = None
 
     def _infer_with_expected(
         self,
@@ -604,7 +605,12 @@ class ExprChecker:
         if call.callee is None:
             return self._c.type_table.error_type
 
-        callee_type = self._infer_expr(call.callee)
+        previous_callee = self._callee
+        self._callee = call.callee
+        try:
+            callee_type = self._infer_expr(call.callee)
+        finally:
+            self._callee = previous_callee
 
         # Check if it's a function type
         func_data = self._c.type_table.get_function_data(callee_type)
@@ -884,7 +890,9 @@ class ExprChecker:
                         )
                 return self._c.type_table.error_type
 
-        obj_type = self._infer_expr(access.object)
+        # The expected type describes the member, not its receiver. Passing it
+        # into a generic receiver call can specialize that call to a field type.
+        obj_type = self._infer_with_expected(access.object, None)
 
         # Handle auto-deref (no-op in v2)
         actual_type = self._c._auto_deref(obj_type)
@@ -963,6 +971,12 @@ class ExprChecker:
                     kind=CalleeKind.ENUM_CTOR,
                     case_name=access.member,
                 )
+                # A call checks its constructor arguments and context below;
+                # only a bare case value needs to be instantiated here.
+                if access is not self._callee:
+                    return self._check_enum_ctor_args(
+                        actual_type, case_def, [], self._c._expected_type
+                    )
             # This is accessing an enum case - return the enum type
             return actual_type
 
