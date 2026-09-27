@@ -30,7 +30,7 @@ def scan(source: String, names: StringInterner) -> Tokens {
                 if !is_identifier_start(byte) && !(byte >= 48 && byte <= 57) { break; }
                 i = i + 1;
             }
-            let name = source.substring(start, i - start);
+            let name = source[start..<i];
             tokens.push(Token { symbol: names.intern(name), start: start, end: i });
         } else { i = i + 1; }
     }
@@ -48,9 +48,7 @@ def main() -> i32 {
     let report = StringBuilder.new();
     for entry in counts.entries() {
         if let name = names.resolve(entry.key) {
-            report.append(name);
-            report.append(": ");
-            report.append_line(entry.value.to_string());
+            report.append_line(f"{name}: {entry.value}");
         }
         counts.remove(entry.key);
     }

@@ -453,6 +453,8 @@ and [the tiny compiler example](examples/compiler_ergonomics.rl).
 Contextual lambdas, generic aliases, switch expressions, guard bindings, iterator
 chains, tuple destructuring, ranges/slices, raw/multiline strings, and named
 arguments are covered in [the syntax guide](docs/syntax-ergonomics.md).
+The compiler, libraries, examples, and selected benchmark loops now use these
+forms; see [source modernization and validation](docs/source-modernization.md).
 
 ### Self-hosting work
 

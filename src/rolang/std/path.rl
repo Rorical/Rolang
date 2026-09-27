@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: path manipulation
 import "vec.rl"
 import "string.rl"
@@ -43,12 +44,10 @@ pub def dir_list(path: String) -> Vec<String>? {
         if handle as i64 == 0 { return nil; }
         let n = rt_gvec_len(handle);
         var out = Vec<String>.with_capacity(n);
-        var i: i32 = 0;
-        while i < n {
+        for i in 0..<n {
             var entry_handle: RawPtr;
             rt_gvec_get(handle, i, entry_handle as RawPtr);
             out.push(String.from_handle(entry_handle));
-            i = i + 1;
         }
         rt_gvec_free(handle);
         return out;

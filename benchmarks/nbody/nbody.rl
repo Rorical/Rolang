@@ -20,10 +20,8 @@ def math_sqrt_local(x: f64) -> f64 {
         return 0.0;
     }
     var guess: f64 = x;
-    var i: i32 = 0;
-    while i < 20 {
+    for i in 0..<20 {
         guess = (guess + x / guess) * 0.5;
-        i = i + 1;
     }
     return guess;
 }
@@ -43,8 +41,7 @@ def main() -> i32 {
 
     // LCG initialization: seed = 12345
     var lcg: i64 = 12345;
-    var init_i: i32 = 0;
-    while init_i < n {
+    for init_i in 0..<n {
         lcg = lcg_next(lcg);
         px.push(lcg_frac(lcg) * 2.0 - 1.0);
         lcg = lcg_next(lcg);
@@ -59,17 +56,13 @@ def main() -> i32 {
         vz.push(lcg_frac(lcg) * 0.2 - 0.1);
         lcg = lcg_next(lcg);
         mass.push(lcg_frac(lcg) * 0.1 + 0.05);
-        init_i = init_i + 1;
     }
 
     // N-body simulation: steps timesteps
-    var step: i32 = 0;
-    while step < steps {
+    for step in 0..<steps {
         // Compute pairwise forces and update velocities
-        var i: i32 = 0;
-        while i < n {
-            var j: i32 = i + 1;
-            while j < n {
+        for i in 0..<n {
+            for j in i + 1..<n {
                 let dx = px.get(j) - px.get(i);
                 let dy = py.get(j) - py.get(i);
                 let dz = pz.get(j) - pz.get(i);
@@ -87,46 +80,35 @@ def main() -> i32 {
                 vx.set(j, vx.get(j) - fx * mi);
                 vy.set(j, vy.get(j) - fy * mi);
                 vz.set(j, vz.get(j) - fz * mi);
-                j = j + 1;
             }
-            i = i + 1;
         }
         // Update positions
-        var pi: i32 = 0;
-        while pi < n {
+        for pi in 0..<n {
             px.set(pi, px.get(pi) + vx.get(pi) * dt);
             py.set(pi, py.get(pi) + vy.get(pi) * dt);
             pz.set(pi, pz.get(pi) + vz.get(pi) * dt);
-            pi = pi + 1;
         }
-        step = step + 1;
     }
 
     // Compute total kinetic + potential energy
     var energy: f64 = 0.0;
     // Kinetic energy
-    var ei: i32 = 0;
-    while ei < n {
+    for ei in 0..<n {
         let vxi = vx.get(ei);
         let vyi = vy.get(ei);
         let vzi = vz.get(ei);
         let mi = mass.get(ei);
         energy = energy + 0.5 * mi * (vxi*vxi + vyi*vyi + vzi*vzi);
-        ei = ei + 1;
     }
     // Potential energy
-    var pi2: i32 = 0;
-    while pi2 < n {
-        var pj: i32 = pi2 + 1;
-        while pj < n {
+    for pi2 in 0..<n {
+        for pj in pi2 + 1..<n {
             let dx = px.get(pj) - px.get(pi2);
             let dy = py.get(pj) - py.get(pi2);
             let dz = pz.get(pj) - pz.get(pi2);
             let dist = math_sqrt_local(dx*dx + dy*dy + dz*dz + 1e-10);
             energy = energy - mass.get(pi2) * mass.get(pj) / dist;
-            pj = pj + 1;
         }
-        pi2 = pi2 + 1;
     }
 
     // Output as integer (multiply by 1000)

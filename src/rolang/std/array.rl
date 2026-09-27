@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: numeric helpers on Vec<i32>.
 
 import "vec.rl"
@@ -7,10 +8,8 @@ import "vec.rl"
 pub def array_sum(arr: Vec<i32>) -> i32 {
     var total = 0;
     let len = arr.len();
-    var i = 0;
-    while i < len {
+    for i in 0..<len {
         total = total + arr.get(i);
-        i = i + 1;
     }
     return total;
 }
@@ -18,10 +17,8 @@ pub def array_sum(arr: Vec<i32>) -> i32 {
 pub def array_product(arr: Vec<i32>) -> i32 {
     var result = 1;
     let len = arr.len();
-    var i = 0;
-    while i < len {
+    for i in 0..<len {
         result = result * arr.get(i);
-        i = i + 1;
     }
     return result;
 }
@@ -30,20 +27,16 @@ pub def array_product(arr: Vec<i32>) -> i32 {
 
 pub def array_contains(arr: Vec<i32>, value: i32) -> Bool {
     let len = arr.len();
-    var i = 0;
-    while i < len {
+    for i in 0..<len {
         if arr.get(i) == value { return true; }
-        i = i + 1;
     }
     return false;
 }
 
 pub def array_find(arr: Vec<i32>, value: i32) -> i32 {
     let len = arr.len();
-    var i = 0;
-    while i < len {
+    for i in 0..<len {
         if arr.get(i) == value { return i; }
-        i = i + 1;
     }
     return -1;
 }
@@ -51,10 +44,8 @@ pub def array_find(arr: Vec<i32>, value: i32) -> i32 {
 pub def array_count(arr: Vec<i32>, value: i32) -> i32 {
     var count = 0;
     let len = arr.len();
-    var i = 0;
-    while i < len {
+    for i in 0..<len {
         if arr.get(i) == value { count = count + 1; }
-        i = i + 1;
     }
     return count;
 }
@@ -68,11 +59,9 @@ pub def array_min(arr: Vec<i32>) -> i32? {
     let len = arr.len();
     if len <= 0 { return nil; }
     var m = arr.get(0);
-    var i = 1;
-    while i < len {
+    for i in 1..<len {
         let v = arr.get(i);
         if v < m { m = v; }
-        i = i + 1;
     }
     return m;
 }
@@ -81,11 +70,9 @@ pub def array_max(arr: Vec<i32>) -> i32? {
     let len = arr.len();
     if len <= 0 { return nil; }
     var m = arr.get(0);
-    var i = 1;
-    while i < len {
+    for i in 1..<len {
         let v = arr.get(i);
         if v > m { m = v; }
-        i = i + 1;
     }
     return m;
 }

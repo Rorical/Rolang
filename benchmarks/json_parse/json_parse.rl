@@ -89,14 +89,12 @@ struct Parser {
 }
 
 def main() -> i32 {
-    var src = "{\"users\":[{\"id\":1,\"name\":\"Alice\",\"active\":true,\"scores\":[85,92,78]},{\"id\":2,\"name\":\"Bob\",\"active\":false,\"scores\":[91,88,95]},{\"id\":3,\"name\":\"Charlie\",\"active\":true,\"scores\":[76,84,90]}],\"metadata\":{\"version\":2,\"generated\":false,\"tags\":[\"benchmark\",\"json\",\"test\"],\"config\":{\"timeout\":30,\"retries\":3}}}";
+    var src = r"""{"users":[{"id":1,"name":"Alice","active":true,"scores":[85,92,78]},{"id":2,"name":"Bob","active":false,"scores":[91,88,95]},{"id":3,"name":"Charlie","active":true,"scores":[76,84,90]}],"metadata":{"version":2,"generated":false,"tags":["benchmark","json","test"],"config":{"timeout":30,"retries":3}}}""";
     var total: i64 = 0;
     var parser = Parser { src: src, pos: 0 };
-    var iter: i32 = 0;
-    while iter < 100000 {
+    for iter in 0..<100000 {
         parser.pos = 0;
         total = total + parser.parse();
-        iter = iter + 1;
     }
     println_i64(total);
     return 0;

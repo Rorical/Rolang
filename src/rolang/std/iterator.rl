@@ -28,21 +28,21 @@ pub def iter_from<T>(advance: () -> T?) -> Iter<T> {
 
 pub def iter_vec<T>(items: Vec<T>) -> Iter<T> {
     let cursor = items.__iter__();
-    return iter_from({ return cursor.__next__(); });
+    return iter_from({ cursor.__next__() });
 }
 
 struct MapCursor<T, U> {
     var source: Iter<T>;
     var transform: (T) -> U;
     def next() -> U? {
-        if let value = self.source.__next__() { return self.transform(value); }
-        return nil;
+        guard let value = self.source.__next__() else { return nil; }
+        return self.transform(value);
     }
 }
 
 pub def iter_map<T, U>(source: Iter<T>, transform: (T) -> U) -> Iter<U> {
     let cursor = MapCursor<T, U> { source: source, transform: transform };
-    return iter_from({ return cursor.next(); });
+    return iter_from({ cursor.next() });
 }
 
 struct FilterCursor<T> {
@@ -50,9 +50,8 @@ struct FilterCursor<T> {
     var predicate: (T) -> Bool;
     def next() -> T? {
         while true {
-            if let value = self.source.__next__() {
-                if self.predicate(value) { return value; }
-            } else { return nil; }
+            guard let value = self.source.__next__() else { return nil; }
+            if self.predicate(value) { return value; }
         }
         return nil;
     }
@@ -60,7 +59,7 @@ struct FilterCursor<T> {
 
 pub def iter_filter<T>(source: Iter<T>, predicate: (T) -> Bool) -> Iter<T> {
     let cursor = FilterCursor<T> { source: source, predicate: predicate };
-    return iter_from({ return cursor.next(); });
+    return iter_from({ cursor.next() });
 }
 
 struct TakeCursor<T> {
@@ -75,7 +74,7 @@ struct TakeCursor<T> {
 
 pub def iter_take<T>(source: Iter<T>, count: i32) -> Iter<T> {
     let cursor = TakeCursor<T> { source: source, remaining: count };
-    return iter_from({ return cursor.next(); });
+    return iter_from({ cursor.next() });
 }
 
 pub struct Indexed<T> { pub var index: i64; pub var value: T; }
@@ -94,7 +93,7 @@ struct EnumerateCursor<T> {
 
 pub def iter_enumerate<T>(source: Iter<T>) -> Iter<Indexed<T>> {
     let cursor = EnumerateCursor<T> { source: source, index: 0 };
-    return iter_from({ return cursor.next(); });
+    return iter_from({ cursor.next() });
 }
 
 pub struct Zipped<A, B> { pub var first: A; pub var second: B; }
@@ -111,7 +110,7 @@ struct ZipCursor<A, B> {
 // Stops at the shorter input. A final unmatched first item may be consumed.
 pub def iter_zip<A, B>(first: Iter<A>, second: Iter<B>) -> Iter<Zipped<A, B>> {
     let cursor = ZipCursor<A, B> { first: first, second: second };
-    return iter_from({ return cursor.next(); });
+    return iter_from({ cursor.next() });
 }
 
 pub def iter_collect<T>(source: Iter<T>) -> Vec<T> {

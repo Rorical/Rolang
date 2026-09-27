@@ -218,11 +218,9 @@ def print_json(val: JsonValue, indent: i32) -> Void {
                 println("[]");
             } else {
                 println("[");
-                var i: i32 = 0;
-                while i < len {
+                for i in 0..<(len as i32) {
                     print(spaces(indent + 1));
                     print_json(v.get(i), indent + 1);
-                    i = i + 1;
                 }
                 print(spaces(indent));
                 println("]");
@@ -263,7 +261,7 @@ def read_dict_val(d: Dict<String, JsonValue>, key: String) -> JsonValue {
 // ============================================================================
 
 def main() -> i32 {
-    let src = "{\"name\": \"Rolang\", \"version\": 1, \"tags\": [\"compiler\", \"json\"], \"nested\": {\"active\": true, \"count\": 0}}";
+    let src = r"""{"name": "Rolang", "version": 1, "tags": ["compiler", "json"], "nested": {"active": true, "count": 0}}""";
     var p = Parser { src: src, pos: 0 };
     let val = p.parse();
     print_json(val, 0);

@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: mathematical utilities
 //
 // Available as free functions (abs_i32, min_i64, sqrt, sin, cos, ...)
@@ -21,10 +22,8 @@ pub def math_sqrt(x: f64) -> f64 {
         return 0.0;
     }
     var guess: f64 = x;
-    var i: i32 = 0;
-    while i < 20 {
+    for i in 0..<20 {
         guess = (guess + x / guess) * 0.5;
-        i = i + 1;
     }
     return guess;
 }

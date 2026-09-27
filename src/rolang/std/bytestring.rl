@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: pure Rolang byte strings.
 //
 // It stores UTF-8 bytes directly in Vec<u8>. Unicode scalar / grapheme APIs are
@@ -41,10 +42,8 @@ pub struct ByteString {
     pub def equals(other: ByteString) -> Bool {
         let n = self.len();
         if n != other.len() { return false; }
-        var i = 0;
-        while i < n {
+        for i in 0..<n {
             if self.byte_at(i) != other.byte_at(i) { return false; }
-            i = i + 1;
         }
         return true;
     }
@@ -55,13 +54,11 @@ pub struct ByteString {
         var limit = a_len;
         if b_len < limit { limit = b_len; }
 
-        var i = 0;
-        while i < limit {
+        for i in 0..<limit {
             let a = self.byte_at(i) as i32;
             let b = other.byte_at(i) as i32;
             if a < b { return -1; }
             if a > b { return 1; }
-            i = i + 1;
         }
 
         if a_len < b_len { return -1; }
@@ -72,10 +69,8 @@ pub struct ByteString {
     pub def starts_with(prefix: ByteString) -> Bool {
         let n = prefix.len();
         if n > self.len() { return false; }
-        var i = 0;
-        while i < n {
+        for i in 0..<n {
             if self.byte_at(i) != prefix.byte_at(i) { return false; }
-            i = i + 1;
         }
         return true;
     }
@@ -85,10 +80,8 @@ pub struct ByteString {
         let self_len = self.len();
         if n > self_len { return false; }
         let start = self_len - n;
-        var i = 0;
-        while i < n {
+        for i in 0..<n {
             if self.byte_at(start + i) != suffix.byte_at(i) { return false; }
-            i = i + 1;
         }
         return true;
     }
@@ -155,14 +148,10 @@ pub struct ByteString {
     pub def repeat(count: i32) -> ByteString {
         if count <= 0 { return ByteString.new(); }
         var result = ByteString.with_capacity(self.len() * count);
-        var n = 0;
-        while n < count {
-            var i = 0;
-            while i < self.len() {
+        for n in 0..<count {
+            for i in 0..<self.len() {
                 result.push(self.byte_at(i));
-                i = i + 1;
             }
-            n = n + 1;
         }
         return result;
     }

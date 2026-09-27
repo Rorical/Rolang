@@ -1,6 +1,7 @@
 // Eager collection transforms. Inputs are borrowed; outputs own their elements.
 // Callbacks must not structurally mutate the input vector during traversal.
 import "vec.rl"
+import "range.rl"
 import "string.rl"
 import "string_builder.rl"
 
@@ -39,13 +40,7 @@ pub def all_vec<T>(items: Vec<T>, predicate: (T) -> Bool) -> Bool {
 
 // Half-open range, clamped to [0, len]. Returns a new vector, not a view.
 pub def slice_vec<T>(items: Vec<T>, start: i32, end: i32) -> Vec<T> {
-    var first = start;
-    if first < 0 { first = 0; }
-    var last = end;
-    if last > items.len() { last = items.len(); }
-    let out = Vec<T>.new();
-    while first < last { out.push(items.get(first)); first = first + 1; }
-    return out;
+    return items[start..<end];
 }
 
 pub def join_strings(items: Vec<String>, separator: String) -> String {

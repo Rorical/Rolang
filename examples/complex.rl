@@ -98,15 +98,12 @@ struct Complex {
 def mandelbrot(c_re: f64, c_im: f64, max_iter: i32) -> i32 {
     var z = Complex { re: 0.0, im: 0.0 };
     let c = Complex { re: c_re, im: c_im };
-    var i: i32 = 0;
-
-    while i < max_iter {
+    for i in 0..<(max_iter as i32) {
         if z.mag_sq() > 4.0 {
             return i;
         }
         z.__mul__(z);
         z.__add__(c);
-        i = i + 1;
     }
     return max_iter;
 }
