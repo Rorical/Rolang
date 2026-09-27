@@ -447,53 +447,6 @@ class ExprChecker:
                         return t
         return self._c.type_table.void_type
 
-    def _enum_has_case(self, data: EnumTypeData, case_name: str) -> bool:
-        """True if the enum behind `data` declares a case named `case_name`."""
-        symbol = self._c.symbol_table.get_symbol(data.symbol_id)
-        if symbol is None or symbol.decl_node is None:
-            return False
-        from . import ast as ast_module
-        if not isinstance(symbol.decl_node, ast_module.EnumDecl):
-            return False
-        for member in symbol.decl_node.members:
-            if hasattr(member, "cases"):
-                for case in member.cases:
-                    if case.name == case_name:
-                        return True
-        return False
-
-    def _is_result_shaped(self, data: EnumTypeData) -> bool:
-        """A Result-shaped enum has both an `ok` and an `err` case. `try`/`?`
-        rely on this layout (ok=tag 0, err=tag 1) when desugaring to an
-        unwrap-or-return, so treating an arbitrary generic enum as Result
-        would mis-lower the case indices."""
-        return self._enum_has_case(data, "ok") and self._enum_has_case(data, "err")
-
-    def _check_try_error_type(
-        self,
-        operand_enum_data,
-        func_return: TypeId,
-        func_return_info,
-        node,
-        operand_type: TypeId,
-    ) -> None:
-        if not operand_enum_data.type_args or len(operand_enum_data.type_args) < 2:
-            return
-        operand_err = operand_enum_data.type_args[1]
-        func_ret_data = func_return_info.data
-        if isinstance(func_ret_data, EnumTypeData):
-            func_err = (func_ret_data.type_args[1]
-                        if func_ret_data.type_args and len(func_ret_data.type_args) >= 2
-                        else None)
-            if func_err is not None:
-                if not self._c._types_equal(operand_err, func_err) and not self._c.type_table.can_widen_int(operand_err, func_err) and not self._c.type_table.is_error(operand_err):
-                    self._c._error(
-                        TypeErrorKind.TYPE_MISMATCH,
-                        f"Cannot propagate error type "
-                        f"'{self._c.type_table.format_type(operand_err)}' "
-                        f"to '{self._c.type_table.format_type(func_err)}' via 'try'"
-                    )
-
     def _infer_unary_op(self, unop: ast.UnaryOp) -> TypeId:
         """Infer type of a unary operation."""
         if unop.operand is None:
@@ -580,56 +533,7 @@ class ExprChecker:
             return operand_type
 
         elif unop.op == "try":
-            # Prefix ``try expr`` unwraps a ``Result<T, E>`` into ``T``
-            # (or propagates the ``err`` case to the caller, lowered in
-            # the HIR/MIR stage). Type-wise this is identical to the
-            # postfix ``?`` operator.
-            info = self._c.type_table.get_type(operand_type)
-            if info and info.kind == TypeKind.ENUM:
-                data = info.data
-                if isinstance(data, EnumTypeData):
-                    # The current function must also return a compatible
-                    # Result type so the err case can be propagated; we
-                    # only validate the structural shape (ENUM with two
-                    # cases) here because Result lives in stdlib and may
-                    # not be available.
-                    cur = self._c._current_function_return
-                    cur_info = (
-                        self._c.type_table.get_type(cur) if cur is not None else None
-                    )
-                    if cur_info is None or cur_info.kind != TypeKind.ENUM:
-                        self._c._error(
-                            TypeErrorKind.INVALID_OPERATION,
-                            "'try' can only be used in a function that "
-                            "returns a Result type"
-                        )
-                        return self._c.type_table.error_type
-                    if not self._is_result_shaped(data):
-                        self._c._error(
-                            TypeErrorKind.INVALID_OPERATION,
-                            "'try' requires a Result type (an enum with 'ok' "
-                            "and 'err' cases)"
-                        )
-                        return self._c.type_table.error_type
-                    self._check_try_error_type(data, cur, cur_info, unop, operand_type)
-                    if data.type_args:
-                        return data.type_args[0]
-                    # Non-generic Result: look up `ok` payload directly.
-                    symbol = self._c.symbol_table.get_symbol(data.symbol_id)
-                    if symbol and symbol.decl_node:
-                        from . import ast as ast_module
-                        if isinstance(symbol.decl_node, ast_module.EnumDecl):
-                            for member in symbol.decl_node.members:
-                                if hasattr(member, 'cases'):
-                                    for case in member.cases:
-                                        if case.name == "ok" and case.payload:
-                                            _, payload_type = case.payload[0]
-                                            return self._c._resolve_type(payload_type)
-            self._c._error(
-                TypeErrorKind.INVALID_OPERATION,
-                "'try' requires a Result-typed expression"
-            )
-            return self._c.type_table.error_type
+            return self._infer_result_propagation(operand_type, "try", unop)
 
         return self._c.type_table.error_type
 
@@ -1577,60 +1481,42 @@ class ExprChecker:
 
         return self._c.type_table.get_builtin("Bool") or self._c.type_table.error_type
 
+    def _infer_result_propagation(self, operand_type: TypeId, operator: str, node) -> TypeId:
+        info = self._c.type_table.get_type(operand_type)
+        current = self._c.type_table.get_type(self._c._current_function_return) if self._c._current_function_return is not None else None
+        if info and isinstance(info.data, OptionalTypeData):
+            if current is None or not isinstance(current.data, OptionalTypeData):
+                self._c._error(TypeErrorKind.INVALID_OPERATION,
+                              f"'{operator}' on an optional requires an optional return type")
+                return self._c.type_table.error_type
+            node._try_error_type = None
+            return info.data.inner
+        from .type_resolver import result_payloads
+        def payloads(t):
+            return result_payloads(t, self._c.type_table, self._c.symbol_table,
+                                   self._c.type_resolver) if t is not None else None
+        operand = payloads(operand_type)
+        target = payloads(self._c._current_function_return)
+        if operand is None:
+            self._c._error(TypeErrorKind.INVALID_OPERATION,
+                          f"'{operator}' requires a Result type with single-payload 'ok' and 'err' cases")
+            return self._c.type_table.error_type
+        if target is None:
+            self._c._error(TypeErrorKind.INVALID_OPERATION,
+                          f"'{operator}' can only be used in a function that returns a Result type")
+            return self._c.type_table.error_type
+        if not self._c._types_equal(operand['err'], target['err']):
+            self._c._error(TypeErrorKind.TYPE_MISMATCH,
+                          "Cannot propagate error type "
+                          f"'{self._c.type_table.format_type(operand['err'])}' to "
+                          f"'{self._c.type_table.format_type(target['err'])}' via '{operator}'")
+        node._try_error_type = operand['err']
+        return operand['ok']
+
     def _infer_try_expr(self, expr: ast.TryExpr) -> TypeId:
-        """Infer type of a try expression (x?).
-        
-        x? returns T where x is Result<T, E>. The T is the ok-case payload type.
-        """
         if expr.value is None:
             return self._c.type_table.error_type
-            
-        inner_type = self._infer_expr(expr.value)
-        info = self._c.type_table.get_type(inner_type)
-        
-        if info and info.kind == TypeKind.ENUM:
-            data = info.data
-            if isinstance(data, EnumTypeData):
-                cur = self._c._current_function_return
-                cur_info = (
-                    self._c.type_table.get_type(cur) if cur is not None else None
-                )
-                # Postfix `?` propagates the err case via an early return, so —
-                # exactly like prefix `try` — the enclosing function must itself
-                # return a Result-shaped (enum) type. Without this guard `r?`
-                # was accepted inside e.g. an i32-returning function and only
-                # blew up later as invalid LLVM IR.
-                if cur_info is None or cur_info.kind != TypeKind.ENUM:
-                    self._c._error(
-                        TypeErrorKind.INVALID_OPERATION,
-                        "'?' can only be used in a function that returns a "
-                        "Result type"
-                    )
-                    return self._c.type_table.error_type
-                if not self._is_result_shaped(data):
-                    self._c._error(
-                        TypeErrorKind.INVALID_OPERATION,
-                        "'?' requires a Result type (an enum with 'ok' and "
-                        "'err' cases)"
-                    )
-                    return self._c.type_table.error_type
-                if isinstance(cur_info.data, EnumTypeData):
-                    self._check_try_error_type(data, cur, cur_info, expr, inner_type)
-                if data.type_args:
-                    return data.type_args[0]
-                # For non-generic Result, look up the 'ok' case payload
-                symbol = self._c.symbol_table.get_symbol(data.symbol_id)
-                if symbol and symbol.decl_node:
-                    from . import ast as ast_module
-                    if isinstance(symbol.decl_node, ast_module.EnumDecl):
-                        for member in symbol.decl_node.members:
-                            if hasattr(member, 'cases'):
-                                for case in member.cases:
-                                    if case.name == "ok" and case.payload:
-                                        _, payload_type = case.payload[0]
-                                        return self._c._resolve_type(payload_type)
-        
-        return self._c.type_table.error_type
+        return self._infer_result_propagation(self._infer_expr(expr.value), "?", expr)
 
     def _infer_size_of_expr(self, expr: ast.SizeOfExpr) -> TypeId:
         """Infer type of size_of(T) — always i32."""

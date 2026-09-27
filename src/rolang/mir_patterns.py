@@ -14,7 +14,7 @@ from .mir import (
     Operand, CopyOperand, ConstantOperand, ConstantKind, Place,
     CmpOp, CmpOpKind, BinOp, BinOpKind,
     ExtractField, ExtractEnumPayload, GetTag,
-    Assign,
+    Assign, Branch, CondBranch,
 )
 from .types import TypeId, TypeKind, StructTypeData, EnumTypeData
 
@@ -103,14 +103,18 @@ class MirPatternLowerer:
             base=cmp_local, projections=[], type_id=bool_type,
         ))
 
-        # Refine the test using any refutable sub-patterns inside the
-        # payload. For example ``.some(.ok(let x))`` needs the tag-of-tag
-        # check on the inner payload. Sub-pattern extraction can only run
-        # legally when the outer tag has already matched, but since the
-        # extracted operands are pure loads it is safe to compute them
-        # unconditionally and then AND the conditions together — the
-        # surrounding switch will only branch into the body when the
-        # final boolean is true.
+        # Never load a payload from an inactive variant: managed payloads may
+        # be null or unrelated pointers, and nested tests dereference them.
+        if not pattern.payload:
+            return cond
+        result = self._b.create_temp(bool_type)
+        place = Place(base=result, projections=[], type_id=bool_type)
+        self._b.emit_op(Assign(place=place, value=cond))
+        payload_bb = self._b.create_block()
+        merge_bb = self._b.create_block()
+        self._b.emit_terminator(CondBranch(
+            condition=cond, true_target=payload_bb, false_target=merge_bb))
+        self._b.switch_to_block(payload_bb)
         for i, sub_pattern in enumerate(pattern.payload):
             payload_type = getattr(sub_pattern, "type_id", None)
             if payload_type is None or self._b.type_table.is_error(payload_type):
@@ -136,7 +140,10 @@ class MirPatternLowerer:
             if sub_cond is not None:
                 cond = self._and(cond, sub_cond)
 
-        return cond
+        self._b.emit_op(Assign(place=place, value=cond))
+        self._b.emit_terminator(Branch(target=merge_bb))
+        self._b.switch_to_block(merge_bb)
+        return CopyOperand(place)
 
     def _lower_or_pattern(
         self, scrutinee: Operand, pattern: HirOrPattern

@@ -410,6 +410,7 @@ class HirTryExpr(HirExpr):
     """Try expression: expr? - propagates error via early return."""
     expr: HirExpr
     result_type: TypeId  # T from Result<T, E>
+    error_type: Optional[TypeId]  # None for optional propagation; E otherwise; preserved through generic specialization
 
 @dataclass
 class HirCast(HirExpr):

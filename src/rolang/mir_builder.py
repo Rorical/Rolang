@@ -1049,83 +1049,8 @@ class MirFunctionBuilder:
         merge_bb: BlockId,
     ) -> None:
         """Lower a switch on an enum type."""
-        # Get discriminant
-        tag_type = self._i32_type()
-        tag_local = self.create_temp(tag_type)
-        self.emit_op(GetTag(result=tag_local, enum_val=scrutinee))
-        tag_operand = CopyOperand(Place(base=tag_local, projections=[], type_id=tag_type))
-
-        # Build case blocks and switch cases
-        case_blocks: List[Tuple[int, BlockId, HirSwitchCase]] = []
-        default_block: Optional[BlockId] = None
-        default_case: Optional[HirSwitchCase] = None
-
-        seen_tags: Set[int] = set()
-        for case in cases:
-            if case.is_default:
-                default_block = self.create_block()
-                default_case = case
-            else:
-                case_bb = self.create_block()
-                # Collect every tag this case can match, expanding or-patterns
-                # (`.a | .b`) so each alternative gets its own switch arm
-                # pointing at the shared case block. Without this, an
-                # or-pattern (a single HirOrPattern) yields no tag and the
-                # case block is left orphaned and unterminated.
-                case_tags: List[int] = []
-                for pattern, guard in case.patterns:
-                    case_tags.extend(self._collect_pattern_tags(pattern))
-                for tag in case_tags:
-                    if tag in seen_tags:
-                        continue  # avoid duplicate SwitchInt keys
-                    seen_tags.add(tag)
-                    case_blocks.append((tag, case_bb, case))
-
-        if default_block is None:
-            default_block = merge_bb
-
-        # Emit switch
-        switch_cases = [(tag, bb) for tag, bb, _ in case_blocks]
-        self.emit_terminator(SwitchInt(
-            value=tag_operand,
-            cases=switch_cases,
-            default=default_block,
-        ))
-
-        # Lower each case block
-        seen_blocks: Set[BlockId] = set()
-        for tag, case_bb, case in case_blocks:
-            if case_bb in seen_blocks:
-                continue
-            seen_blocks.add(case_bb)
-
-            self.switch_to_block(case_bb)
-
-            # Bind pattern variables
-            for pattern, guard in case.patterns:
-                self._bind_enum_pattern(pattern, scrutinee)
-                if guard is not None:
-                    # Handle guard
-                    guard_val = self.expr_lowerer.lower_expr(guard)
-                    guard_continue = self.create_block()
-                    self.emit_terminator(CondBranch(
-                        condition=guard_val,
-                        true_target=guard_continue,
-                        false_target=default_block,
-                    ))
-                    self.switch_to_block(guard_continue)
-                break  # Only bind first pattern
-
-            self.lower_block(case.body)
-            if not self.is_terminated():
-                self.emit_terminator(Branch(target=merge_bb))
-
-        # Default case
-        if default_case is not None:
-            self.switch_to_block(default_block)
-            self.lower_block(default_case.body)
-            if not self.is_terminated():
-                self.emit_terminator(Branch(target=merge_bb))
+        # Ordered tests preserve guarded and repeated cases and payload patterns.
+        self._lower_value_switch(scrutinee, cases, merge_bb)
 
     def _lower_optional_switch(
         self,
@@ -1258,60 +1183,32 @@ class MirFunctionBuilder:
         merge_bb: BlockId,
     ) -> None:
         """Lower a switch on a value type (int, string, etc.)."""
-        # Create chain of if-else comparisons
         for case in cases:
             if case.is_default:
                 self.lower_block(case.body)
                 if not self.is_terminated():
                     self.emit_terminator(Branch(target=merge_bb))
                 return
-
             for pattern, guard in case.patterns:
-                # Compare scrutinee to pattern value
-                match_bb = self.create_block()
                 next_bb = self.create_block()
-
                 cond = self._lower_pattern_match(scrutinee, pattern)
                 if cond is not None:
-                    if guard is not None:
-                        # Check pattern first, then guard
-                        pattern_match_bb = self.create_block()
-                        self.emit_terminator(CondBranch(
-                            condition=cond,
-                            true_target=pattern_match_bb,
-                            false_target=next_bb,
-                        ))
-                        self.switch_to_block(pattern_match_bb)
-                        guard_val = self.expr_lowerer.lower_expr(guard)
-                        self.emit_terminator(CondBranch(
-                            condition=guard_val,
-                            true_target=match_bb,
-                            false_target=next_bb,
-                        ))
-                    else:
-                        self.emit_terminator(CondBranch(
-                            condition=cond,
-                            true_target=match_bb,
-                            false_target=next_bb,
-                        ))
-
-                    # Match block
-                    self.switch_to_block(match_bb)
-                    self.bind_pattern(pattern, scrutinee)
-                    self.lower_block(case.body)
-                    if not self.is_terminated():
-                        self.emit_terminator(Branch(target=merge_bb))
-
-                    self.switch_to_block(next_bb)
-                else:
-                    # Wildcard or binding pattern - always matches
-                    self.bind_pattern(pattern, scrutinee)
-                    self.lower_block(case.body)
-                    if not self.is_terminated():
-                        self.emit_terminator(Branch(target=merge_bb))
-                    return
-
-        # If no case matched, fall through to merge
+                    matched = self.create_block()
+                    self.emit_terminator(CondBranch(
+                        condition=cond, true_target=matched, false_target=next_bb))
+                    self.switch_to_block(matched)
+                # Guards may reference the bindings of the matched pattern.
+                self.bind_pattern(pattern, scrutinee)
+                if guard is not None:
+                    body_bb = self.create_block()
+                    guard_val = self.expr_lowerer.lower_expr(guard)
+                    self.emit_terminator(CondBranch(
+                        condition=guard_val, true_target=body_bb, false_target=next_bb))
+                    self.switch_to_block(body_bb)
+                self.lower_block(case.body)
+                if not self.is_terminated():
+                    self.emit_terminator(Branch(target=merge_bb))
+                self.switch_to_block(next_bb)
         if not self.is_terminated():
             self.emit_terminator(Branch(target=merge_bb))
 

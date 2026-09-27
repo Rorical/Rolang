@@ -1150,6 +1150,7 @@ class Monomorphizer:
                 type_id=new_type,
                 expr=self._specialize_expr(expr.expr, subst),
                 result_type=new_type,
+                error_type=self._specialize_type(expr.error_type, subst) if expr.error_type is not None else None,
             )
 
         if isinstance(expr, HirOptionalSome):

@@ -826,30 +826,8 @@ class HirBuilder:
         # node used for postfix ``expr?``: unwrap the ``ok`` payload of a
         # ``Result<T, E>`` or propagate the ``err`` to the caller.
         if unop.op == "try":
-            inner_type = operand.type_id
-            inner_t = self.type_table.error_type
-            info = self.type_table.get_type(inner_type)
-            if info and info.kind == TypeKind.ENUM:
-                from .types import EnumTypeData
-                if isinstance(info.data, EnumTypeData):
-                    if info.data.type_args and len(info.data.type_args) > 0:
-                        inner_t = info.data.type_args[0]
-                    else:
-                        # Non-generic Result, look up payload type of `ok`.
-                        symbol = self.symbol_table.get_symbol(info.data.symbol_id)
-                        if symbol and symbol.decl_node:
-                            for member in symbol.decl_node.members:
-                                if hasattr(member, 'cases'):
-                                    for case in member.cases:
-                                        if case.name == "ok" and case.payload:
-                                            _, payload_type = case.payload[0]
-                                            inner_t = self._resolve_type_node(payload_type)
-                                            break
-            return HirTryExpr(
-                type_id=inner_t,
-                expr=operand,
-                result_type=inner_t,
-            )
+            return HirTryExpr(type_id=type_id, expr=operand, result_type=type_id,
+                              error_type=unop._try_error_type)
 
         return HirUnaryOp(
             type_id=type_id,
@@ -1249,34 +1227,9 @@ class HirBuilder:
     def _build_try_expr(self, expr: ast.TryExpr) -> HirTryExpr:
         """Build an HIR try expression (x? operator)."""
         inner = self._build_expr(expr.value) if expr.value else self._error_expr()
-        inner_type = inner.type_id
-
-        # Extract T from Result<T, E> (the 'ok' case payload type)
-        inner_t = self.type_table.error_type
-        info = self.type_table.get_type(inner_type)
-        if info and info.kind == TypeKind.ENUM:
-            from .types import EnumTypeData
-            if isinstance(info.data, EnumTypeData):
-                # Try type_args first (for generic Result<T,E>)
-                if info.data.type_args and len(info.data.type_args) > 0:
-                    inner_t = info.data.type_args[0]
-                else:
-                    # For non-generic Result, look up the 'ok' case payload
-                    symbol = self.symbol_table.get_symbol(info.data.symbol_id)
-                    if symbol and symbol.decl_node:
-                        for member in symbol.decl_node.members:
-                            if hasattr(member, 'cases'):
-                                for case in member.cases:
-                                    if case.name == "ok" and case.payload:
-                                        _, payload_type = case.payload[0]
-                                        inner_t = self._resolve_type_node(payload_type)
-                                        break
-
-        return HirTryExpr(
-            type_id=inner_t,
-            expr=inner,
-            result_type=inner_t,
-        )
+        result_type = self._get_expr_type(expr)
+        return HirTryExpr(type_id=result_type, expr=inner, result_type=result_type,
+                          error_type=expr._try_error_type)
 
     def _build_size_of_expr(self, expr: ast.SizeOfExpr) -> HirLiteral:
         """Build an HIR literal for size_of(T)."""

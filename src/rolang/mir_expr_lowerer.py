@@ -1024,19 +1024,19 @@ class MirExpressionLowerer:
         # Allocate result local EARLY so it's available in all blocks
         result_local = self._b.create_temp(expr.result_type, "__try_ok")
         
-        # Get discriminant tag (0 = ok, 1+ = err)
+        # Branch using the declared ok tag, independent of case order.
         tag_type = self._b._i32_type()
         tag_local = self._b.create_temp(tag_type)
         self._b.emit_op(GetTag(result=tag_local, enum_val=scrutinee))
         
-        # Compare tag == 0
+        # Compare the discriminant with the ok tag.
         bool_type = self._b._bool_type()
         is_ok_local = self._b.create_temp(bool_type)
         self._b.emit_op(CmpOp(
             result=is_ok_local,
             op=CmpOpKind.EQ,
             left=CopyOperand(Place(base=tag_local, projections=[], type_id=tag_type)),
-            right=ConstantOperand(ConstantKind.INT, 0, tag_type),
+            right=ConstantOperand(ConstantKind.INT, (1 if expr.error_type is None else self._b._get_enum_case_tag(expr.expr.type_id, "ok")), tag_type),
         ))
         
         ok_bb = self._b.create_block()
@@ -1049,17 +1049,32 @@ class MirExpressionLowerer:
             false_target=err_bb,
         ))
         
-        # Error block: return the entire scrutinee (which is the error value)
+        # Reconstruct err in the enclosing return type; its ok layout may differ.
         self._b.switch_to_block(err_bb)
+        return_type = self._b.func.return_type
+        return_local = self._b.create_temp(return_type)
+        if expr.error_type is None:
+            self._b.emit_op(MakeNone(result=return_local, result_type=return_type))
+        else:
+            error_type = expr.error_type
+            error_local = self._b.create_temp(error_type)
+            self._b.emit_op(ExtractEnumPayload(
+                result=error_local, enum_val=scrutinee, case_name="err",
+                payload_index=0, result_type=error_type))
+            self._b.emit_op(MakeEnum(
+                result=return_local, enum_type=return_type, case_name="err",
+                tag=self._b._get_enum_case_tag(return_type, "err"),
+                payload=[CopyOperand(Place(base=error_local, projections=[], type_id=error_type))]))
         self._b.emit_defers()
-        self._b.emit_terminator(Return(value=scrutinee))
+        self._b.emit_terminator(Return(value=CopyOperand(
+            Place(base=return_local, projections=[], type_id=return_type))))
         
         # Success block: extract payload from 'ok' case, store in result_local
         self._b.switch_to_block(ok_bb)
         self._b.emit_op(ExtractEnumPayload(
             result=result_local,
             enum_val=scrutinee,
-            case_name="ok",
+            case_name="Some" if expr.error_type is None else "ok",
             payload_index=0,
             result_type=expr.result_type,
         ))

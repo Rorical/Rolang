@@ -300,3 +300,24 @@ class TypeResolver:
     ) -> None:
         if self.error_reporter is not None:
             self.error_reporter(kind, message, node)
+
+
+def result_payloads(type_id, type_table, symbol_table, resolver):
+    """Resolve a two-case Result's payloads, independent of case/type parameter order."""
+    from .types import EnumTypeData
+    info = type_table.get_type(type_id)
+    if info is None or not isinstance(info.data, EnumTypeData):
+        return None
+    data = info.data
+    symbol = symbol_table.get_symbol(data.symbol_id)
+    if symbol is None or not isinstance(symbol.decl_node, ast.EnumDecl):
+        return None
+    decl = symbol.decl_node
+    cases = [case for member in decl.members if isinstance(member, ast.EnumCaseDecl)
+             for case in member.cases]
+    if len(cases) != 2 or {case.name for case in cases} != {"ok", "err"}:
+        return None
+    if any(len(case.payload) != 1 for case in cases):
+        return None
+    subst = {param.name: arg for param, arg in zip(decl.generic_params, data.type_args)}
+    return {case.name: resolver.resolve(case.payload[0][1], subst) for case in cases}
