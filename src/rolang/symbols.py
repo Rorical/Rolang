@@ -248,7 +248,7 @@ class SymbolTable:
         # Populate O(1) lookup indices.
         if decl_node is not None:
             self.node_to_symbol[id(decl_node)] = symbol_id
-        if kind in (SymbolKind.STRUCT, SymbolKind.ENUM, SymbolKind.PROTOCOL, SymbolKind.BUILTIN_TYPE, SymbolKind.GENERIC_PARAM):
+        if kind in (SymbolKind.STRUCT, SymbolKind.ENUM, SymbolKind.PROTOCOL, SymbolKind.BUILTIN_TYPE, SymbolKind.GENERIC_PARAM, SymbolKind.TYPE_ALIAS):
             self._type_index[name] = symbol_id
 
         return symbol

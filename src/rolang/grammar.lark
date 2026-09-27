@@ -35,7 +35,7 @@ module_path: IDENT ("." IDENT)*
 //   * `static def __gc_trace__(payload, cb, ctx) -> Void`  — GC trace hook
 // They are normal methods syntactically; the compiler picks them up by
 // name during codegen and installs them in the type descriptor.
-type_alias_decl: [visibility] "typealias" IDENT "=" type _TERM
+type_alias_decl: [visibility] "typealias" IDENT [generic_params] "=" type _TERM
 
 struct_decl: [visibility] "struct" IDENT [generic_params] [type_constraints] "{" struct_member* "}"
 struct_member: property_decl
@@ -301,7 +301,7 @@ primary_expr: interpolated_string
             | "[" [expr_list] "]" -> array_literal
             | "[" ":" "]" -> empty_dict_literal
             | "[" dict_entry ("," dict_entry)* "]" -> dict_literal
-            | "{" [lambda_params "in"] stmt* "}" -> lambda_expr
+            | "{" [lambda_params "in"] stmt* [trailing_expr] "}" -> lambda_expr
 
 type_member_expr: generic_type_name "." IDENT
 

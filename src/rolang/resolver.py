@@ -650,8 +650,14 @@ class NameResolver:
 
     def _resolve_type_alias(self, alias: ast.TypeAliasDecl) -> None:
         """Resolve a type alias declaration."""
+        self._push_scope(ScopeKind.TYPE)
+        for param in alias.generic_params:
+            self._define_type(param.name, SymbolKind.GENERIC_PARAM, node=param)
+            for bound in param.bounds or []:
+                self._resolve_type(bound)
         if alias.aliased_type:
             self._resolve_type(alias.aliased_type)
+        self._pop_scope()
 
     def _resolve_extension(self, ext: ast.ExtensionDecl) -> None:
         """Resolve an extension declaration."""

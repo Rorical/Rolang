@@ -547,6 +547,24 @@ class TypeTable:
             return False
         return data.primitive == PrimitiveType.BOOL
 
+    def has_type_variables(self, type_id: TypeId) -> bool:
+        info = self.get_type(type_id)
+        if info is None:
+            return False
+        data = info.data
+        if info.kind == TypeKind.TYPE_VARIABLE:
+            return True
+        if isinstance(data, (StructTypeData, EnumTypeData)):
+            args = list(data.type_args)
+            if isinstance(data, StructTypeData):
+                args.extend(t for _, t in (data.anon_fields or ()))
+            return any(self.has_type_variables(t) for t in args)
+        if isinstance(data, OptionalTypeData):
+            return self.has_type_variables(data.inner)
+        if isinstance(data, FunctionTypeData):
+            return any(self.has_type_variables(t) for t in (*data.params, data.return_type))
+        return False
+
     def is_string(self, type_id: TypeId) -> bool:
         """Check if a type is String."""
         info = self.get_type(type_id)

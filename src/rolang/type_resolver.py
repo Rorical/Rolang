@@ -193,8 +193,11 @@ class TypeResolver:
         type_args = tuple(self.resolve(arg, subst) for arg in named.generic_args)
 
         if symbol.kind == SymbolKind.TYPE_ALIAS:
-            if named.generic_args:
-                self._error("GENERIC_ARG_COUNT", f"Type alias '{symbol.name}' does not accept generic arguments", named)
+            params = symbol.decl_node.generic_params
+            if len(type_args) != len(params):
+                message = (f"Type alias '{symbol.name}' expects {len(params)} generic argument(s), got {len(type_args)}"
+                           if params else f"Type alias '{symbol.name}' does not accept generic arguments")
+                self._error("GENERIC_ARG_COUNT", message, named)
                 return self.type_table.error_type
             if symbol_id in self._resolving_aliases:
                 self._error("NOT_A_TYPE", f"Cyclic type alias '{symbol.name}'", named)
@@ -203,7 +206,7 @@ class TypeResolver:
             try:
                 # Resolve in the declaration's scope using its bound AST nodes;
                 # call-site generic substitutions must not capture alias names.
-                return self.resolve(symbol.decl_node.aliased_type)
+                return self.resolve(symbol.decl_node.aliased_type, dict(zip((p.name for p in params), type_args)))
             finally:
                 self._resolving_aliases.remove(symbol_id)
 

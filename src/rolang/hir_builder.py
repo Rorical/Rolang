@@ -1136,10 +1136,9 @@ class HirBuilder:
         type_id = self._get_expr_type(lam)
 
         params: List[HirParam] = []
-        for pattern, type_ann in lam.params:
-            param_type = self.type_table.error_type
-            if type_ann:
-                param_type = self._resolve_type_node(type_ann)
+        signature = self.type_table.get_function_data(type_id)
+        for index, (pattern, type_ann) in enumerate(lam.params):
+            param_type = signature.params[index] if signature and index < len(signature.params) else self.type_table.error_type
 
             name = "__param"
             if isinstance(pattern, ast.IdentifierPattern):

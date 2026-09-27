@@ -61,26 +61,22 @@ class GenericInference:
         inferred: Dict[str, TypeId] = {}
         generic_names = {param.name for param in decl.generic_params}
 
-        for i, arg in enumerate(call.arguments):
-            if i >= len(decl.params) or arg.value is None:
-                break
-            arg_type = self._c.expr_types.get(id(arg.value))
-            if arg_type is None:
-                arg_type = self._c._infer_expr(arg.value)
-            self._infer_type_node_generics(
-                decl.params[i].type_annotation,
-                arg_type,
-                generic_names,
-                inferred,
-            )
-
+        # Infer ordinary arguments first, then provide their types to callbacks.
+        # This also handles a callback preceding the collection argument.
         if expected_type is not None and decl.return_type is not None:
-            self._infer_type_node_generics(
-                decl.return_type,
-                expected_type,
-                generic_names,
-                inferred,
-            )
+            self._infer_type_node_generics(decl.return_type, expected_type, generic_names, inferred)
+        ordered = sorted(enumerate(call.arguments), key=lambda pair: isinstance(pair[1].value, ast.Lambda))
+        for i, arg in ordered:
+            if i >= len(decl.params) or arg.value is None:
+                continue
+            if isinstance(arg.value, ast.Lambda):
+                context = self._c.type_resolver.resolve(decl.params[i].type_annotation, inferred)
+                arg_type = self._c._infer_with_expected(arg.value, context)
+            else:
+                arg_type = self._c.expr_types.get(id(arg.value))
+                if arg_type is None:
+                    arg_type = self._c._infer_with_expected(arg.value, None)
+            self._infer_type_node_generics(decl.params[i].type_annotation, arg_type, generic_names, inferred)
 
         return inferred
 

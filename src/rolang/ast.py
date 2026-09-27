@@ -630,6 +630,7 @@ class ExtensionDecl(TopLevelItem):
 
 @dataclass
 class TypeAliasDecl(TopLevelItem):
-    """Type alias declaration."""
+    """Transparent, optionally generic type alias."""
     name: str = ""
     aliased_type: Optional[Type] = None
+    generic_params: list[GenericParam] = field(default_factory=list)

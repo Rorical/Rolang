@@ -249,14 +249,17 @@ class RoLangTransformer(Transformer):
         visibility = "internal"
         name = ""
         target = None
+        generics = []
         for item in items:
             if isinstance(item, str) and item in {"pub", "private", "internal"}:
                 visibility = item
             elif isinstance(item, Token):
                 name = str(item)
+            elif isinstance(item, list):
+                generics = item
             elif isinstance(item, ast.Type):
                 target = item
-        return ast.TypeAliasDecl(name=name, aliased_type=target, visibility=visibility)
+        return ast.TypeAliasDecl(name=name, aliased_type=target, visibility=visibility, generic_params=generics)
 
     def struct_decl(self, items: list) -> ast.StructDecl:
         visibility = "internal"
@@ -1127,6 +1130,8 @@ class RoLangTransformer(Transformer):
                 params = item
             elif isinstance(item, ast.Stmt):
                 body.append(item)
+            elif isinstance(item, ast.Expr):
+                body.append(ast.ReturnStmt(value=item, implicit=True))
         return ast.Lambda(params=params, body=body)
 
     def lambda_params(self, items: list) -> list[tuple]:

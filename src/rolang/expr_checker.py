@@ -1114,19 +1114,29 @@ class ExprChecker:
         `unsafe extern` / `RawPtr` operations inside a lambda must use
         their own `unsafe { }` block, scoped to the closure body.
         """
+        context = self._c.type_table.get_function_data(self._c._expected_type) if self._c._expected_type is not None else None
         param_types: List[TypeId] = []
-
-        for pattern, type_ann in lam.params:
+        for index, (pattern, type_ann) in enumerate(lam.params):
             if type_ann:
                 param_type = self._c._resolve_type(type_ann)
+            elif context and index < len(context.params):
+                param_type = context.params[index]
             else:
-                param_type = self._c.type_table.make_type_variable("lambda_param")
+                self._c._error(TypeErrorKind.TYPE_MISMATCH,
+                              "Cannot infer lambda parameter type; add an annotation or a function type context", node=pattern)
+                param_type = self._c.type_table.error_type
             param_types.append(param_type)
             self._c._bind_pattern_type(pattern, param_type)
 
-        # Save and clear current function return type for lambda body.
         old_return_type = self._c._current_function_return
-        self._c._current_function_return = None  # Lambdas infer their return type
+        old_expected = self._c._expected_type
+        # A generic callback result is inferred from the body. Concrete result
+        # contexts permit optional lifting, contextual literals and propagation.
+        expected_return = context.return_type if context else None
+        if expected_return is not None and self._c.type_table.has_type_variables(expected_return):
+            expected_return = None
+        self._c._current_function_return = expected_return
+        self._c._expected_type = None
         # Force the lambda body to type-check as safe even if the lambda
         # literal appears inside an `unsafe { ... }` block.
         old_in_unsafe = self._c._in_unsafe
@@ -1142,7 +1152,8 @@ class ExprChecker:
         return_type = self._c.type_table.void_type
         for stmt in lam.body:
             self._c._check_stmt(stmt)
-        return_type = self._infer_block_return_type(lam.body)
+        return_type = expected_return if expected_return is not None else self._infer_block_return_type(lam.body)
+        self._c._expected_type = old_expected
 
         # Restore outer function return type and unsafe state.
         self._c._current_function_return = old_return_type
