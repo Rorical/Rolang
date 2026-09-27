@@ -6,6 +6,13 @@ pub struct Iter<T> {
     var advance: () -> T?;
     var finished: Bool;
     pub def __iter__() -> Iter<T> { return self; }
+    pub def map<U>(transform: (T) -> U) -> Iter<U> { return iter_map(self, transform); }
+    pub def filter(predicate: (T) -> Bool) -> Iter<T> { return iter_filter(self, predicate); }
+    pub def take(count: i32) -> Iter<T> { return iter_take(self, count); }
+    pub def zip<U>(other: Iter<U>) -> Iter<Zipped<T, U>> { return iter_zip(self, other); }
+    pub def collect() -> Vec<T> { return iter_collect(self); }
+    pub def fold<U>(initial: U, combine: (U, T) -> U) -> U { return iter_fold(self, initial, combine); }
+
     pub def __next__() -> T? {
         if self.finished { return nil; }
         let value = self.advance();
@@ -117,4 +124,13 @@ pub def iter_fold<T, U>(source: Iter<T>, initial: U, combine: (U, T) -> U) -> U 
     var out = initial;
     for value in source { out = combine(out, value); }
     return out;
+}
+
+// Import std.iterator to enable this method without a Vec/iterator import cycle.
+pub extension<T> Vec<T> {
+    pub def iter() -> Iter<T> { return iter_vec(self); }
+}
+
+pub extension<T> Iter<T> {
+    pub def enumerate() -> Iter<Indexed<T>> { return iter_enumerate(self); }
 }

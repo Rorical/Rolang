@@ -17,7 +17,7 @@ from .hir import (
     HirBinaryOp, HirUnaryOp, HirTernary, HirCall, HirMethodCall,
     HirFieldAccess, HirSubscript, HirTuple, HirArray, HirDict,
     HirStructInit,
-    HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirOptionalSome,
+    HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirSwitchExpr, HirOptionalSome,
     HirOptionalNone, HirOptionalMatch, HirLiteral,
     HirVarDecl, HirAssign, HirExprStmt, HirReturn,
     HirIf, HirIfLet, HirGuard, HirWhile, HirFor, HirSwitch, HirDefer,
@@ -265,6 +265,10 @@ class CaptureAnalyzer:
 
         elif isinstance(expr, HirCast):
             refs.update(self._collect_refs_expr(expr.expr))
+
+        elif isinstance(expr, HirSwitchExpr):
+            refs.update(self._collect_refs_stmt(expr.switch) - self._collect_locals_stmt(expr.switch)
+                        - {expr.result_symbol})
 
         elif isinstance(expr, HirTryExpr):
             refs.update(self._collect_refs_expr(expr.expr))

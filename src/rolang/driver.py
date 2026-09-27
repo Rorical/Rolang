@@ -235,7 +235,7 @@ class CompilationDriver:
             if isinstance(item, ast_module.ImportDecl) and item.path
         }
         implicit = []
-        for path in ("vec.rl", "dict.rl", "string.rl"):
+        for path in ("vec.rl", "dict.rl", "string.rl", "range.rl"):
             if path not in existing:
                 implicit.append(ast_module.ImportDecl(path=path))
         if implicit:

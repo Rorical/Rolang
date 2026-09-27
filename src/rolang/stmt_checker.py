@@ -134,6 +134,9 @@ class StmtChecker:
             self._check_let_reassignment(assign.target)
 
             target_type = self._c._infer_expr(assign.target)
+            if isinstance(assign.target, ast.Subscript) and hasattr(assign.target, "_slice_call"):
+                self._c._error(TypeErrorKind.INVALID_OPERATION, "slice assignment is not supported; slices are copies", node=assign)
+                return
             value_type = self._c._infer_expr(assign.value)
 
             # Handle compound assignment
@@ -269,7 +272,14 @@ class StmtChecker:
 
     def _check_guard_stmt(self, guard: ast.GuardStmt) -> None:
         """Type check a guard statement."""
-        if guard.condition:
+        if isinstance(guard.condition, tuple):
+            pattern, value = guard.condition
+            value_type = self._c._infer_with_expected(value, None)
+            inner = self._c.type_table.get_optional_inner(value_type)
+            if inner is None and not isinstance(pattern, ast.EnumCasePattern):
+                self._c._error(TypeErrorKind.TYPE_MISMATCH, "guard let requires an optional or an enum case pattern", node=guard)
+            self._c._bind_pattern_type(pattern, inner if inner is not None else value_type)
+        elif guard.condition:
             cond_type = self._c._infer_expr(guard.condition)
             self._c._check_boolean(cond_type, "guard condition")
 

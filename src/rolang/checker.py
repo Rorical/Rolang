@@ -318,11 +318,19 @@ class TypeChecker:
 
         elif isinstance(pattern, ast.TuplePattern):
             info = self.type_table.get_type(type_id)
-            if info and info.kind == TypeKind.STRUCT and isinstance(info.data, StructTypeData):
+            fields = ()
+            if (info and info.kind == TypeKind.STRUCT
+                    and isinstance(info.data, StructTypeData) and info.data.symbol_id is None):
                 fields = info.data.anon_fields or ()
-                for i, (_, elem_pattern) in enumerate(pattern.elements):
-                    if i < len(fields):
-                        self._bind_pattern_type(elem_pattern, fields[i][1])
+                if len(pattern.elements) != len(fields):
+                    self._error(TypeErrorKind.TYPE_MISMATCH,
+                                f"tuple pattern has {len(pattern.elements)} elements but value has {len(fields)}", node=pattern)
+            elif not self.type_table.is_error(type_id):
+                self._error(TypeErrorKind.TYPE_MISMATCH, "tuple pattern requires a tuple value", node=pattern)
+            for i, (label, elem_pattern) in enumerate(pattern.elements):
+                if i < len(fields) and label is not None and label != fields[i][0]:
+                    self._error(TypeErrorKind.TYPE_MISMATCH, f"tuple pattern label '{label}' does not match '{fields[i][0]}'", node=pattern)
+                self._bind_pattern_type(elem_pattern, fields[i][1] if i < len(fields) else self.type_table.error_type)
 
         elif isinstance(pattern, ast.EnumCasePattern):
             # Get payload types from enum case, substituting any generic params

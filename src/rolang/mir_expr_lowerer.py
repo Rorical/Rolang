@@ -13,7 +13,7 @@ from .hir import (
     HirExpr, HirLiteral, HirVar, HirBinaryOp, HirUnaryOp, HirTernary,
     HirCall, HirMethodCall, HirFieldAccess, HirSubscript,
     HirTuple, HirArray, HirDict, HirLambda, HirClone,
-    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr,
+    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirSwitchExpr,
     HirOptionalSome, HirOptionalNone, HirOptionalMatch,
     HirParam, HirBlock, HirReturn,
 )
@@ -67,6 +67,16 @@ class MirExpressionLowerer:
 
     def lower_expr(self, expr: HirExpr) -> Operand:
         """Lower an expression to an operand."""
+        if isinstance(expr, HirSwitchExpr):
+            local = self._b.create_local("__switch_value", expr.type_id, symbol_id=expr.result_symbol)
+            place = Place(base=local, projections=[], type_id=expr.type_id)
+            if self._b.type_table.is_heap_type(expr.type_id):
+                self._b.emit_op(Assign(place=place, value=ConstantOperand(ConstantKind.NIL, None, expr.type_id)))
+            else:
+                self._b._emit_default_init(local, expr.type_id, "__switch_value", False, expr.result_symbol)
+            self._b.lower_switch(expr.switch)
+            return CopyOperand(Place(base=local, projections=[], type_id=expr.type_id))
+
         if isinstance(expr, HirLiteral):
             return self._lower_literal(expr)
 

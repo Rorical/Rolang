@@ -675,6 +675,10 @@ class NameResolver:
         self.node_symbols[id(ext)] = ext_symbol.id
 
         self._push_scope(ScopeKind.TYPE)
+        for param in ext.generic_params:
+            self._define_type(param.name, SymbolKind.GENERIC_PARAM, node=param)
+            for bound in param.bounds or []:
+                self._resolve_type(bound)
 
         # Resolve the extended type and get its symbol for self binding
         extended_type_symbol = None
@@ -742,6 +746,12 @@ class NameResolver:
             self._resolve_constraint(constraint)
         self._merge_constraints_into_params(func.constraints, func.generic_params)
 
+        # Defaults are evaluated at the call site and resolve in declaration
+        # scope; neither self nor this function's parameters are available.
+        for param in func.params:
+            if param.default_value is not None:
+                self._resolve_expr(param.default_value)
+
         # If inside a type (struct/enum), inject 'self' as an implicit parameter.
         # `self` is immutable as a binding (you can't write `self = something_else`)
         # but its fields are mutable through the heap reference.
@@ -769,8 +779,6 @@ class NameResolver:
                 is_mutable=False,
                 node=param,
             )
-            if param.default_value:
-                self._resolve_expr(param.default_value)
 
         # Resolve return type
         if func.return_type:
@@ -922,10 +930,18 @@ class NameResolver:
         elif isinstance(stmt, ast.IfStmt):
             self._resolve_if_stmt(stmt)
         elif isinstance(stmt, ast.GuardStmt):
-            if stmt.condition:
-                self._resolve_expr(stmt.condition)
-            if stmt.else_block:
-                self._resolve_block(stmt.else_block)
+            if isinstance(stmt.condition, tuple):
+                pattern, value = stmt.condition
+                self._resolve_expr(value)
+                if stmt.else_block:
+                    self._resolve_block(stmt.else_block)
+                # Success bindings are visible after the guard, never in else.
+                self._bind_pattern(pattern, is_mutable=False)
+            else:
+                if stmt.condition:
+                    self._resolve_expr(stmt.condition)
+                if stmt.else_block:
+                    self._resolve_block(stmt.else_block)
         elif isinstance(stmt, ast.WhileStmt):
             if stmt.condition:
                 self._resolve_expr(stmt.condition)
@@ -1067,7 +1083,9 @@ class NameResolver:
 
     def _resolve_expr(self, expr: ast.Expr) -> None:
         """Resolve an expression."""
-        if isinstance(expr, ast.Literal):
+        if isinstance(expr, ast.SwitchExpr):
+            self._resolve_switch_stmt(expr)
+        elif isinstance(expr, ast.Literal):
             # Literals need no resolution
             pass
         elif isinstance(expr, ast.Identifier):

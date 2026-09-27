@@ -4,16 +4,17 @@ import std.iterator
 import std.code_writer
 import std.io
 
+typealias ParseResult<T> = Result<T, String>;
+
 enum Expr {
     case literal(value: i32);
     case add(left: Expr?, right: Expr?);
 }
 
-def parse_number(text: String) -> Result<Expr, String> {
+def parse_number(text: String) -> ParseResult<Expr> {
     if text.is_empty() { return Result.err(error: "expected a number"); }
     var value = 0;
-    var i = 0;
-    while (i as i64) < text.len() {
+    for i in 0..<(text.len() as i32) {
         let digit = text.byte_at(i) - 48;
         if digit < 0 || digit > 9 {
             return Result.err(error: f"invalid digit at byte {i}: {text}");
@@ -22,15 +23,14 @@ def parse_number(text: String) -> Result<Expr, String> {
             return Result.err(error: "integer literal is too large");
         }
         value = value * 10 + digit;
-        i = i + 1;
     }
     return Result.ok(value: Expr.literal(value: value));
 }
 
-def parse_expression(source: String) -> Result<Expr, String> {
+def parse_expression(source: String) -> ParseResult<Expr> {
     var root: Expr? = nil;
-    for part in iter_vec(source.split("+")) {
-        let next = parse_number(part.trim())?;
+    for part in source.split("+").iter().map({ part in part.trim() }) {
+        let next = parse_number(part)?;
         if let previous = root {
             root = Expr.add(left: previous, right: next);
         } else { root = next; }
@@ -40,17 +40,15 @@ def parse_expression(source: String) -> Result<Expr, String> {
 }
 
 def emit_expression(node: Expr?) -> String {
-    if let expr = node {
-        switch expr {
-            case .literal(let value): return f"{value}";
-            case .add(let left, let right):
-                return f"({emit_expression(left)} + {emit_expression(right)})";
-        }
-    }
-    return "0";
+    guard let expr = node else { return "0"; }
+    return switch expr {
+        case .literal(let value): f"{value}";
+        case .add(let left, let right):
+            f"({emit_expression(left)} + {emit_expression(right)})";
+    };
 }
 
-def compile_expression(source: String) -> Result<String, String> {
+def compile_expression(source: String) -> ParseResult<String> {
     let tree = parse_expression(source)?;
     let writer = CodeWriter.new();
     writer.line("int main(void) {");

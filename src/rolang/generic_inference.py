@@ -11,7 +11,6 @@ from .types import (
     TypeVariableData,
     StructTypeData,
     EnumTypeData,
-    StructTypeData,
     FunctionTypeData,
     OptionalTypeData,
 )
@@ -19,6 +18,33 @@ from .symbols import Symbol, SymbolId
 
 if TYPE_CHECKING:
     from .checker import TypeChecker
+
+
+def infer_resolved_type_arguments(table, pattern, concrete, names, inferred):
+    """Unify canonical types, so aliases may reorder or wrap parameters."""
+    template = table.get_type(pattern)
+    actual = table.get_type(concrete)
+    if template is None or actual is None or table.is_error(concrete):
+        return
+    left, right = template.data, actual.data
+    if isinstance(left, TypeVariableData):
+        if left.name in names:
+            inferred.setdefault(left.name, concrete)
+        return
+    pairs = []
+    if isinstance(left, OptionalTypeData):
+        pairs = [(left.inner, right.inner if isinstance(right, OptionalTypeData) else concrete)]
+    elif isinstance(left, FunctionTypeData) and isinstance(right, FunctionTypeData):
+        pairs = list(zip(left.params, right.params)) + [(left.return_type, right.return_type)]
+    elif isinstance(left, (StructTypeData, EnumTypeData)) and type(left) is type(right):
+        if left.symbol_id != right.symbol_id:
+            return
+        if isinstance(left, StructTypeData) and left.symbol_id is None:
+            pairs = [(a[1], b[1]) for a, b in zip(left.anon_fields or (), right.anon_fields or ())]
+        else:
+            pairs = list(zip(left.type_args, right.type_args))
+    for parameter, argument in pairs:
+        infer_resolved_type_arguments(table, parameter, argument, names, inferred)
 
 
 class GenericInference:
@@ -55,11 +81,18 @@ class GenericInference:
             return {}
 
         decl = symbol.decl_node
-        if not decl.generic_params:
+        if not decl.generic_params and not isinstance(call.callee, ast.MemberAccess):
             return {}
 
         inferred: Dict[str, TypeId] = {}
         generic_names = {param.name for param in decl.generic_params}
+        owner = None
+        if isinstance(call.callee, ast.MemberAccess):
+            receiver_type = self._c.expr_types.get(id(call.callee.object))
+            info = self._c.type_table.get_type(receiver_type) if receiver_type is not None else None
+            owner = self._c.expr_checker._find_method_owner(decl)
+            if owner and info and isinstance(info.data, (StructTypeData, EnumTypeData)):
+                inferred.update(zip((p.name for p in owner.generic_params), info.data.type_args))
 
         # Infer ordinary arguments first, then provide their types to callbacks.
         # This also handles a callback preceding the collection argument.
@@ -78,6 +111,10 @@ class GenericInference:
                     arg_type = self._c._infer_with_expected(arg.value, None)
             self._infer_type_node_generics(decl.params[i].type_annotation, arg_type, generic_names, inferred)
 
+        # Nominal method signatures already contain receiver substitutions.
+        # Applying them again captures caller variables with the same names.
+        if owner is not None and not isinstance(owner, ast.ExtensionDecl):
+            return {name: value for name, value in inferred.items() if name in generic_names}
         return inferred
 
     def _infer_type_node_generics(
@@ -90,68 +127,9 @@ class GenericInference:
         """Unify an annotation against a concrete type for generic inference."""
         if type_node is None:
             return
-
-        if isinstance(type_node, ast.NamedType):
-            if not type_node.generic_args and type_node.name in generic_names:
-                inferred.setdefault(type_node.name, concrete_type)
-                return
-            info = self._c.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.STRUCT and isinstance(info.data, StructTypeData):
-                for node_arg, concrete_arg in zip(type_node.generic_args, info.data.type_args):
-                    self._infer_type_node_generics(node_arg, concrete_arg, generic_names, inferred)
-            elif info and info.kind == TypeKind.ENUM and isinstance(info.data, EnumTypeData):
-                for node_arg, concrete_arg in zip(type_node.generic_args, info.data.type_args):
-                    self._infer_type_node_generics(node_arg, concrete_arg, generic_names, inferred)
-            return
-
-        if isinstance(type_node, ast.ArrayType):
-            # `[T]` is sugar for `Vec<T>` STRUCT now — recurse into the
-            # concrete struct's first type arg.
-            info = self._c.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.STRUCT and isinstance(info.data, StructTypeData):
-                if info.data.type_args:
-                    self._infer_type_node_generics(
-                        type_node.element, info.data.type_args[0], generic_names, inferred
-                    )
-            return
-
-        if isinstance(type_node, ast.DictType):
-            # `[K: V]` is sugar for `Dict<K, V>` STRUCT now.
-            info = self._c.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.STRUCT and isinstance(info.data, StructTypeData):
-                if len(info.data.type_args) >= 2:
-                    self._infer_type_node_generics(
-                        type_node.key, info.data.type_args[0], generic_names, inferred
-                    )
-                    self._infer_type_node_generics(
-                        type_node.value, info.data.type_args[1], generic_names, inferred
-                    )
-            return
-
-        if isinstance(type_node, ast.FunctionType):
-            info = self._c.type_table.get_type(concrete_type)
-            if info and isinstance(info.data, FunctionTypeData):
-                for node_param, concrete_param in zip(type_node.params, info.data.params):
-                    self._infer_type_node_generics(node_param, concrete_param, generic_names, inferred)
-                self._infer_type_node_generics(type_node.return_type, info.data.return_type,
-                                               generic_names, inferred)
-            return
-
-        if isinstance(type_node, ast.OptionalType):
-            info = self._c.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.OPTIONAL and isinstance(info.data, OptionalTypeData):
-                self._infer_type_node_generics(type_node.inner, info.data.inner, generic_names, inferred)
-            else:
-                self._infer_type_node_generics(type_node.inner, concrete_type, generic_names, inferred)
-            return
-
-        if isinstance(type_node, ast.TupleType):
-            info = self._c.type_table.get_type(concrete_type)
-            if (info and info.kind == TypeKind.STRUCT
-                    and isinstance(info.data, StructTypeData) and info.data.symbol_id is None):
-                fields = info.data.anon_fields or ()
-                for (_, node_elem), (_, concrete_elem) in zip(type_node.elements, fields):
-                    self._infer_type_node_generics(node_elem, concrete_elem, generic_names, inferred)
+        variables = {name: self._c.type_table.make_type_variable(name) for name in generic_names}
+        pattern = self._c.type_resolver.resolve(type_node, {**inferred, **variables})
+        infer_resolved_type_arguments(self._c.type_table, pattern, concrete_type, generic_names, inferred)
 
     def substitute_type(self, type_id: TypeId, mapping: Dict[str, TypeId]) -> TypeId:
         """Apply a generic type substitution to a TypeId."""

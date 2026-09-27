@@ -19,7 +19,7 @@ from .hir import (
     HirExpr, HirLiteral, HirVar, HirBinaryOp, HirUnaryOp, HirTernary,
     HirCall, HirMethodCall, HirFieldAccess, HirSubscript,
     HirTuple, HirArray, HirDict, HirLambda, HirClone,
-    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr,
+    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirSwitchExpr,
     HirOptionalSome, HirOptionalNone, HirOptionalMatch,
     HirPattern, HirWildcardPattern, HirBindingPattern, HirLiteralPattern,
     HirTuplePattern, HirEnumCasePattern, HirOrPattern,
@@ -504,36 +504,39 @@ class HirBuilder:
                 is_mutable=var_decl.is_mutable,
             )
 
-        # For complex patterns, we need to destructure
-        # For now, treat as simple case
-        name = "__pattern"
-        if var_decl.pattern and isinstance(var_decl.pattern, ast.IdentifierPattern):
-            name = var_decl.pattern.name
-
+        # Evaluate the initializer once, then project all nested bindings from
+        # that retained tuple. A synthetic block introduces no user scope.
+        type_id = (self._resolve_type_node(var_decl.type_annotation)
+                   if var_decl.type_annotation else
+                   self._get_expr_type(var_decl.initializer))
         symbol = self.symbol_table.create_symbol(
-            name=name,
-            kind=SymbolKind.VARIABLE,
-            namespace=Namespace.VALUE,
-            is_mutable=var_decl.is_mutable,
+            name="__pattern", kind=SymbolKind.VARIABLE, namespace=Namespace.VALUE,
         )
+        statements = [HirVarDecl(
+            name=symbol.name, symbol_id=symbol.id, type_id=type_id,
+            initializer=self._build_expr(var_decl.initializer) if var_decl.initializer else None,
+            is_mutable=False,
+        )]
 
-        type_id = self.type_table.error_type
-        if var_decl.type_annotation:
-            type_id = self._resolve_type_node(var_decl.type_annotation)
-        elif var_decl.initializer:
-            type_id = self._get_expr_type(var_decl.initializer)
+        def bind(pattern: ast.Pattern, value: HirExpr) -> None:
+            if isinstance(pattern, ast.IdentifierPattern):
+                statements.append(HirVarDecl(
+                    name=pattern.name, symbol_id=self._get_symbol(pattern),
+                    type_id=value.type_id, initializer=value,
+                    is_mutable=var_decl.is_mutable,
+                ))
+            elif isinstance(pattern, ast.TuplePattern):
+                info = self.type_table.get_type(value.type_id)
+                fields = info.data.anon_fields
+                for (_, child), (name, field_type) in zip(pattern.elements, fields):
+                    bind(child, HirFieldAccess(
+                        type_id=field_type, object=value, field_name=name,
+                    ))
 
-        initializer = None
-        if var_decl.initializer:
-            initializer = self._build_expr(var_decl.initializer)
-
-        return HirVarDecl(
-            name=name,
-            symbol_id=symbol.id,
-            type_id=type_id,
-            initializer=initializer,
-            is_mutable=var_decl.is_mutable,
-        )
+        bind(var_decl.pattern, HirVar(
+            type_id=type_id, symbol_id=symbol.id, name=symbol.name,
+        ))
+        return HirBlock(statements=statements)
 
     def _build_assignment(self, assign: ast.Assignment) -> HirAssign:
         """Build an HIR assignment."""
@@ -607,6 +610,9 @@ class HirBuilder:
 
     def _build_guard_stmt(self, guard: ast.GuardStmt) -> HirGuard:
         """Build an HIR guard statement."""
+        if isinstance(guard.condition, tuple):
+            return self._build_if_stmt(ast.IfStmt(condition=guard.condition,
+                then_block=ast.Block(), else_block=guard.else_block))
         condition = self._build_expr(guard.condition) if guard.condition else self._error_expr()
         else_block = self._build_block(guard.else_block) if guard.else_block else HirBlock()
         return HirGuard(condition=condition, else_block=else_block)
@@ -689,6 +695,16 @@ class HirBuilder:
 
     def _build_expr(self, expr: ast.Expr) -> HirExpr:
         """Build an HIR expression from an AST expression."""
+        if isinstance(expr, ast.SwitchExpr):
+            result_type = self._get_expr_type(expr)
+            name = self._fresh_temp("__switch_value")
+            symbol = self._create_temp_symbol(name, result_type)
+            switch = self._build_switch_stmt(expr)
+            for case in switch.cases:
+                value = case.body.statements[0].expr
+                case.body = HirBlock(statements=[HirAssign(
+                    target=HirVar(type_id=result_type, name=name, symbol_id=symbol), value=value)])
+            return HirSwitchExpr(type_id=result_type, switch=switch, result_symbol=symbol)
         if isinstance(expr, ast.Literal):
             return self._build_literal(expr)
         elif isinstance(expr, ast.Identifier):
@@ -1065,6 +1081,8 @@ class HirBuilder:
 
     def _build_subscript(self, sub: ast.Subscript) -> HirSubscript:
         """Build an HIR subscript expression."""
+        if hasattr(sub, "_slice_call"):
+            return self._build_call(sub._slice_call)
         type_id = self._get_expr_type(sub)
         obj = self._build_expr(sub.object) if sub.object else self._error_expr()
         indices = [self._build_expr(idx) for idx in sub.indices]

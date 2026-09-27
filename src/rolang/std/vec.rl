@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: generic dynamic vector Vec<T>
 //
 // Backed by C runtime gvec functions. Works for any type T:
@@ -62,6 +63,15 @@ pub struct Vec<T> {
 
     pub def set(index: i32, value: T) -> Void {
         unsafe { rt_gvec_set(self.handle, index, value as RawPtr); }
+    }
+
+    // Slicing returns an independent vector retaining the selected elements.
+    pub def slice(bounds: IndexRange) -> Vec<T> {
+        let out = Vec<T>.new();
+        var i = bounds.lower(self.len());
+        let end = bounds.upper(self.len());
+        while i < end { out.push(self.get(i)); i = i + 1; }
+        return out;
     }
 
     pub def __iter__() -> VecIter<T> {

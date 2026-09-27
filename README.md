@@ -450,6 +450,9 @@ The Python/LLVM compiler also supports `f"...{expression}..."` interpolation,
 optional `?` propagation, collection transforms, lazy iterator adapters, and
 `CodeWriter` for indented source output. See [the ergonomics guide](docs/language-ergonomics.md)
 and [the tiny compiler example](examples/compiler_ergonomics.rl).
+Contextual lambdas, generic aliases, switch expressions, guard bindings, iterator
+chains, tuple destructuring, ranges/slices, raw/multiline strings, and named
+arguments are covered in [the syntax guide](docs/syntax-ergonomics.md).
 
 ### Self-hosting work
 

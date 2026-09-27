@@ -1,3 +1,4 @@
+import "range.rl"
 // Standard library: heap-backed strings.
 //
 // `String` is a normal ARC-managed Rolang struct. Its bytes live behind an
@@ -105,6 +106,14 @@ pub struct String {
 
     pub def find_char(ch: i32, start: i32) -> i32 {
         unsafe { return rt_string_find_char(self, ch, start); }
+    }
+
+    // Byte offsets, matching substring and byte_at; the result is a copy.
+    pub def slice(bounds: IndexRange) -> String {
+        let start = bounds.lower(self.len() as i32);
+        let end = bounds.upper(self.len() as i32);
+        if end <= start { return ""; }
+        return self.substring(start, end - start);
     }
 
     pub def substring(start: i32, len: i32) -> String {

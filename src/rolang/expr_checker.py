@@ -66,6 +66,8 @@ class ExprChecker:
 
     def _do_infer_expr(self, expr: ast.Expr) -> TypeId:
         """Implementation of expression type inference."""
+        if isinstance(expr, ast.SwitchExpr):
+            return self._infer_switch_expr(expr)
         if isinstance(expr, ast.Literal):
             return self._infer_literal(expr)
         elif isinstance(expr, ast.Identifier):
@@ -684,7 +686,10 @@ class ExprChecker:
                 if decl_params is not None:
                     for i, arg in enumerate(call.arguments):
                         expected_label = decl_params[i].external_name
-                        if arg.label != expected_label:
+                        if arg.label != expected_label and not (
+                            expected_label is None
+                            and arg.label == decl_params[i].internal_name
+                        ):
                             expected_display = expected_label if expected_label is not None else "<none>"
                             actual_display = arg.label if arg.label is not None else "<none>"
                             self._c._error(
@@ -985,9 +990,14 @@ class ExprChecker:
         if info is None:
             return self._c.type_table.error_type
 
-        # Check index types
-        for index in sub.indices:
-            self._infer_expr(index)
+        index_types = [self._infer_with_expected(index, None) for index in sub.indices]
+        if len(index_types) == 1 and isinstance(info.data, StructTypeData) and self._struct_symbol_name(info.data.symbol_id) in ("Vec", "String"):
+            index_info = self._c.type_table.get_type(index_types[0])
+            if index_info and isinstance(index_info.data, StructTypeData) and self._struct_symbol_name(index_info.data.symbol_id) == "IndexRange":
+                call = ast.Call(callee=ast.MemberAccess(object=sub.object, member="slice", span=sub.span),
+                                arguments=[ast.Argument(value=sub.indices[0])], span=sub.span)
+                sub._slice_call = call
+                return self._infer_expr(call)
 
         if info.kind == TypeKind.STRUCT:
             data = info.data
@@ -1103,6 +1113,27 @@ class ExprChecker:
 
         return self._c.type_resolver.make_dict_type(key_type, value_type)
 
+    def _infer_switch_expr(self, expr: ast.SwitchExpr) -> TypeId:
+        from .exhaustiveness import ExhaustivenessChecker
+        result_type = self._c._expected_type
+        scrutinee_type = self._infer_with_expected(expr.value, None)
+        for case in expr.cases:
+            for pattern, guard in case.patterns:
+                self._c._bind_pattern_type(pattern, scrutinee_type)
+                if guard:
+                    self._c._check_boolean(self._infer_with_expected(guard, None), "case guard")
+            value = case.body[0].expr
+            inferred = self._infer_with_expected(value, result_type)
+            if result_type is None:
+                result_type = inferred
+            else:
+                self._c._check_assignable(inferred, result_type, "switch expression branch", node=value)
+        ExhaustivenessChecker(self._c.type_table, self._c.symbol_table, self._c._error).check_switch(expr, scrutinee_type)
+        if result_type is None or result_type == self._c.type_table.void_type:
+            self._c._error(TypeErrorKind.TYPE_MISMATCH, "switch expression branches must produce a value", node=expr)
+            return self._c.type_table.error_type
+        return result_type
+
     def _infer_lambda(self, lam: ast.Lambda) -> TypeId:
         """Infer type of a lambda expression.
 
@@ -1153,6 +1184,8 @@ class ExprChecker:
         for stmt in lam.body:
             self._c._check_stmt(stmt)
         return_type = expected_return if expected_return is not None else self._infer_block_return_type(lam.body)
+        if return_type != self._c.type_table.void_type and not self._c.stmt_checker._definitely_returns_block(ast.Block(statements=lam.body)):
+            self._c._error(TypeErrorKind.TYPE_MISMATCH, "lambda must return a value on all paths", node=lam)
         self._c._expected_type = old_expected
 
         # Restore outer function return type and unsafe state.
@@ -1264,10 +1297,10 @@ class ExprChecker:
             specialized = self._c.type_table.make_enum(symbol_id, type_args)
         self._c.expr_types[id(obj_expr)] = specialized
 
-    def _find_method_owner(self, method: ast.FuncDecl) -> Optional[ast.StructDecl | ast.EnumDecl]:
+    def _find_method_owner(self, method: ast.FuncDecl) -> Optional[ast.StructDecl | ast.EnumDecl | ast.ExtensionDecl]:
         for symbol in self._c.symbol_table.symbols.values():
             decl = symbol.decl_node
-            if isinstance(decl, (ast.StructDecl, ast.EnumDecl)):
+            if isinstance(decl, (ast.StructDecl, ast.EnumDecl, ast.ExtensionDecl)):
                 if any(member is method for member in decl.members):
                     return decl
         return None

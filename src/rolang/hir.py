@@ -406,6 +406,12 @@ class HirEnumConstruct(HirExpr):
 
 
 @dataclass
+class HirSwitchExpr(HirExpr):
+    switch: HirSwitch
+    result_symbol: SymbolId
+
+
+@dataclass
 class HirTryExpr(HirExpr):
     """Try expression: expr? - propagates error via early return."""
     expr: HirExpr
@@ -536,7 +542,7 @@ HirExprType = Union[
     HirLiteral, HirVar, HirBinaryOp, HirUnaryOp, HirTernary,
     HirCall, HirMethodCall, HirFieldAccess, HirSubscript,
     HirTuple, HirArray, HirDict, HirLambda,
-    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr,
+    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirSwitchExpr,
     HirOptionalSome, HirOptionalNone, HirOptionalMatch
 ]
 

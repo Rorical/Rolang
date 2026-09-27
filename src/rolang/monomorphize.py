@@ -40,7 +40,7 @@ from .hir import (
     HirExpr, HirLiteral, HirVar, HirBinaryOp, HirUnaryOp, HirTernary,
     HirCall, HirMethodCall, HirFieldAccess, HirSubscript,
     HirTuple, HirArray, HirDict, HirLambda, HirClone,
-    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr,
+    HirStructInit, HirEnumConstruct, HirCast, HirTypeCheck, HirTryExpr, HirSwitchExpr,
     HirOptionalSome, HirOptionalNone, HirOptionalMatch,
     HirPattern, HirWildcardPattern, HirBindingPattern, HirLiteralPattern,
     HirTuplePattern, HirEnumCasePattern, HirOrPattern,
@@ -348,6 +348,49 @@ class Monomorphizer:
                 for method in item.methods:
                     self._func_by_symbol[method.symbol_id] = method
 
+        # Methods with their own generic parameters are instantiated at calls,
+        # using both owner and method type arguments.
+        self._generic_method_owners: Dict[SymbolId, SymbolId] = {}
+        for item in self.program.items:
+            if isinstance(item, (HirStruct, HirEnum)):
+                for method in item.methods:
+                    symbol = self.symbol_table.get_symbol(method.symbol_id)
+                    if symbol and getattr(symbol.decl_node, "generic_params", None):
+                        self._generic_method_owners[method.symbol_id] = item.symbol_id
+                        self._func_by_symbol[method.symbol_id] = method
+
+        for item in self.program.items:
+            if isinstance(item, HirExtension):
+                for method in item.methods:
+                    symbol = self.symbol_table.get_symbol(method.symbol_id)
+                    for candidate in list(self.symbol_table.symbols.values()):
+                        owner = candidate.decl_node
+                        if (symbol and isinstance(owner, ast.ExtensionDecl)
+                                and any(member is symbol.decl_node for member in owner.members)):
+                            if owner.generic_params or symbol.decl_node.generic_params:
+                                self._generic_method_owners[method.symbol_id] = candidate.id
+                            break
+
+        # Standalone specialized methods use an explicit receiver parameter.
+        from .mir_special_builders import _iter_hir_vars
+        from .type_resolver import TypeResolver as AstTypeResolver
+        for method_id, owner_id in self._generic_method_owners.items():
+            method = self._func_by_symbol[method_id]
+            if method.is_static:
+                continue
+            owner_symbol = self.symbol_table.get_symbol(owner_id)
+            owner_decl = owner_symbol.decl_node
+            variables = tuple(self.type_table.make_type_variable(p.name) for p in owner_decl.generic_params)
+            if isinstance(owner_decl, ast.ExtensionDecl):
+                receiver_type = AstTypeResolver(self.type_table, self.symbol_table, allow_symbol_table_lookup=True).resolve(
+                    owner_decl.extended_type, dict(zip((p.name for p in owner_decl.generic_params), variables)))
+            elif isinstance(owner_decl, ast.EnumDecl):
+                receiver_type = self.type_table.make_enum(owner_id, variables)
+            else:
+                receiver_type = self.type_table.make_struct(owner_id, variables)
+            self_symbol = next((v.symbol_id for v in _iter_hir_vars(method.body, set()) if v.name == "self"), None)
+            self._func_by_symbol[method_id] = replace(method, params=[HirParam(name="self", type_id=receiver_type, symbol_id=self_symbol)] + method.params)
+
         # Track specialized symbols
         self._specialized_symbols: Dict[Tuple[SymbolId, Tuple[TypeId, ...]], SymbolId] = {}
         self._temp_counter = 0
@@ -393,6 +436,8 @@ class Monomorphizer:
 
     def _is_generic_function(self, func: HirFunction) -> bool:
         """Check if a function has generic parameters."""
+        if func.symbol_id in self._generic_method_owners:
+            return True
         symbol = self.symbol_table.get_symbol(func.symbol_id)
         if symbol and symbol.decl_node:
             decl = symbol.decl_node
@@ -424,7 +469,8 @@ class Monomorphizer:
         if symbol and symbol.decl_node:
             decl = symbol.decl_node
             if hasattr(decl, 'generic_params'):
-                return [p.name for p in decl.generic_params]
+                owner = self._generic_method_owners.get(symbol_id)
+                return (self._get_generic_params(owner) if owner is not None else []) + [p.name for p in decl.generic_params]
         return []
 
     # ----------------------- Worklist Management -----------------------
@@ -597,7 +643,8 @@ class Monomorphizer:
             return
 
         subst = self._build_substitution(key.symbol_id, key.type_args)
-        mangled = mangle_name(original.name, key.type_args, self.type_table)
+        base_name = f"{original.name}$method{key.symbol_id.id}" if key.symbol_id in self._generic_method_owners else original.name
+        mangled = mangle_name(base_name, key.type_args, self.type_table)
 
         # Create or get specialized symbol
         specialized_symbol = self._get_or_create_specialized_symbol(
@@ -762,6 +809,8 @@ class Monomorphizer:
         # Specialize methods
         new_methods: List[HirFunction] = []
         for method in struct.methods:
+            if method.symbol_id in self._generic_method_owners:
+                continue
             # Create a specialized symbol for the method
             method_mangled = f"{mangled_name}_{method.name}"
             method_symbol = self.symbol_table.create_symbol(
@@ -816,6 +865,8 @@ class Monomorphizer:
         # Specialize methods
         new_methods: List[HirFunction] = []
         for method in enum.methods:
+            if method.symbol_id in self._generic_method_owners:
+                continue
             method_mangled = f"{mangled_name}_{method.name}"
             method_symbol = self.symbol_table.create_symbol(
                 name=method_mangled,
@@ -1145,6 +1196,10 @@ class Monomorphizer:
                 checked_type=new_checked,
             )
 
+        if isinstance(expr, HirSwitchExpr):
+            return HirSwitchExpr(type_id=new_type, switch=self._specialize_stmt(expr.switch, subst),
+                                 result_symbol=expr.result_symbol)
+
         if isinstance(expr, HirTryExpr):
             return HirTryExpr(
                 type_id=new_type,
@@ -1296,6 +1351,32 @@ class Monomorphizer:
             for label, arg in call.arguments
         ]
 
+        if call.method_symbol in self._generic_method_owners:
+            method_symbol = call.method_symbol
+            owner = self._generic_method_owners[method_symbol]
+            original = self._func_by_symbol[method_symbol]
+            receiver_type = subst.apply(call.receiver.type_id, self.type_table)
+            info = self.type_table.get_type(receiver_type)
+            owner_args = info.data.type_args if info and isinstance(info.data, (StructTypeData, EnumTypeData)) else ()
+            initial = dict(zip(self._get_generic_params(owner), owner_args))
+            inference_args = [(label, replace(arg, type_id=subst.apply(arg.type_id, self.type_table)))
+                              for label, arg in call.arguments]
+            type_args = self._infer_call_type_args(method_symbol, inference_args,
+                subst.apply(call.type_id, self.type_table), initial)
+            if any(self.type_table.is_error(t) or self._has_type_variables(t) for t in type_args):
+                self.errors.append(f"could not infer type arguments for generic method '{original.name}'")
+                return call
+            self._enqueue_function(InstanceKey(method_symbol, type_args))
+            name = mangle_name(f"{original.name}$method{method_symbol.id}", type_args, self.type_table)
+            specialized_symbol = self._get_or_create_specialized_symbol(method_symbol, type_args, name)
+            method_subst = self._build_substitution(method_symbol, type_args)
+            signature = self.type_table.make_function(
+                tuple(self._specialize_type(p.type_id, method_subst) for p in original.params),
+                new_type, original.is_async)
+            arguments = new_args if call.is_static else [(None, new_receiver)] + new_args
+            return HirCall(type_id=new_type, callee=HirVar(type_id=signature, name=name, symbol_id=specialized_symbol),
+                           arguments=arguments, callee_symbol=specialized_symbol)
+
         # Check receiver type for generic instantiation
         receiver_type = new_receiver.type_id
         self._discover_type_instantiation(receiver_type)
@@ -1446,6 +1527,7 @@ class Monomorphizer:
         callee_symbol: SymbolId,
         arguments: List[Tuple[Optional[str], HirExpr]],
         return_type: Optional[TypeId] = None,
+        initial: Optional[Dict[str, TypeId]] = None,
     ) -> Tuple[TypeId, ...]:
         """
         Infer type arguments for a generic function call.
@@ -1473,7 +1555,7 @@ class Monomorphizer:
         # generic functions' parameter names pollute the search and we end
         # up mapping concrete types onto unrelated identifiers.
         param_set: Set[str] = set(params)
-        inferred: Dict[str, TypeId] = {}
+        inferred: Dict[str, TypeId] = dict(initial or {})
 
         # Infer from arguments
         for i, (_, arg_expr) in enumerate(arguments):
@@ -1522,91 +1604,14 @@ class Monomorphizer:
         """
         if type_node is None:
             return
-
+        from .type_resolver import TypeResolver as AstTypeResolver
+        from .generic_inference import infer_resolved_type_arguments
         if params is None:
             params = self._get_generic_params_from_context()
-
-        if isinstance(type_node, ast.NamedType):
-            # Check if this is a type parameter reference
-            if not type_node.generic_args:
-                if type_node.name in params:
-                    # Found a type parameter - record the inference
-                    if type_node.name not in inferred:
-                        inferred[type_node.name] = concrete_type
-                    return
-
-            # Otherwise, recurse into generic args
-            info = self.type_table.get_type(concrete_type)
-            if info is None:
-                return
-
-            if info.kind == TypeKind.STRUCT:
-                data = info.data
-                if isinstance(data, StructTypeData):
-                    for i, arg in enumerate(type_node.generic_args):
-                        if i < len(data.type_args):
-                            self._unify_for_inference(
-                                arg, data.type_args[i], inferred, params
-                            )
-
-            elif info.kind == TypeKind.ENUM:
-                data = info.data
-                if isinstance(data, EnumTypeData):
-                    for i, arg in enumerate(type_node.generic_args):
-                        if i < len(data.type_args):
-                            self._unify_for_inference(
-                                arg, data.type_args[i], inferred, params
-                            )
-
-        elif isinstance(type_node, ast.ArrayType):
-            # `[T]` annotations are sugar for `Vec<T>` STRUCT.
-            info = self.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.STRUCT:
-                data = info.data
-                if isinstance(data, StructTypeData) and data.type_args:
-                    self._unify_for_inference(
-                        type_node.element, data.type_args[0], inferred, params
-                    )
-
-        elif isinstance(type_node, ast.DictType):
-            # `[K: V]` annotations are sugar for `Dict<K, V>` STRUCT.
-            info = self.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.STRUCT:
-                data = info.data
-                if isinstance(data, StructTypeData) and len(data.type_args) >= 2:
-                    self._unify_for_inference(
-                        type_node.key, data.type_args[0], inferred, params
-                    )
-                    self._unify_for_inference(
-                        type_node.value, data.type_args[1], inferred, params
-                    )
-
-        elif isinstance(type_node, ast.FunctionType):
-            info = self.type_table.get_type(concrete_type)
-            if info and isinstance(info.data, FunctionTypeData):
-                for node_param, concrete_param in zip(type_node.params, info.data.params):
-                    self._unify_for_inference(node_param, concrete_param, inferred, params)
-                self._unify_for_inference(type_node.return_type, info.data.return_type, inferred, params)
-
-        elif isinstance(type_node, ast.OptionalType):
-            info = self.type_table.get_type(concrete_type)
-            if info and info.kind == TypeKind.OPTIONAL:
-                data = info.data
-                if isinstance(data, OptionalTypeData):
-                    self._unify_for_inference(
-                        type_node.inner, data.inner, inferred, params
-                    )
-
-        elif isinstance(type_node, ast.TupleType):
-            info = self.type_table.get_type(concrete_type)
-            if (info and info.kind == TypeKind.STRUCT
-                    and isinstance(info.data, StructTypeData) and info.data.symbol_id is None):
-                fields = info.data.anon_fields or ()
-                for i, (_, elem_type) in enumerate(type_node.elements):
-                    if i < len(fields):
-                        self._unify_for_inference(
-                            elem_type, fields[i][1], inferred, params
-                        )
+        variables = {name: self.type_table.make_type_variable(name) for name in params}
+        resolver = AstTypeResolver(self.type_table, self.symbol_table, allow_symbol_table_lookup=True)
+        pattern = resolver.resolve(type_node, variables)
+        infer_resolved_type_arguments(self.type_table, pattern, concrete_type, params, inferred)
 
     def _get_generic_params_from_context(self) -> Set[str]:
         """Get generic parameter names from the current context (all functions)."""
@@ -1707,7 +1712,8 @@ class Monomorphizer:
         for item in self.program.items:
             if isinstance(item, HirExtension):
                 for method in item.methods:
-                    extension_method_symbols.add(method.symbol_id)
+                    if method.symbol_id not in self._generic_method_owners:
+                        extension_method_symbols.add(method.symbol_id)
 
         # Add non-generic items that weren't processed (extern funcs, etc.)
         for item in self.program.items:
@@ -1723,6 +1729,8 @@ class Monomorphizer:
                 # downstream but at least we don't lose the declaration.
                 specialized_methods: List[HirFunction] = []
                 for method in item.methods:
+                    if method.symbol_id in self._generic_method_owners:
+                        continue
                     key = InstanceKey(method.symbol_id, ())
                     inst = self.function_instances.get(key)
                     if inst is not None:

@@ -495,7 +495,9 @@ differential checks against LLVM. The reference also conflates some identically
 named functions reached through different import aliases. Native collision tests
 retain explicit expected results; renamed equivalents provide LLVM comparisons.
 
-A further reference-compiler limitation affects static methods returning a struct
-through a type alias: LLVM's frontend can infer an error type for the call result.
-The native backend supports this case and checks its expected result at C O0/O3;
-other typealias programs are compared against the LLVM compiler.
+Static methods returning a struct through a type alias are now also supported
+by the Python/LLVM compiler; this previously recorded frontend limitation has
+a dedicated O0/O3 regression test in `tests/test_generic_alias_sugar.py`.
+The newer syntax described in [the syntax guide](../docs/syntax-ergonomics.md)
+is implemented in the Python/LLVM compiler and is not yet part of the native
+compiler's supported subset.

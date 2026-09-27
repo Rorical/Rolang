@@ -41,7 +41,7 @@ class RoLangTransformer(Transformer):
     def _transform_tree(self, tree):
         """Transform a tree and attach span info to the resulting AST node."""
         result = super()._transform_tree(tree)
-        if tree.data in ("interpolation_text", "interpolation_value"):
+        if tree.data in ("interpolation_text", "multiline_interpolation_text", "interpolation_value"):
             result._template_start = tree.meta.start_pos
             result._template_end = tree.meta.end_pos
         if isinstance(result, ast.Node) and result.span is None:
@@ -612,6 +612,7 @@ class RoLangTransformer(Transformer):
         extended_type = None
         conformances: list[ast.NamedType] = []
         constraints = []
+        generics = []
         members = []
 
         for item in items:
@@ -621,6 +622,8 @@ class RoLangTransformer(Transformer):
                 conformances = list(item)
             elif isinstance(item, ast.NamedType):
                 extended_type = item
+            elif isinstance(item, list) and item and isinstance(item[0], ast.GenericParam):
+                generics = item
             elif isinstance(item, list) and item and isinstance(item[0], ast.Constraint):
                 constraints = item
             elif isinstance(item, (ast.StructMember, ast.FuncDecl)):
@@ -629,6 +632,7 @@ class RoLangTransformer(Transformer):
 
         return ast.ExtensionDecl(
             extended_type=extended_type,
+            generic_params=generics,
             conformances=conformances,
             constraints=constraints,
             members=members,
@@ -1122,6 +1126,23 @@ class RoLangTransformer(Transformer):
     def dict_entry(self, items: list) -> tuple:
         return (items[0], items[1])
 
+    def switch_expr(self, items: list) -> ast.SwitchExpr:
+        return ast.SwitchExpr(value=items[0], cases=items[1:])
+
+    def value_case_branch(self, items: list) -> ast.SwitchCase:
+        return ast.SwitchCase(patterns=items[0], body=[ast.ExprStmt(expr=items[1])])
+
+    def value_default_branch(self, items: list) -> ast.SwitchCase:
+        return ast.SwitchCase(is_default=True, body=[ast.ExprStmt(expr=items[0])])
+
+    def range_expr(self, items: list) -> ast.Expr:
+        if len(items) == 1 or items[1] is None:
+            return items[0]
+        return ast.StructLiteral(type_name=ast.NamedType(name="IndexRange"), arguments=[
+            ast.Argument(label="start", value=items[0]),
+            ast.Argument(label="end", value=items[2]),
+            ast.Argument(label="inclusive", value=ast.Literal(kind="bool", value=str(items[1]) == "..."))])
+
     def lambda_expr(self, items: list) -> ast.Lambda:
         params = []
         body = []
@@ -1132,6 +1153,10 @@ class RoLangTransformer(Transformer):
                 body.append(item)
             elif isinstance(item, ast.Expr):
                 body.append(ast.ReturnStmt(value=item, implicit=True))
+        if body and isinstance(body[-1], ast.SwitchStmt):
+            switch = body[-1]
+            if switch.cases and all(len(c.body) == 1 and isinstance(c.body[0], ast.ExprStmt) for c in switch.cases):
+                body[-1] = ast.ReturnStmt(value=ast.SwitchExpr(value=switch.value, cases=switch.cases, span=switch.span), implicit=True)
         return ast.Lambda(params=params, body=body)
 
     def lambda_params(self, items: list) -> list[tuple]:
@@ -1179,6 +1204,21 @@ class RoLangTransformer(Transformer):
         raw = str(items[0]).replace("{{", "{").replace("}}", "}")
         return ast.Literal(value=self._unescape_string(raw), kind="string")
 
+    def multiline_interpolation_text(self, items: list) -> ast.Literal:
+        return self.interpolation_text(items)
+
+    def raw_string_literal(self, items: list) -> ast.Literal:
+        raw = str(items[0])[1:]
+        size = 3 if raw.startswith('"""') else 1
+        return ast.Literal(value=raw[size:-size], kind="string")
+
+    def multiline_string_literal(self, items: list) -> ast.Literal:
+        return ast.Literal(value=self._unescape_string(str(items[0])[3:-3]), kind="string")
+
+    @v_args(meta=True)
+    def interpolated_multiline_string(self, meta, items: list) -> ast.Expr:
+        return self._interpolated_string(meta, items, 3)
+
     def interpolation_value(self, items: list) -> ast.Call:
         value = items[0]
         return ast.Call(callee=ast.MemberAccess(object=value, member="to_string",
@@ -1187,6 +1227,9 @@ class RoLangTransformer(Transformer):
 
     @v_args(meta=True)
     def interpolated_string(self, meta, items: list) -> ast.Expr:
+        return self._interpolated_string(meta, items, 1)
+
+    def _interpolated_string(self, meta, items: list, closing: int) -> ast.Expr:
         # Lark ignores whitespace globally, including whitespace-only text
         # between template fields. Restore literal gaps from their exact source
         # spans; expression spans include braces, so their trivia stays code.
@@ -1198,8 +1241,8 @@ class RoLangTransformer(Transformer):
                 parts.append(ast.Literal(value=self._unescape_string(raw), kind="string"))
             parts.append(part)
             cursor = part._template_end
-        if cursor < meta.end_pos - 1:
-            raw = self.source[cursor:meta.end_pos - 1]
+        if cursor < meta.end_pos - closing:
+            raw = self.source[cursor:meta.end_pos - closing]
             parts.append(ast.Literal(value=self._unescape_string(raw), kind="string"))
         if not parts:
             return ast.Literal(value="", kind="string")

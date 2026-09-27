@@ -398,8 +398,8 @@ class IfStmt(Stmt):
 
 @dataclass
 class GuardStmt(Stmt):
-    """Guard statement: guard condition else { }"""
-    condition: Optional[Expr] = None
+    """Guard statement, including guard let bindings."""
+    condition: Optional[Union[Expr, tuple[Pattern, Expr]]] = None
     else_block: Optional[Block] = None
 
 
@@ -429,6 +429,12 @@ class SwitchCase(Node):
 @dataclass
 class SwitchStmt(Stmt):
     """Switch statement."""
+    value: Optional[Expr] = None
+    cases: list[SwitchCase] = field(default_factory=list)
+
+
+@dataclass
+class SwitchExpr(Expr):
     value: Optional[Expr] = None
     cases: list[SwitchCase] = field(default_factory=list)
 
@@ -622,6 +628,7 @@ class ProtocolDecl(TopLevelItem):
 @dataclass
 class ExtensionDecl(TopLevelItem):
     """Extension declaration."""
+    generic_params: list[GenericParam] = field(default_factory=list)
     extended_type: Optional[NamedType] = None
     conformances: list[NamedType] = field(default_factory=list)
     constraints: list[Constraint] = field(default_factory=list)
