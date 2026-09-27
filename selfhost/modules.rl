@@ -17,7 +17,7 @@ pub struct ModuleSymbol {
     pub var source: String;
     pub var qualified: String;
     pub var public: Bool;
-    pub var kind: i32; // 1 function, 2 struct
+    pub var kind: i32; // 1 function, 2 type (struct or alias)
 }
 
 // Resolve source names before handing the merged syntax tree to the backend.
@@ -29,9 +29,14 @@ pub struct Modules {
     pub var root: String;
     pub var imports: Dict<String, Vec<ModuleImport>>;
     pub var symbols: Dict<String, ModuleSymbol>;
+    pub var aliases: Dict<String, Declaration>;
+    pub var expanded: Dict<String, String>;
+    pub var active: Dict<String, Bool>;
+    pub var visibility: Dict<String, Bool>;
+    pub var alias_depth: i32;
 
     pub static def new() -> Modules {
-        return Modules { program: Program { functions: Vec<Function>.new(), declarations: Vec<Declaration>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new() }, paths: Dict<String, i32>.with_capacity(16, 1), error: "", root: "", imports: Dict<String, Vec<ModuleImport>>.with_capacity(16, 1), symbols: Dict<String, ModuleSymbol>.with_capacity(64, 1) };
+        return Modules { program: Program { functions: Vec<Function>.new(), declarations: Vec<Declaration>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new() }, paths: Dict<String, i32>.with_capacity(16, 1), error: "", root: "", imports: Dict<String, Vec<ModuleImport>>.with_capacity(16, 1), symbols: Dict<String, ModuleSymbol>.with_capacity(64, 1), aliases: Dict<String, Declaration>.with_capacity(16, 1), expanded: Dict<String, String>.with_capacity(16, 1), active: Dict<String, Bool>.with_capacity(16, 1), visibility: Dict<String, Bool>.with_capacity(32, 1), alias_depth: 0 };
     }
     pub def offset(ids: Vec<i32>, amount: i32) -> Void {
         var i = 0;
@@ -117,6 +122,7 @@ pub struct Modules {
             if !token.source.equals(self.root) { self.error = location(token, "imported main unsupported"); return; }
             qualified = "main";
         }
+        if kind == 2 { self.visibility.set(qualified, modifiers.contains("pub ")); }
         self.symbols.set(key, ModuleSymbol { name: token.text, source: token.source, qualified: qualified, public: modifiers.contains("pub "), kind: kind });
     }
     pub def import_name(edge: ModuleImport, name: String) -> String {
@@ -187,9 +193,37 @@ pub struct Modules {
         }
         return "";
     }
+    pub def expand(name: String) -> String {
+        if !self.error.is_empty() { return name; }
+        if let cached = self.expanded.get(name) { return cached; }
+        if let declaration = self.aliases.get(name) {
+            if self.active.contains(name) { self.error = location(declaration.token, "cyclic typealias"); return name; }
+            if self.alias_depth >= 64 { self.error = location(declaration.token, "typealias nesting limit exceeded"); return name; }
+            self.active.set(name, true); self.alias_depth = self.alias_depth + 1;
+            let result = self.type_name(declaration.value, declaration.token);
+            self.alias_depth = self.alias_depth - 1; self.active.remove(name);
+            if self.error.is_empty() { self.expanded.set(name, result); }
+            return result;
+        }
+        return name;
+    }
+    pub def check_public_type(name: String, token: Token) -> Void {
+        var i = 0;
+        while i < (name.len() as i32) {
+            let start = i;
+            if identifier_start(name.byte_at(i)) || name.byte_at(i) == 36 {
+                i = i + 1;
+                while i < (name.len() as i32) && (identifier_start(name.byte_at(i)) || decimal_digit(name.byte_at(i)) || name.byte_at(i) == 36) { i = i + 1; }
+                if let public = self.visibility.get(name.substring(start, i - start)) {
+                    if !public { self.error = location(token, "public typealias exposes non-public type"); return; }
+                }
+            } else { i = i + 1; }
+        }
+    }
     pub def type_name(name: String, token: Token) -> String {
+        if !self.error.is_empty() { return ""; }
         // Replace identifiers inside nested Vec/Dict/optional type spellings.
-        var result = ""; var i = 0;
+        var result = ""; var i = 0; var alias_used = false;
         while i < (name.len() as i32) {
             let start = i;
             if identifier_start(name.byte_at(i)) {
@@ -197,19 +231,45 @@ pub struct Modules {
                 while i < (name.len() as i32) && (identifier_start(name.byte_at(i)) || decimal_digit(name.byte_at(i)) || name.byte_at(i) == 46) { i = i + 1; }
                 let word = name.substring(start, i - start);
                 let resolved = self.resolve(word, token, 2);
-                if resolved.starts_with("$ambiguous$") { self.error = location(token, "ambiguous imported type '" + word + "'"); }
-                if resolved.is_empty() { result = result + word; } else { result = result + resolved; }
+                if resolved.starts_with("$ambiguous$") { self.error = location(token, "ambiguous imported type '" + word + "'"); return ""; }
+                var replacement = word;
+                if resolved.is_empty() {
+                    if self.alias_depth > 0 && !primitive_type(word) && !word.equals("String") && !word.equals("StringBuilder") && !word.equals("Vec") && !word.equals("Dict") {
+                        self.error = location(token, "unknown type in typealias: " + word); return "";
+                    }
+                } else {
+                    if self.aliases.contains(resolved) && i < (name.len() as i32) && name.byte_at(i) == 60 { self.error = location(token, "typealias does not accept generic arguments"); return ""; }
+                    if self.aliases.contains(resolved) { alias_used = true; }
+                    replacement = self.expand(resolved);
+                    if !self.error.is_empty() { return ""; }
+                }
+                if (self.alias_depth > 0 || alias_used) && result.len() + replacement.len() > 65536 { self.error = location(token, "expanded type size limit exceeded"); return ""; }
+                result = result + replacement;
             } else { result = result + name.substring(i, 1); i = i + 1; }
         }
+        var complexity = 0; i = 0;
+        while i < (result.len() as i32) {
+            let c = result.byte_at(i);
+            if c == 60 || c == 63 || c == 40 || c == 91 { complexity = complexity + 1; }
+            i = i + 1;
+        }
+        if (self.alias_depth > 0 || alias_used) && complexity > 128 { self.error = location(token, "expanded type complexity limit exceeded"); }
         return result;
     }
     pub def validate() -> Void {
         if self.paths.len() <= 1 {
             var needed = false;
+            for declaration in self.program.declarations { if declaration.kind == 3 { needed = true; } }
             if let edges = self.imports.get(self.root) { for edge in edges { if !edge.alias.is_empty() || edge.public { needed = true; } } }
             if !needed { return; }
         }
-        for declaration in self.program.declarations { if declaration.kind == 2 { self.register(declaration.token, declaration.modifiers, 2); } }
+        for declaration in self.program.declarations {
+            if declaration.kind == 2 || declaration.kind == 3 {
+                if declaration.kind == 3 && declaration.modifiers.contains("static") { self.error = location(declaration.token, "static typealias unsupported"); return; }
+                self.register(declaration.token, declaration.modifiers, 2);
+                if declaration.kind == 3 { self.aliases.set(self.resolve(declaration.token.text, declaration.token, 2), declaration); }
+            }
+        }
         for fn in self.program.functions { if fn.owner.is_empty() { self.register(fn.token, fn.modifiers, 1); } }
         if !self.error.is_empty() { return; }
         for source in self.imports.keys() {
@@ -219,6 +279,16 @@ pub struct Modules {
                 }
             }
         }
+        // Resolve every alias, including unused ones, before mutating syntax nodes.
+        for key in self.aliases.keys() { self.expand(key); if !self.error.is_empty() { return; } }
+        for declaration in self.program.declarations {
+            if declaration.kind == 3 {
+                declaration.value = self.expand(self.resolve(declaration.token.text, declaration.token, 2));
+                if declaration.modifiers.contains("pub ") { self.check_public_type(declaration.value, declaration.token); }
+                if !self.error.is_empty() { return; }
+            }
+        }
+        if !self.error.is_empty() { return; }
         var expression_id = 0;
         for expr in self.program.expressions {
             expr.type_name = self.type_name(expr.type_name, expr.token);
@@ -226,7 +296,7 @@ pub struct Modules {
                 expr.type_name = self.resolve(expr.token.text, expr.token, 1);
                 if expr.type_name.is_empty() { expr.type_name = "$missing$" + expr.token.text; }
             }
-            if expr.kind == 3 || expr.kind == 9 { expr.type_name = self.resolve(self.reference_name(expression_id), expr.token, 2); }
+            if expr.kind == 3 || expr.kind == 9 { expr.type_name = self.expand(self.resolve(self.reference_name(expression_id), expr.token, 2)); }
             if expr.kind == 14 { expr.type_name = self.resolve(self.reference_name(expr.left), expr.token, 1); }
             expression_id = expression_id + 1;
         }

@@ -381,6 +381,7 @@ pub struct Backend {
         var index = 0;
         for declaration in self.program.declarations {
             if declaration.kind == 1 && self.builtin_module(declaration.value) { index = index + 1; continue; }
+            if declaration.kind == 3 { index = index + 1; continue; }
             if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
@@ -390,6 +391,7 @@ pub struct Backend {
             index = index + 1;
         }
         for declaration in self.program.declarations {
+            if declaration.kind == 3 && !declaration.value.equals("Void") { self.supported_type(declaration.token, declaration.value); }
             let names = Dict<String, i32>.with_capacity(8, 1);
             for field in declaration.fields {
                 self.supported_type(field.token, field.type_name);
@@ -561,7 +563,7 @@ pub struct Backend {
         var owner = ""; var code = ""; var static_call = false;
         var receiver_type = receiver.token.text;
         if !receiver.type_name.is_empty() { receiver_type = receiver.type_name; }
-        if (receiver.kind == 3 || (receiver.kind == 9 && !receiver.type_name.is_empty())) && (self.structs.contains(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
+        if (receiver.kind == 3 || (receiver.kind == 9 && !receiver.type_name.is_empty())) && (self.structs.contains(receiver_type) || self.is_vector(receiver_type) || self.is_dictionary(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
             if shadowed { static_call = false; }
             else {
                 if receiver_type.starts_with("$ambiguous$") { self.fail(receiver.token, "ambiguous imported type"); return self.invalid(); }
@@ -571,6 +573,8 @@ pub struct Backend {
         if !static_call {
             let object = self.expression(member.left); owner = object.type_name; code = object.code;
         }
+        if static_call && self.is_vector(owner) { self.supported_type(member.token, owner); return self.vector_constructor(owner, member.token, expr.args); }
+        if static_call && self.is_dictionary(owner) { self.supported_type(member.token, owner); return self.dict_constructor(owner, member.token, expr.args); }
         if owner.equals("StringBuilder") {
             if static_call {
                 if !member.token.text.equals("new") { self.fail(member.token, "unknown StringBuilder constructor"); return self.invalid(); }

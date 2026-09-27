@@ -1377,6 +1377,7 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
     modules.mkdir()
     test_native_module_reexport_alias_chains(compiler, modules)
     test_native_module_std_aliases_and_reexports(compiler, modules)
+    test_native_typealias_modules_and_reexports(compiler, modules)
     # Keep the existing protection against overwriting the input, including symlinks.
     alias = tmp_path / 'source-alias.rl'
     alias.symlink_to(path)
@@ -1827,4 +1828,134 @@ def test_native_module_alias_resolution_preserves_member_receivers(bootstrap, tm
     struct Holder { var Box: Box; }
     def make() -> Holder { return Holder { Box: Box {} }; }
     def main() -> i32 { return make().Box.read(); }"""
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+TYPEALIAS_PROGRAMS = [
+    ('''typealias Index = Later;
+    typealias Later = i32;
+    typealias Maybe = Index?;
+    typealias Wide = i64;
+    typealias Nothing = Void;
+    def noop() -> Nothing { return; }
+    def increment(x: Index) -> Later { return x + 1; }
+    def main() -> i32 { noop(); let n: Maybe = increment(41);
+        let wide = 42 as Wide; if wide != 42 { return 1; }
+        if let value = n { return value; } return 2;
+    }''', 42),
+    ('''typealias Nodes = Vec<NodeId>;
+    typealias NodeId = i32;
+    typealias Table = Dict<String, Nodes>;
+    def main() -> i32 { let nodes: Nodes = Nodes.new(); nodes.push(42);
+        let table = Table.with_capacity(1, 1); table.set("nodes", nodes);
+        if let values = table.get("nodes") { return values[0]; } return 1;
+    }''', 42),
+    ('''typealias Record = Item;
+    typealias OptionalRecord = Record?;
+    struct Item { var n: i32; static def new(n: i32) -> Item { return Record { n: n }; }
+        def read() -> i32 { return self.n; } }
+    def identity(x: Record) -> Item { return x; }
+    def main() -> i32 { let x = Record.new(40); let y: OptionalRecord = identity(x);
+        if let value = y { value.n = value.n + 2; return x.read(); } return 1;
+    }''', 42),
+    ('''import std.string_builder
+    typealias Text = StringBuilder;
+    typealias Flag = Bool;
+    def main() -> i32 { let b: Text = Text.new(); b.append("42"); let yes: Flag = true;
+        if yes && b.to_string().equals("42") { return 42; } return 1;
+    }''', 42),
+]
+
+
+@pytest.mark.parametrize('source, expected', TYPEALIAS_PROGRAMS)
+def test_native_typealias_matches_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+def test_native_typealias_modules_and_reexports(bootstrap, tmp_path):
+    (tmp_path / 'types.rl').write_text('''pub typealias Id = i32;
+        pub typealias List = Vec<Id>;
+        pub struct Item { pub var n: Id; pub static def new(n: Id) -> Item { return Item { n: n }; } }
+        pub typealias Record = Item;
+        typealias Private = i64;''')
+    (tmp_path / 'api.rl').write_text('pub import "types.rl" as Types')
+    source = '''import "api.rl" as API
+    typealias Id = String;
+    typealias Record = API.Types.Record;
+    def read(n: API.Types.Id) -> i32 { return n; }
+    def main() -> i32 { let xs = API.Types.List.new(); xs.push(42);
+        let x = Record.new(xs[0]); let literal = API.Types.Record { n: read(x.n) };
+        let local: Id = "text"; if !local.equals("text") { return 1; }
+        return literal.n;
+    }'''
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+@pytest.mark.parametrize('declarations, diagnostic', [
+    ('typealias A = A;', 'cyclic typealias'),
+    ('typealias A = B; typealias B = Vec<A>;', 'cyclic typealias'),
+    ('typealias A = Missing;', 'unknown type in typealias'),
+    ('typealias A = i32; typealias B = A<i32>;', 'does not accept generic arguments'),
+    ('typealias A = i32; def f(x: A<i32>) -> Void {}', 'does not accept generic arguments'),
+    ('struct Hidden {} pub typealias A = Vec<Hidden>;', 'non-public type'),
+    ('typealias A = i32; typealias A = i64;', 'duplicate declaration'),
+    ('typealias i32 = i64;', 'reserved struct name'),
+    ('typealias Callback = (i32)->i32;', 'declared non-generic structs'),
+    ('typealias Wide = f64;', 'declared non-generic structs'),
+    ('static typealias A = i32;', 'static typealias unsupported'),
+    ('typealias Nothing = Void; typealias Bad = Vec<Nothing>;', 'declared non-generic structs'),
+])
+def test_native_typealias_errors(bootstrap, tmp_path, declarations, diagnostic):
+    test_errors_preserve_output(bootstrap, tmp_path,
+        declarations + '\ndef main() -> i32 { return 0; }', diagnostic)
+
+
+def test_native_typealias_public_chain(bootstrap, tmp_path):
+    source = '''typealias PrivateName = Public;
+    pub typealias Visible = PrivateName;
+    pub struct Public { pub var n: i32; }
+    def main() -> i32 { let x = Visible { n: 42 }; return x.n; }'''
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+def test_native_typealias_cross_module_cycle(bootstrap, tmp_path):
+    (tmp_path / 'a.rl').write_text('import "b.rl" as B\npub typealias A = B.B;')
+    (tmp_path / 'b.rl').write_text('import "a.rl" as A\npub typealias B = A.A;')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "a.rl"\ndef main() -> i32 { return 0; }', 'cyclic typealias')
+
+
+def test_native_typealias_expansion_limits(bootstrap, tmp_path):
+    chain = '\n'.join(f'typealias A{i} = A{i+1};' for i in range(70)) + '\ntypealias A70 = i32;'
+    test_errors_preserve_output(bootstrap, tmp_path, chain + '\ndef main() -> i32 { return 0; }', 'typealias nesting limit')
+    growth = '\n'.join(f'typealias A{i} = Dict<A{i+1}, A{i+1}>;' for i in range(20)) + '\ntypealias A20 = i32;'
+    test_errors_preserve_output(bootstrap, tmp_path, growth + '\ndef main() -> i32 { return 0; }', 'expanded type complexity limit')
+
+
+def test_native_typealias_private_import(bootstrap, tmp_path):
+    (tmp_path / 'lib.rl').write_text('typealias Hidden = i32;')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "lib.rl" as L\ntypealias A = L.Hidden;\ndef main() -> i32 { return 0; }', 'unknown type in typealias')
+
+
+def test_native_typealias_static_method_return(bootstrap, tmp_path):
+    # LLVM currently loses the alias return type on static method calls.
+    source = '''typealias Record = Item;
+    struct Item { var n: i32; static def new(n: i32) -> Record { return Record { n: n }; }
+        def read() -> i32 { return self.n; } }
+    def main() -> i32 { return Record.new(42).read(); }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        assert execute_c(output, level).returncode == 42
+
+
+def test_native_typealias_recursive_struct(bootstrap, tmp_path):
+    source = '''typealias Link = Node?;
+    struct Node { var n: i32; var next: Link; }
+    def main() -> i32 { let head = Node { n: 40, next: nil };
+        var cursor: Link = Node { n: 2, next: head }; var sum = 0;
+        while true { if let node = cursor { sum = sum + node.n; cursor = node.next; } else { break; } }
+        return sum;
+    }'''
     test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)

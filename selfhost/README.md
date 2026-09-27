@@ -52,6 +52,24 @@ standard-library built-ins. Escaped import paths and imported entrypoints remain
 unsupported. Import and re-export traversal depth are limited to 128. Output path
 protection uses canonical paths, not hard-link identity.
 
+## Transparent type aliases
+
+`typealias Id = i32;` names an existing supported type without creating a distinct
+runtime type. Alias chains and forward references resolve in the declaring module,
+including qualified names reached through imports and public re-exports. Aliases
+work in parameters, returns, fields, locals, casts, nested collections and optional
+types, struct literals, and static constructors (`Nodes.new()` for an alias of
+`Vec<i32>`, for example). Recursive struct layouts remain valid through aliases.
+
+All aliases are validated, even when unused. Cyclic aliases, unknown/private import
+targets, generic arguments applied to an alias, and public aliases exposing private
+underlying types are diagnosed before output is written. Expansion is memoized,
+with a recursion limit of 64 and bounds of 65,536 bytes and 128 structural type
+markers per expanded type. These bounds prevent excessive expansion through alias
+chains. Underlying types still need C backend support: function types and broader
+numeric widths remain unsupported. Aliases may name fixed generic instantiations;
+aliases themselves take no type arguments.
+
 ## Build and run
 
 From the repository root, using the existing development environment:
@@ -136,7 +154,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-Local imports support the module subset above; type aliases are not lowered yet. String fields,
+Local imports and transparent type aliases support the subset described above. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -439,19 +457,17 @@ environment APIs, stdin, and directory listing are not lowered yet.
 
 On Apple Silicon macOS, this milestone passed:
 
-- **116 regression checks passed** in 201.60 seconds across O0/O3 bootstrap
-  builds, covering struct execution and diagnostics, generated-C sanitizers,
-  parsing the compiler's source files, and standard-library I/O.
-- **136 focused checks passed** in 109.56 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. These cover module
-  identities, visibility, aliases, re-exports, cycles, ambiguity, shadowing,
-  standard-library calls, source protections, and native self-rebuilds.
-- **4 final checks passed** in 70.26 seconds after fixing computed member receivers:
-  the new member/type-name collision regression and direct project self-rebuilds
-  at both bootstrap optimization levels.
+- **170 regression checks passed** in 342.25 seconds across O0/O3 bootstrap
+  builds, covering existing struct/optional/dictionary/builder behavior, diagnostics,
+  parsing the compiler's own sources, and native compiler-core compilation.
+- **154 focused checks passed** in 182.56 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These cover type aliases,
+  declaration scopes, visibility, forward references, cycles, expansion limits,
+  containers, struct constructors, module imports/re-exports, and self-rebuilds.
 - Rebuild tests compile the actual CLI through three C generations with identical
   C output and no Python/tools on the rebuilding executable's PATH. Stage 3 also
-  compiles nested aliases and standard-library re-exports. Stage 2 is compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
+  compiles nested import aliases, standard-library re-exports, and cross-module
+  type aliases. Stage 2 is compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
   Generated file-byte tests also use both sanitizers. `detect_leaks=0` means these
   checks do not validate leaks.
 - The preceding I/O milestone also passed **5 primary-runtime regressions**
@@ -478,3 +494,8 @@ against an explicit expected result at C O0/O3; other module/type cases retain
 differential checks against LLVM. The reference also conflates some identically
 named functions reached through different import aliases. Native collision tests
 retain explicit expected results; renamed equivalents provide LLVM comparisons.
+
+A further reference-compiler limitation affects static methods returning a struct
+through a type alias: LLVM's frontend can infer an error type for the call result.
+The native backend supports this case and checks its expected result at C O0/O3;
+other typealias programs are compared against the LLVM compiler.
