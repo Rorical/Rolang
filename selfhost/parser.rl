@@ -199,6 +199,16 @@ pub struct Parser {
         }
         } }
         while self.error.is_empty() {
+            if self.generic_reference() && !self.reference_name(left).is_empty() {
+                var name = self.reference_name(left); self.expect("<"); name = name + "<";
+                while self.error.is_empty() {
+                    name = name + self.type_name();
+                    if !self.take(",") { break; } name = name + ",";
+                }
+                self.expect(">"); name = name + ">";
+                left = self.add_expr(token, 13, -1, -1, Vec<i32>.new());
+                let node = self.program.expressions[left]; node.type_name = name; continue;
+            }
             if self.take(".") {
                 let member = self.name();
                 left = self.add_expr(member, 9, left, -1, Vec<i32>.new());

@@ -461,6 +461,8 @@ forms; see [source modernization and validation](docs/source-modernization.md).
 The [Rolang-written bootstrap compiler](selfhost/README.md) lexes, parses,
 checks types, and emits standalone C for a growing subset including structs,
 methods, strings, vectors, dictionaries, optionals, and compiler-oriented I/O.
+It also supports [generic function, struct and enum specialization](docs/selfhost-generics.md),
+including recursive generic enums and generic methods.
 Its real CLI can now rebuild itself directly from `selfhost/main.rl` through
 three native generations with identical generated C; rebuilt executables also
 pass program, AST JSON, diagnostic, and output-preservation checks.

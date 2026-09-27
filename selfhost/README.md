@@ -55,12 +55,12 @@ iterator method chains, tuple destructuring, and general named/default
 arguments—remain outside this native backend's subset. Standard library and
 example sources targeting Python/LLVM use them where appropriate. See the
 [repository modernization notes](../docs/source-modernization.md). The migration
-passes all 728 native compiler checks (698 regression cases and 30 syntax/bootstrap
+passed all 728 native compiler checks (698 regression cases and 30 syntax/bootstrap
 cases), including the O0/O3 source-tree comparisons and three-generation rebuild.
 
 ## Enums and switch
 
-The native compiler supports non-generic enums, associated values (including
+The native compiler supports enums, associated values (including
 recursive references), enum methods, labeled constructors, switch statements and
 switch expressions, nested case patterns, scoped bindings and `where` guards.
 Enum and Bool switches require complete coverage; switch expressions also require
@@ -70,8 +70,17 @@ enum identities. `selfhost/ast.rl` now uses a recursive `Pattern` enum directly.
 See [native enum semantics and validation](../docs/selfhost-enums.md) for the
 supported patterns, evaluation order, current boundaries and bootstrap checks.
 `selfhost/examples/enums.rl` demonstrates a compiler-style recursive tree and
-returns 42 under both compilers. The expanded suite passes **792 native checks**
+returns 42 under both compilers. The enum milestone passed **792 native checks**
 and **45 related primary-compiler checks**, including three identical C generations.
+
+## Generic specialization
+
+Generic functions, structs and enums now specialize to concrete C functions and
+layouts. This includes recursive enum payloads, generic instance/static methods,
+argument/return-context inference, imported qualified types and cached instances.
+The compiler itself uses `copy_items<T>` when cloning its AST.
+See [generic semantics, limits and validation](../docs/selfhost-generics.md) and
+the executable [generic tree example](examples/generics.rl).
 
 ## Native local imports
 
@@ -168,7 +177,7 @@ that resolve to the same path are rejected, including symlink aliases.
 | Statements | `if let`, `return`, `if { } else { }`, `while`, `for` over vectors, `break`/`continue`, nested/unsafe blocks, expression statements |
 | Expressions | Decimal i32/i64 integers, checked byte literals, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
-| Objects | Non-generic structs and enums, associated values, fields, labeled constructors, static and instance methods, shared references |
+| Objects | Structs and enums, generic specialization, associated values, fields, labeled constructors, static and instance methods, shared references |
 | Collections | Typed `Vec<T>` and `Dict<K,V>`, nested collections, indexed access/assignment, constructors and core methods |
 | Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
 
@@ -273,8 +282,7 @@ Supported operations:
 runtime bounds diagnostic. Empty `pop` follows the current library's zero-slot
 behavior: zero/false for scalars and a null reference for heap elements. Callers
 must ensure a nonempty vector before using a popped heap object. Explicit `free`,
-raw handles, iterator objects, collection literals, and general user-defined
-generic specialization remain unsupported.
+raw handles, iterator objects, and collection literals remain unsupported.
 
 Vector references preserve aliasing across calls, fields, and returned values.
 Indexed assignment evaluates the receiver, index, and value in that order, as in
@@ -370,12 +378,12 @@ The tests build the Rolang-written compiler at O0 and O3, then:
 
 ## Deliberate limits and next milestones
 
-The frontend still accepts a subset. Generic enums, protocols, extensions, constraints,
+The frontend still accepts a subset. Generic aliases, protocols, extensions, constraints,
 closures, labeled/default call parameters, collection literals, tuple types,
 optional chaining, additional numeric literal forms, bitwise operators, async,
 FFI declarations, and implicit value returns are not implemented here. Struct fields
 and statements require semicolons. `else if` must be written as `else { if ... }`.
-Generic expression receivers currently use unqualified names (`Vec<T>.new()`).
+Generic expression receivers support qualified names (`API.Box<i32>.new()`).
 The existing compiler remains the primary compiler for the broader language.
 
 Expression/block/type nesting is limited to 128; source length is limited to the
@@ -386,11 +394,10 @@ Next steps toward actual self-compilation:
 
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
-2. **In progress:** non-generic structs/methods, core strings, signed widths,
+2. **In progress:** structs/methods, generic specialization, core strings, signed widths,
    typed vectors, dictionaries, optional values, StringBuilder, and byte casts
    now have C lowering, including the OS bridge and native module loader used by
-   the real CLI. General generic specialization
-   remains part of broader language coverage.
+   the real CLI. Broader language coverage remains unfinished.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. **Verified from project sources:** rebuild the complete CLI through three C
    generations directly from `selfhost/main.rl`.

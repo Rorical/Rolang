@@ -1,6 +1,6 @@
 # Native enums and switch
 
-The Rolang-written compiler now compiles non-generic enums with associated values,
+The Rolang-written compiler now compiles enums with associated values,
 recursive payloads, methods, and module-scoped identities into standalone C11.
 `Pattern` in `selfhost/ast.rl` is itself a recursive enum. Its parser, module-index
 remapping, AST serializer, and backend use constructors and switch patterns.
@@ -51,7 +51,8 @@ enum Expr {
 
 ## Current boundaries
 
-Generic enums, OR/multiple patterns per arm, tuple patterns, and optional
+Generic enums are covered by [native specialization](selfhost-generics.md).
+OR/multiple patterns per arm, tuple patterns, and optional
 `.Some`/`.None` patterns remain unsupported. Use `if let`/`guard let` for optionals.
 General function named/default arguments remain unsupported; labels are accepted
 for enum constructors. Switch value branches require explicit semicolons.

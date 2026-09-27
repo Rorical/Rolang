@@ -1,6 +1,7 @@
 import "lexer.rl"
 import "ast.rl"
 import "parser.rl"
+import "generics.rl"
 import "string_codegen.rl"
 import "vector_codegen.rl"
 import "dict_codegen.rl"
@@ -17,6 +18,12 @@ pub struct Backend {
     pub var functions: Dict<String, i32>;
     pub var scopes: Vec<Dict<String, Binding>>;
     pub var structs: Dict<String, i32>;
+    pub var templates: Dict<String, i32>;
+    pub var instances: Dict<String, i32>;
+    pub var specialization_count: i32;
+    pub var specialization_depth: i32;
+    pub var expected_type: String;
+    pub var type_depth: i32;
     pub var output: StringBuilder;
     pub var error: String;
     pub var next_id: i32;
@@ -27,7 +34,7 @@ pub struct Backend {
 
     pub static def new(program: Program) -> Backend {
         return Backend { program: program, functions: Dict<String, i32>.with_capacity(16, 1),
-            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, loop_depth: 0, unsafe_depth: 0, return_type: "i32" };
+            structs: Dict<String, i32>.with_capacity(16, 1), templates: Dict<String, i32>.with_capacity(16, 1), instances: Dict<String, i32>.with_capacity(16, 1), specialization_count: 0, specialization_depth: 0, expected_type: "", type_depth: 0, scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, loop_depth: 0, unsafe_depth: 0, return_type: "i32" };
     }
     pub def fail(token: Token, message: String) -> Void {
         if self.error.is_empty() { self.error = location(token, message); }
@@ -61,9 +68,9 @@ pub struct Backend {
         let expr = self.program.expressions.get(id); var inner = expected;
         if self.is_optional(inner) { inner = self.optional_inner(inner); }
         if expr.kind == 16 { return self.switch_value(expr.left, expr.arms, expected, true, token).value; }
-        if expr.kind == 17 { return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels), expected, token); }
+        if expr.kind == 17 { return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels, inner), expected, token); }
         if expr.kind == 14 && self.program.expressions.get(expr.left).kind == 17 {
-            return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels), expected, token);
+            return self.coerce(self.enum_construct(inner, expr.token, expr.args, expr.labels, inner), expected, token);
         }
         if self.numeric(inner) {
             if expr.kind == 1 { return self.coerce(self.integer_value(expr.token, false, inner), expected, token); }
@@ -72,7 +79,9 @@ pub struct Backend {
                 if literal.kind == 1 { return self.coerce(self.integer_value(literal.token, true, inner), expected, token); }
             }
         }
-        return self.coerce(self.expression(id), expected, token);
+        let previous = self.expected_type; self.expected_type = expected;
+        let value = self.expression(id); self.expected_type = previous;
+        return self.coerce(value, expected, token);
     }
     pub def require_type(token: Token, actual: String, expected: String) -> Void {
         if !actual.equals(expected) && !self.widens(actual, expected) { self.fail(token, f"expected {expected}, got {actual}"); }
@@ -121,11 +130,12 @@ pub struct Backend {
             self.depth = self.depth - 1;
             return Value { code: "0", type_name: "i32" };
         }
-        let result = self.emit_expression(id);
+        let expected = self.expected_type; self.expected_type = "";
+        let result = self.emit_expression(id, expected);
         self.depth = self.depth - 1;
         return result;
     }
-    pub def emit_expression(id: i32) -> Value {
+    pub def emit_expression(id: i32, expected: String) -> Value {
         let expr = self.program.expressions.get(id);
         let token = expr.token;
         if expr.kind == 16 { return self.switch_value(expr.left, expr.arms, "", true, token).value; }
@@ -190,13 +200,13 @@ pub struct Backend {
             if !expr.type_name.is_empty() { name = expr.type_name; }
             if name.starts_with("$ambiguous$") { self.fail(token, "ambiguous imported function"); return self.invalid(); }
             if name.starts_with("$std$") { return self.stdlib_call(token, expr.args, true); }
-            if let index = self.functions.get(name) { return self.call(index, expr.args, "", token); }
+            if let index = self.functions.get(name) { return self.call(index, expr.args, "", token, expected); }
             if !self.stdlib_module(token.text).is_empty() { return self.stdlib_call(token, expr.args, false); }
             self.fail(token, f"unknown function '{token.text}'"); return self.invalid();
         }
         if expr.kind == 9 {
             let owner = self.static_owner(expr.left);
-            if self.is_enum(owner) { return self.enum_construct(owner, token, expr.args, expr.labels); }
+            if self.is_enum(owner) { return self.enum_construct(owner, token, expr.args, expr.labels, expected); }
             let object = self.expression(expr.left);
             let field = self.field_index(object.type_name, token);
             if field < 0 { return self.invalid(); }
@@ -219,7 +229,7 @@ pub struct Backend {
             return self.vector_get(object, index, token);
         }
         if expr.kind == 10 { return self.construct(expr); }
-        if expr.kind == 14 { return self.method_call(expr); }
+        if expr.kind == 14 { return self.method_call(expr, expected); }
         if expr.kind != 4 { self.fail(token, "expression unsupported by C backend"); return self.invalid(); }
         let left = self.expression(expr.left);
         let op = token.text;
@@ -270,6 +280,7 @@ pub struct Backend {
     pub def statement(id: i32) -> Bool {
         let statement = self.program.statements.get(id);
         let token = statement.token;
+        if !statement.annotation.is_empty() { self.supported_type(token, statement.annotation); }
         if statement.kind == 16 { return self.switch_value(statement.expr, statement.arms, "", false, token).returned; }
         if statement.kind == 7 || statement.kind == 12 {
             self.output.append_line("{");
@@ -388,7 +399,144 @@ pub struct Backend {
         return text.to_string();
     }
     // Validate every node, including unreachable constructs, before emission.
+    pub def validate_parameters(names: Vec<String>, token: Token) -> Void {
+        let seen = Dict<String, Bool>.with_capacity(8, 1);
+        for name in names {
+            if seen.contains(name) { self.fail(token, "duplicate generic parameter"); }
+            if primitive_type(name) || name.equals("Vec") || name.equals("Dict") || name.equals("String") || name.equals("StringBuilder") || name.equals("IndexRange") { self.fail(token, "reserved generic parameter name"); }
+            seen.set(name, true);
+        }
+    }
+    pub def function_parameters(function: Function) -> Vec<String> {
+        let names = Vec<String>.new();
+        if let index = self.templates.get(function.owner) { for name in self.program.declarations[index].generics { names.push(name); } }
+        for name in function.generics { names.push(name); } return names;
+    }
+    pub def template_type(name: String, parameters: Vec<String>, token: Token) -> Void {
+        if !type_unbound(name, parameters) { self.supported_type(token, name); return; }
+        for param in parameters { if name.equals(param) { return; } }
+        if self.is_optional(name) { self.template_type(self.optional_inner(name), parameters, token); return; }
+        let base = type_base(name); let args = type_arguments(name); var arity = -1;
+        if base.equals("Vec") { arity = 1; }
+        if base.equals("Dict") { arity = 2; }
+        if let index = self.templates.get(base) { arity = self.program.declarations[index].generics.len(); }
+        if arity < 0 || args.len() != arity { self.fail(token, "unknown generic type or wrong type argument count"); return; }
+        for arg in args { self.template_type(arg, parameters, token); }
+    }
+    pub def specialization_budget(token: Token) -> Bool {
+        if self.specialization_count >= 256 || self.specialization_depth >= 32 { self.fail(token, "generic specialization limit exceeded"); return false; }
+        self.specialization_count = self.specialization_count + 1; return true;
+    }
+    pub def instantiate_type(name: String, token: Token) -> Void {
+        if !self.error.is_empty() || self.structs.contains(name) { return; }
+        let args = type_arguments(name); if args.len() == 0 { return; }
+        guard let template_index = self.templates.get(type_base(name)) else { return; }
+        let template = self.program.declarations[template_index];
+        if template.generics.len() != args.len() { self.fail(token, "wrong generic type argument count"); return; }
+        if name.len() > 8192 { self.fail(token, "generic type size limit exceeded"); return; }
+        if !self.specialization_budget(token) { return; }
+        self.specialization_depth = self.specialization_depth + 1;
+        let bindings = Dict<String, String>.with_capacity(8, 1);
+        for i in 0..<args.len() { self.supported_type(token, args[i]); bindings.set(template.generics[i], args[i]); }
+        if !self.error.is_empty() { self.specialization_depth = self.specialization_depth - 1; return; }
+        let copier = Specializer.new(self.program, bindings); let declaration = copier.declaration(template, name);
+        let index = self.program.declarations.len(); self.program.declarations.push(declaration);
+        // Publish the layout identity before visiting recursive payload types.
+        self.structs.set(name, index);
+        for method in template.methods {
+            let function = self.program.functions[method];
+            let clone = Specializer.new(self.program, bindings).function(function, function.token.text, name, copy_items(function.generics));
+            let id = self.program.functions.len(); self.program.functions.push(clone); declaration.methods.push(id);
+            self.functions.set(f"{name}.{function.token.text}", id);
+        }
+        for field in declaration.fields { self.supported_type(field.token, field.type_name); }
+        for variant in declaration.variants { for param in variant.payload { self.supported_type(param.token, param.type_name); } }
+        self.specialization_depth = self.specialization_depth - 1;
+    }
+    pub def enum_index(name: String) -> i32 {
+        let index = self.struct_index(name); if index >= 0 { return index; }
+        if let template = self.templates.get(name) { return template; } return -1;
+    }
+    pub def infer(formal: String, actual: String, parameters: Vec<String>, bindings: Dict<String, String>, token: Token, invariant: Bool) -> Void {
+        if !self.error.is_empty() { return; }
+        // nil provides no information, but another argument or the return
+        // context may still determine an optional parameter's concrete type.
+        if actual.equals("nil") { return; }
+        for param in parameters {
+            if formal.equals(param) {
+                if actual.equals("Void") { self.fail(token, "cannot infer a generic value type from Void"); return; }
+                if let previous = bindings.get(param) {
+                    if !previous.equals(actual) && (invariant || !self.widens(actual, previous)) { self.fail(token, f"conflicting generic argument for {param}: {previous} and {actual}"); }
+                } else { bindings.set(param, actual); }
+                return;
+            }
+        }
+        if self.is_optional(formal) {
+            var inner = actual; if self.is_optional(actual) { inner = self.optional_inner(actual); }
+            self.infer(self.optional_inner(formal), inner, parameters, bindings, token, invariant); return;
+        }
+        let wanted = type_arguments(formal); let supplied = type_arguments(actual);
+        if wanted.len() > 0 {
+            if !type_base(formal).equals(type_base(actual)) || wanted.len() != supplied.len() { self.fail(token, f"generic type mismatch: expected {formal}, got {actual}"); return; }
+            for i in 0..<wanted.len() { self.infer(wanted[i], supplied[i], parameters, bindings, token, true); } return;
+        }
+        let concrete = type_substitute(formal, bindings);
+        if !concrete.equals(actual) && (invariant || !self.widens(actual, concrete)) { self.fail(token, f"expected {concrete}, got {actual}"); }
+    }
+    pub def arguments_for(parameters: Vec<String>, bindings: Dict<String, String>, token: Token) -> Vec<String> {
+        let result = Vec<String>.new();
+        for name in parameters {
+            if let value = bindings.get(name) { self.supported_type(token, value); result.push(value); }
+            else { self.fail(token, f"cannot infer generic parameter {name}; provide a concrete type context"); result.push("i32"); }
+        }
+        return result;
+    }
+    pub def generic_call(index: i32, args: Vec<i32>, receiver: String, token: Token, expected: String) -> Value {
+        let function = self.program.functions[index]; let bindings = Dict<String, String>.with_capacity(8, 1);
+        var context = expected;
+        if self.is_optional(context) && !self.is_optional(function.return_type) && type_arguments(function.return_type).len() > 0 { context = self.optional_inner(context); }
+        // For a bare T and optional context, first let the arguments decide
+        // whether T itself is optional or the return needs optional lifting.
+        let defer_context = self.is_optional(context) && !self.is_optional(function.return_type) && type_arguments(function.return_type).len() == 0;
+        if !context.is_empty() && !defer_context && type_unbound(function.return_type, function.generics) {
+            self.infer(function.return_type, context, function.generics, bindings, token, false);
+        }
+        let values = Vec<Value>.new();
+        for i in 0..<args.len() {
+            let formal = function.params[i].type_name; let substituted = type_substitute(formal, bindings); var value = self.invalid();
+            if type_unbound(substituted, function.generics) { value = self.expression(args[i]); }
+            else { value = self.expression_as(args[i], substituted, token); }
+            self.infer(formal, value.type_name, function.generics, bindings, token, false); values.push(value);
+        }
+        if !context.is_empty() && type_unbound(type_substitute(function.return_type, bindings), function.generics) {
+            self.infer(function.return_type, context, function.generics, bindings, token, false);
+        }
+        let types = self.arguments_for(function.generics, bindings, token);
+        if !self.error.is_empty() { return self.invalid(); }
+        let key = type_apply(index.to_string(), types); var concrete = -1;
+        if let cached = self.instances.get(key) { concrete = cached; }
+        else {
+            if !self.specialization_budget(token) { return self.invalid(); }
+            let clone = Specializer.new(self.program, bindings).function(function, type_apply(function.token.text, types), function.owner, Vec<String>.new());
+            concrete = self.program.functions.len(); self.program.functions.push(clone); self.instances.set(key, concrete);
+            if !clone.return_type.equals("Void") { self.supported_type(token, clone.return_type); }
+            for param in clone.params { self.supported_type(token, param.type_name); }
+        }
+        let instance = self.program.functions[concrete]; let code = StringBuilder.new(); code.append(receiver);
+        for i in 0..<values.len() {
+            let value = self.coerce(values[i], instance.params[i].type_name, token);
+            if i > 0 || !receiver.is_empty() { code.append(", "); } code.append(value.code);
+        }
+        return self.value(instance.return_type, f"rl_f{concrete}({code})");
+    }
     pub def supported_type(token: Token, type_name: String) -> Void {
+        if !self.error.is_empty() { return; }
+        if type_name.len() > 8192 || self.type_depth >= 128 { self.fail(token, "generic specialization limit exceeded (type size or nesting)"); return; }
+        self.type_depth = self.type_depth + 1;
+        self.check_supported_type(token, type_name);
+        self.type_depth = self.type_depth - 1;
+    }
+    pub def check_supported_type(token: Token, type_name: String) -> Void {
         if self.is_optional(type_name) { self.supported_type(token, self.optional_inner(type_name)); return; }
         if self.is_dictionary(type_name) {
             let key = self.dict_key(type_name); let value = self.dict_value(type_name);
@@ -397,8 +545,9 @@ pub struct Backend {
             return;
         }
         if self.is_vector(type_name) { self.supported_type(token, self.vector_element(type_name)); return; }
+        self.instantiate_type(type_name, token);
         if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !type_name.equals("StringBuilder") && !type_name.equals("RawPtr") && !type_name.equals("IndexRange") && !self.structs.contains(type_name) {
-            self.fail(token, "C backend supports only u8, i32, i64, Bool, RawPtr, String, StringBuilder, collections, or declared non-generic structs");
+            self.fail(token, "C backend supports only u8, i32, i64, Bool, RawPtr, String, StringBuilder, collections, or concrete declared structs/enums");
         }
     }
     pub def validate_subset() -> Void {
@@ -406,15 +555,18 @@ pub struct Backend {
         for declaration in self.program.declarations {
             if declaration.kind == 1 && self.builtin_module(declaration.value) { index = index + 1; continue; }
             if declaration.kind == 3 { index = index + 1; continue; }
-            if (declaration.kind != 2 && declaration.kind != 4) || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
+            if declaration.kind != 2 && declaration.kind != 4 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
-                if self.structs.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") || name.equals("Dict") || name.equals("StringBuilder") || name.equals("IndexRange") { self.fail(declaration.token, "duplicate or reserved struct name"); }
-                self.structs.set(name, index);
+                if self.templates.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") || name.equals("Dict") || name.equals("StringBuilder") || name.equals("IndexRange") { self.fail(declaration.token, "duplicate or reserved struct name"); }
+                self.templates.set(name, index); self.validate_parameters(declaration.generics, declaration.token);
+                if declaration.generics.len() == 0 { self.structs.set(name, index); }
             }
             index = index + 1;
         }
-        for declaration in self.program.declarations {
+        var declaration_index = 0;
+        while declaration_index < self.program.declarations.len() {
+            let declaration = self.program.declarations[declaration_index]; declaration_index = declaration_index + 1;
             if declaration.kind == 3 && !declaration.value.equals("Void") { self.supported_type(declaration.token, declaration.value); }
             let names = Dict<String, i32>.with_capacity(8, 1);
             if declaration.kind == 4 && declaration.variants.len() == 0 { self.fail(declaration.token, "enum must declare at least one case"); }
@@ -423,7 +575,7 @@ pub struct Backend {
                 names.set(variant.token.text, 1);
                 let labels = Dict<String, Bool>.with_capacity(8, 1);
                 for param in variant.payload {
-                    self.supported_type(param.token, param.type_name);
+                    self.template_type(param.type_name, declaration.generics, param.token);
                     if !param.token.text.is_empty() {
                         if labels.contains(param.token.text) { self.fail(param.token, "duplicate enum payload label"); }
                         labels.set(param.token.text, true);
@@ -431,7 +583,7 @@ pub struct Backend {
                 }
             }
             for field in declaration.fields {
-                self.supported_type(field.token, field.type_name);
+                self.template_type(field.type_name, declaration.generics, field.token);
                 if names.contains(field.token.text) { self.fail(field.token, "duplicate field"); }
                 names.set(field.token.text, 1);
                 if field.expr >= 0 { self.fail(field.token, "field defaults unsupported by C backend"); }
@@ -444,9 +596,18 @@ pub struct Backend {
             }
         }
         for function in self.program.functions {
-            if function.generics.len() != 0 || (function.owner.is_empty() && function.modifiers.contains("static")) { self.fail(function.token, "function unsupported by C backend"); }
-            if !function.return_type.equals("Void") { self.supported_type(function.token, function.return_type); }
-            for param in function.params { self.supported_type(param.token, param.type_name); }
+            if function.owner.is_empty() && function.modifiers.contains("static") { self.fail(function.token, "function unsupported by C backend"); }
+            let parameter_names = Dict<String, Bool>.with_capacity(8, 1);
+            if !function.owner.is_empty() && !function.modifiers.contains("static") { parameter_names.set("self", true); }
+            for param in function.params {
+                if parameter_names.contains(param.token.text) { self.fail(param.token, "duplicate parameter"); }
+                parameter_names.set(param.token.text, true);
+            }
+            self.validate_parameters(function.generics, function.token);
+            let parameters = self.function_parameters(function);
+            self.validate_parameters(parameters, function.token);
+            if !function.return_type.equals("Void") { self.template_type(function.return_type, parameters, function.token); }
+            for param in function.params { self.template_type(param.type_name, parameters, param.token); }
             if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
@@ -454,7 +615,7 @@ pub struct Backend {
         }
         for statement in self.program.statements {
             if statement.expr < 0 && ((statement.kind == 2 && !self.is_optional(statement.annotation)) || statement.kind == 9 || statement.kind == 3 || statement.kind == 4 || statement.kind == 5 || statement.kind == 6 || statement.kind == 8 || statement.kind == 13) { self.fail(statement.token, "C backend requires an expression or initializer"); }
-            if !statement.annotation.is_empty() { self.supported_type(statement.token, statement.annotation); }
+
         }
     }
     pub def generate() -> Void {
@@ -465,15 +626,42 @@ pub struct Backend {
             let function = self.program.functions.get(i);
             var key = function.token.text;
             if !function.owner.is_empty() { key = f"{function.owner}.{key}"; }
-            if self.functions.contains(key) { self.fail(function.token, "duplicate function"); }
+            if let previous = self.functions.get(key) { if previous != i { self.fail(function.token, "duplicate function"); } }
             self.functions.set(key, i);
             i = i + 1;
         }
         if let index = self.functions.get("main") {
             let main_function = self.program.functions.get(index);
-            if main_function.params.len() != 0 || !main_function.return_type.equals("i32") { self.fail(main_function.token, "main must have signature def main() -> i32"); }
+            if main_function.generics.len() != 0 || main_function.params.len() != 0 || !main_function.return_type.equals("i32") { self.fail(main_function.token, "main must have signature def main() -> i32"); }
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
+        i = 0;
+        while i < self.program.functions.len() && self.error.is_empty() {
+            let function = self.program.functions.get(i);
+            if self.function_parameters(function).len() > 0 { i = i + 1; continue; }
+            if !function.return_type.equals("Void") { self.supported_type(function.token, function.return_type); }
+            for param in function.params { self.supported_type(param.token, param.type_name); }
+            self.return_type = function.return_type;
+            self.unsafe_depth = 0;
+            let scope = Dict<String, Binding>.with_capacity(8, 1);
+            self.scopes.push(scope);
+            if !function.owner.is_empty() && !function.modifiers.contains("static") {
+                scope.set("self", Binding { code: "rl_self", type_name: function.owner, mutable: false });
+            }
+            var p = 0;
+            for param in function.params {
+                if scope.contains(param.token.text) { self.fail(param.token, "duplicate parameter"); }
+                scope.set(param.token.text, Binding { code: f"rl_p{p}", type_name: param.type_name, mutable: false });
+                p = p + 1;
+            }
+            self.output.append_line(f"{self.signature(i)} {{");
+            if !self.block(function.body, false) && !function.return_type.equals("Void") { self.fail(function.token, "function must return on every path"); }
+            self.output.append_line("}");
+            self.scopes.pop();
+            i = i + 1;
+        }
+        if !self.error.is_empty() { return; }
+        let bodies = self.output.to_string(); self.output = StringBuilder.new();
         self.output.append(r"""#ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE 700
 #endif
@@ -505,29 +693,8 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
 """);
         emit_dict_runtime(self.output);
         i = 0;
-        while i < self.program.functions.len() { self.output.append_line(f"{self.signature(i)};"); i = i + 1; }
-        i = 0;
-        while i < self.program.functions.len() && self.error.is_empty() {
-            let function = self.program.functions.get(i);
-            self.return_type = function.return_type;
-            self.unsafe_depth = 0;
-            let scope = Dict<String, Binding>.with_capacity(8, 1);
-            self.scopes.push(scope);
-            if !function.owner.is_empty() && !function.modifiers.contains("static") {
-                scope.set("self", Binding { code: "rl_self", type_name: function.owner, mutable: false });
-            }
-            var p = 0;
-            for param in function.params {
-                if scope.contains(param.token.text) { self.fail(param.token, "duplicate parameter"); }
-                scope.set(param.token.text, Binding { code: f"rl_p{p}", type_name: param.type_name, mutable: false });
-                p = p + 1;
-            }
-            self.output.append_line(f"{self.signature(i)} {{");
-            if !self.block(function.body, false) && !function.return_type.equals("Void") { self.fail(function.token, "function must return on every path"); }
-            self.output.append_line("}");
-            self.scopes.pop();
-            i = i + 1;
-        }
+        while i < self.program.functions.len() { if self.function_parameters(self.program.functions[i]).len() == 0 { self.output.append_line(f"{self.signature(i)};"); } i = i + 1; }
+        self.output.append(bodies);
         if let index = self.functions.get("main") { self.output.append_line(f"int main(int argc, char **argv) {{ rl_argc = argc; rl_argv = argv; if (atexit(rl_cleanup)) return 1; return (int)rl_f{index}(); }}"); }
     }
 
@@ -564,11 +731,12 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
         }
         self.fail(token, f"unknown field '{token.text}'"); return -1;
     }
-    pub def call(index: i32, values: Vec<i32>, receiver: String, token: Token) -> Value {
+    pub def call(index: i32, values: Vec<i32>, receiver: String, token: Token, expected: String) -> Value {
         let function = self.program.functions.get(index);
         if !function.modifiers.contains("pub ") && !function.token.source.equals(token.source) { self.fail(token, "function or method is private to its module"); return self.invalid(); }
         if function.modifiers.contains("unsafe") && self.unsafe_depth == 0 { self.fail(token, "unsafe function call requires unsafe"); }
-        if function.params.len() != values.len() { self.fail(token, "wrong argument count"); }
+        if function.params.len() != values.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
+        if function.generics.len() > 0 { return self.generic_call(index, values, receiver, token, expected); }
         let args = StringBuilder.new(); args.append(receiver);
         for i in 0..<values.len() {
             var value = self.invalid();
@@ -589,13 +757,13 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
         }
         return "";
     }
-    pub def method_call(expr: Expression) -> Value {
+    pub def method_call(expr: Expression, expected: String) -> Value {
         let member = self.program.expressions.get(expr.left);
         if member.kind == 17 { self.fail(member.token, "enum shorthand requires a contextual type"); return self.invalid(); }
         if member.kind != 9 { self.fail(expr.token, "call target unsupported by C backend"); return self.invalid(); }
         let enum_owner = self.static_owner(member.left);
         if self.is_enum(enum_owner) && self.variant_index(enum_owner, member.token.text) >= 0 {
-            return self.enum_construct(enum_owner, member.token, expr.args, expr.labels);
+            return self.enum_construct(enum_owner, member.token, expr.args, expr.labels, expected);
         }
         self.positional_arguments(expr);
         let root = self.reference_root(expr.left);
@@ -604,19 +772,19 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
         if !shadowed && !expr.type_name.is_empty() {
             if expr.type_name.starts_with("$ambiguous$") { self.fail(expr.token, "ambiguous imported function"); return self.invalid(); }
             if expr.type_name.starts_with("$std$") { return self.stdlib_call(member.token, expr.args, true); }
-            if let index = self.functions.get(expr.type_name) { return self.call(index, expr.args, "", member.token); }
+            if let index = self.functions.get(expr.type_name) { return self.call(index, expr.args, "", member.token, expected); }
         }
         let receiver = self.program.expressions.get(member.left);
         if receiver.kind == 13 {
             self.supported_type(receiver.token, receiver.type_name);
             if self.is_dictionary(receiver.type_name) { return self.dict_constructor(receiver.type_name, member.token, expr.args); }
             if self.is_vector(receiver.type_name) { return self.vector_constructor(receiver.type_name, member.token, expr.args); }
-            self.fail(receiver.token, "generic receiver unsupported by C backend"); return self.invalid();
+            if !self.structs.contains(receiver.type_name) { self.fail(receiver.token, "generic receiver unsupported by C backend"); return self.invalid(); }
         }
         var owner = ""; var code = ""; var static_call = false;
         var receiver_type = receiver.token.text;
         if !receiver.type_name.is_empty() { receiver_type = receiver.type_name; }
-        if (receiver.kind == 3 || (receiver.kind == 9 && !receiver.type_name.is_empty())) && (self.structs.contains(receiver_type) || self.is_vector(receiver_type) || self.is_dictionary(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
+        if (receiver.kind == 3 || receiver.kind == 13 || (receiver.kind == 9 && !receiver.type_name.is_empty())) && (self.structs.contains(receiver_type) || self.is_vector(receiver_type) || self.is_dictionary(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
             if shadowed { static_call = false; }
             else {
                 if receiver_type.starts_with("$ambiguous$") { self.fail(receiver.token, "ambiguous imported type"); return self.invalid(); }
@@ -642,11 +810,12 @@ static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof
         if let index = self.functions.get(f"{owner}.{member.token.text}") {
             let function = self.program.functions.get(index);
             if function.modifiers.contains("static") != static_call { self.fail(member.token, "static/instance method receiver mismatch"); return self.invalid(); }
-            return self.call(index, expr.args, code, member.token);
+            return self.call(index, expr.args, code, member.token, expected);
         }
         self.fail(member.token, f"unknown method '{member.token.text}'"); return self.invalid();
     }
     pub def construct(expr: Expression) -> Value {
+        if type_arguments(expr.type_name).len() > 0 { self.supported_type(expr.token, expr.type_name); }
         let index = self.struct_index(expr.type_name);
         if index < 0 { self.fail(expr.token, f"unknown struct '{expr.type_name}'"); return self.invalid(); }
         let declaration = self.program.declarations.get(index);
@@ -676,11 +845,11 @@ static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation
 """);
         var i = 0;
         while i < self.program.declarations.len() {
-            if self.program.declarations.get(i).kind == 2 || self.program.declarations.get(i).kind == 4 { self.output.append_line(f"typedef struct rl_s{i} rl_s{i};"); } i = i + 1;
+            if self.program.declarations.get(i).generics.len() == 0 && (self.program.declarations.get(i).kind == 2 || self.program.declarations.get(i).kind == 4) { self.output.append_line(f"typedef struct rl_s{i} rl_s{i};"); } i = i + 1;
         }
         i = 0;
         for declaration in self.program.declarations {
-            if declaration.kind != 2 && declaration.kind != 4 { i = i + 1; continue; }
+            if declaration.generics.len() > 0 || (declaration.kind != 2 && declaration.kind != 4) { i = i + 1; continue; }
             self.output.append_line(f"struct rl_s{i} {{");
             if declaration.kind == 4 {
                 self.output.append_line("int32_t rl_tag;");
@@ -704,7 +873,7 @@ static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation
         for label in expr.labels { if !label.is_empty() { self.fail(expr.token, "named arguments are supported only for enum constructors"); } }
     }
     pub def is_enum(name: String) -> Bool {
-        let index = self.struct_index(name);
+        let index = self.enum_index(name);
         return index >= 0 && self.program.declarations.get(index).kind == 4;
     }
     pub def static_owner(id: i32) -> String {
@@ -712,37 +881,57 @@ static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation
         let root = self.reference_root(id);
         if !root.is_empty() { if let local = self.lookup(root) { return ""; } }
         let node = self.program.expressions.get(id);
-        if node.kind != 3 && node.kind != 9 { return ""; }
-        if !node.type_name.is_empty() { return node.type_name; }
+        if node.kind != 3 && node.kind != 9 && node.kind != 13 { return ""; }
+        if !node.type_name.is_empty() {
+            if self.templates.contains(type_base(node.type_name)) && type_arguments(node.type_name).len() > 0 { self.supported_type(node.token, node.type_name); }
+            return node.type_name;
+        }
         if node.kind == 3 { return node.token.text; }
         return "";
     }
     pub def variant_index(owner: String, name: String) -> i32 {
         if !self.is_enum(owner) { return -1; }
-        let variants = self.program.declarations.get(self.struct_index(owner)).variants;
+        let variants = self.program.declarations.get(self.enum_index(owner)).variants;
         for i in 0..<variants.len() { if variants.get(i).token.text.equals(name) { return i; } }
         return -1;
     }
-    pub def enum_construct(owner: String, token: Token, args: Vec<i32>, labels: Vec<String>) -> Value {
+    pub def enum_construct(owner: String, token: Token, args: Vec<i32>, labels: Vec<String>, expected: String) -> Value {
+        self.instantiate_type(owner, token);
         let tag = self.variant_index(owner, token.text);
         if tag < 0 { self.fail(token, "unknown enum case or enum type"); return self.invalid(); }
-        let index = self.struct_index(owner);
-        let variant = self.program.declarations.get(index).variants.get(tag);
+        let declaration = self.program.declarations[self.enum_index(owner)];
+        let variant = declaration.variants[tag];
         if args.len() != variant.payload.len() { self.fail(token, "wrong enum payload count"); return self.invalid(); }
-        let result = self.value(owner, f"rl_allocate(sizeof(rl_s{index}))");
-        self.output.append_line(f"{result.code}->rl_tag = {tag};");
-        let seen = Dict<i32, Bool>.with_capacity(8, 0);
+        let bindings = Dict<String, String>.with_capacity(8, 1); let parameters = declaration.generics;
+        if parameters.len() > 0 && !expected.is_empty() {
+            var context = expected; if self.is_optional(context) { context = self.optional_inner(context); }
+            self.infer(type_apply(owner, parameters), context, parameters, bindings, token, true);
+        }
+        let seen = Dict<i32, Bool>.with_capacity(8, 0); let values = Vec<Value>.new(); let targets = Vec<i32>.new();
         for i in 0..<args.len() {
             var target = i; var label = "";
-            if i < labels.len() { label = labels.get(i); }
+            if i < labels.len() { label = labels[i]; }
             if !label.is_empty() {
                 target = -1;
-                for j in 0..<variant.payload.len() { if variant.payload.get(j).token.text.equals(label) { target = j; } }
+                for j in 0..<variant.payload.len() { if variant.payload[j].token.text.equals(label) { target = j; } }
             }
             if target < 0 || target >= variant.payload.len() { self.fail(token, "unknown enum payload label"); return self.invalid(); }
             if seen.contains(target) { self.fail(token, "duplicate enum payload argument"); return self.invalid(); }
-            seen.set(target, true);
-            let value = self.expression_as(args.get(i), variant.payload.get(target).type_name, token);
+            seen.set(target, true); targets.push(target);
+            let formal = variant.payload[target].type_name; let substituted = type_substitute(formal, bindings);
+            var value = self.invalid();
+            if type_unbound(substituted, parameters) { value = self.expression(args[i]); }
+            else { value = self.expression_as(args[i], substituted, token); }
+            if parameters.len() > 0 { self.infer(formal, value.type_name, parameters, bindings, token, false); }
+            values.push(value);
+        }
+        var concrete = owner;
+        if parameters.len() > 0 { concrete = type_apply(owner, self.arguments_for(parameters, bindings, token)); self.supported_type(token, concrete); }
+        if !self.error.is_empty() { return self.invalid(); }
+        let index = self.struct_index(concrete); let payload = self.program.declarations[index].variants[tag].payload;
+        let result = self.value(concrete, f"rl_allocate(sizeof(rl_s{index}))"); self.output.append_line(f"{result.code}->rl_tag = {tag};");
+        for i in 0..<values.len() {
+            let target = targets[i]; let value = self.coerce(values[i], payload[target].type_name, token);
             self.output.append_line(f"{result.code}->rl_v{tag}_{target} = {value.code};");
         }
         return result;

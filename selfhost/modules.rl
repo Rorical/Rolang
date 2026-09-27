@@ -34,9 +34,12 @@ pub struct Modules {
     pub var active: Dict<String, Bool>;
     pub var visibility: Dict<String, Bool>;
     pub var alias_depth: i32;
+    pub var bound_types: Vec<String>;
+    pub var expression_contexts: Dict<i32, Vec<String>>;
+    pub var statement_contexts: Dict<i32, Vec<String>>;
 
     pub static def new() -> Modules {
-        return Modules { program: Program { functions: Vec<Function>.new(), declarations: Vec<Declaration>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new() }, paths: Dict<String, i32>.with_capacity(16, 1), error: "", root: "", imports: Dict<String, Vec<ModuleImport>>.with_capacity(16, 1), symbols: Dict<String, ModuleSymbol>.with_capacity(64, 1), aliases: Dict<String, Declaration>.with_capacity(16, 1), expanded: Dict<String, String>.with_capacity(16, 1), active: Dict<String, Bool>.with_capacity(16, 1), visibility: Dict<String, Bool>.with_capacity(32, 1), alias_depth: 0 };
+        return Modules { program: Program { functions: Vec<Function>.new(), declarations: Vec<Declaration>.new(), expressions: Vec<Expression>.new(), statements: Vec<Statement>.new() }, paths: Dict<String, i32>.with_capacity(16, 1), error: "", root: "", imports: Dict<String, Vec<ModuleImport>>.with_capacity(16, 1), symbols: Dict<String, ModuleSymbol>.with_capacity(64, 1), aliases: Dict<String, Declaration>.with_capacity(16, 1), expanded: Dict<String, String>.with_capacity(16, 1), active: Dict<String, Bool>.with_capacity(16, 1), visibility: Dict<String, Bool>.with_capacity(32, 1), alias_depth: 0, bound_types: Vec<String>.new(), expression_contexts: Dict<i32, Vec<String>>.with_capacity(32, 0), statement_contexts: Dict<i32, Vec<String>>.with_capacity(32, 0) };
     }
     pub def offset(ids: Vec<i32>, amount: i32) -> Void {
         for i in 0..<ids.len() { ids.set(i, ids.get(i) + amount); }
@@ -193,6 +196,7 @@ pub struct Modules {
     }
     pub def resolve(name: String, token: Token, kind: i32) -> String {
         if name.is_empty() { return ""; }
+        if kind == 2 { for bound in self.bound_types { if bound.equals(name) { return name; } } }
         if let symbol = self.symbols.get(f"{token.source}#{name}") {
             if symbol.kind == kind { return symbol.qualified; }
             return "";
@@ -281,6 +285,44 @@ pub struct Modules {
         if (self.alias_depth > 0 || alias_used) && complexity > 128 { self.error = location(token, "expanded type complexity limit exceeded"); }
         return result;
     }
+    pub def context_pattern(pattern: Pattern, names: Vec<String>) -> Void {
+        switch pattern {
+            case .literal(_, let index): self.context_expression(index, names);
+            case .variant(_, let children): for child in children { self.context_pattern(child, names); }
+            default: {}
+        }
+    }
+    pub def context_arms(arms: Vec<SwitchArm>, names: Vec<String>) -> Void {
+        for arm in arms {
+            self.context_pattern(arm.pattern, names); self.context_expression(arm.guard_expr, names);
+            self.context_expression(arm.value, names); self.context_body(arm.body, names);
+        }
+    }
+    pub def context_expression(index: i32, names: Vec<String>) -> Void {
+        if index < 0 || self.expression_contexts.contains(index) { return; }
+        self.expression_contexts.set(index, names); let node = self.program.expressions[index];
+        self.context_expression(node.left, names); self.context_expression(node.right, names);
+        for arg in node.args { self.context_expression(arg, names); } self.context_arms(node.arms, names);
+    }
+    pub def context_body(body: Vec<i32>, names: Vec<String>) -> Void {
+        for index in body {
+            if self.statement_contexts.contains(index) { continue; }
+            self.statement_contexts.set(index, names); let node = self.program.statements[index];
+            self.context_expression(node.expr, names); self.context_expression(node.target, names);
+            self.context_body(node.body, names); self.context_body(node.alternative, names); self.context_arms(node.arms, names);
+        }
+    }
+    pub def function_context(function: Function) -> Vec<String> {
+        let result = Vec<String>.new();
+        if !function.owner.is_empty() {
+            for declaration in self.program.declarations {
+                if declaration.token.text.equals(function.owner) && declaration.token.source.equals(function.token.source) {
+                    for name in declaration.generics { result.push(name); }
+                }
+            }
+        }
+        for name in function.generics { result.push(name); } return result;
+    }
     pub def validate() -> Void {
         if self.paths.len() <= 1 {
             var needed = false;
@@ -314,8 +356,12 @@ pub struct Modules {
             }
         }
         if !self.error.is_empty() { return; }
+        let function_contexts = Vec<Vec<String>>.new();
+        for fn in self.program.functions { let names = self.function_context(fn); function_contexts.push(names); if names.len() > 0 { self.context_body(fn.body, names); } }
+        let empty = Vec<String>.new();
         var expression_id = 0;
         for expr in self.program.expressions {
+            self.bound_types = empty; if let names = self.expression_contexts.get(expression_id) { self.bound_types = names; }
             expr.type_name = self.type_name(expr.type_name, expr.token);
             if expr.kind == 6 {
                 expr.type_name = self.resolve(expr.token.text, expr.token, 1);
@@ -325,16 +371,23 @@ pub struct Modules {
             if expr.kind == 14 { expr.type_name = self.resolve(self.reference_name(expr.left), expr.token, 1); }
             expression_id = expression_id + 1;
         }
-        for stmt in self.program.statements { stmt.annotation = self.type_name(stmt.annotation, stmt.token); }
+        for statement_id in 0..<self.program.statements.len() {
+            self.bound_types = empty; if let names = self.statement_contexts.get(statement_id) { self.bound_types = names; }
+            let stmt = self.program.statements[statement_id]; stmt.annotation = self.type_name(stmt.annotation, stmt.token);
+        }
+        var function_id = 0;
         for fn in self.program.functions {
+            self.bound_types = function_contexts[function_id]; function_id = function_id + 1;
             fn.return_type = self.type_name(fn.return_type, fn.token);
             for param in fn.params { param.type_name = self.type_name(param.type_name, param.token); }
             if !fn.owner.is_empty() { fn.owner = self.type_name(fn.owner, fn.token); }
             else { fn.token.text = self.resolve(fn.token.text, fn.token, 1); }
         }
         for declaration in self.program.declarations {
+            self.bound_types = declaration.generics;
             for field in declaration.fields { field.type_name = self.type_name(field.type_name, field.token); }
             for variant in declaration.variants { for param in variant.payload { param.type_name = self.type_name(param.type_name, param.token); } }
+            self.bound_types = empty;
             if declaration.kind == 2 || declaration.kind == 4 { declaration.token.text = self.resolve(declaration.token.text, declaration.token, 2); }
         }
     }

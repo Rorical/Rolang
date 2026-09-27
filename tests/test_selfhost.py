@@ -679,7 +679,7 @@ def test_struct_program_matches_reference(bootstrap, tmp_path, source, expected)
     ('struct S { var x: Void; }', 'supports only'),
     ('struct S { var x: i32 = 1; }', 'field defaults unsupported'),
     ('struct S { def __release__() {} }', 'lifecycle hooks unsupported'),
-    ('struct S<T> { var x: T; }', 'declaration unsupported'),
+    ('struct S<T, T> { var x: T; }', 'duplicate generic parameter'),
     ('struct S {} def S() {}', 'conflicts with struct'),
     ('struct S { var x: i32; } def main() -> i32 { let s = S {}; return 0; }', 'missing field'),
     ('struct S { var x: i32; } def main() -> i32 { let s = S { x: 1, x: 2 }; return 0; }', 'duplicate field initializer'),
@@ -1380,7 +1380,7 @@ def test_builder_generated_c_sanitizers(bootstrap, tmp_path):
 
 
 def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
-    names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
+    names = ('lexer.rl', 'ast.rl', 'parser.rl', 'generics.rl', 'string_codegen.rl',
              'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl', 'os_codegen.rl', 'range_codegen.rl',
              'backend.rl', 'ast_json.rl')
     # Exercise the compiler core independently of the module loader and CLI.
@@ -1442,7 +1442,7 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
         flags = ('-fsanitize=address,undefined', '-fno-sanitize-recover=all') if stage == 2 else ()
         compile_c_executable(next_c, compiler, level, flags)
     # The rebuilt compiler emits and runs representative programs and full AST JSON.
-    for sample, expected in (PROGRAMS[1], DICT_PROGRAMS[3], BUILDER_PROGRAMS[0], ENUM_PROGRAMS[0], ENUM_PROGRAMS[1]):
+    for sample, expected in (PROGRAMS[1], DICT_PROGRAMS[3], BUILDER_PROGRAMS[0], ENUM_PROGRAMS[0], ENUM_PROGRAMS[1], GENERIC_PROGRAMS[0], GENERIC_PROGRAMS[1]):
         result, path, output = emit(compiler, tmp_path, sample)
         assert result.returncode == 0, result.stdout
         assert execute_c(output, 3).returncode == expected
@@ -1673,7 +1673,7 @@ def test_native_module_public_types_and_shadowing(bootstrap, tmp_path):
 
 @pytest.mark.parametrize('body, diagnostic', [
     ('return hidden();', 'unknown function'),
-    ('let x: Hidden = nil; return 0;', 'declared non-generic structs'),
+    ('let x: Hidden = nil; return 0;', 'concrete declared structs/enums'),
     ('let x = Hidden { n: 1 }; return 0;', 'unknown struct'),
     ('return Box.secret();', 'private to its module'),
     ('let x = Box.new(); return x.n;', 'private to its module'),
@@ -1696,7 +1696,7 @@ def test_native_module_private_access(bootstrap, tmp_path, body, diagnostic):
 @pytest.mark.parametrize('body, diagnostic', [
     ('return leaf();', 'unknown function'),
     ('let x = Leaf.new(); return 0;', 'unknown variable'),
-    ('let x: Vec<Leaf> = Vec<Leaf>.new(); return 0;', 'declared non-generic structs'),
+    ('let x: Vec<Leaf> = Vec<Leaf>.new(); return 0;', 'concrete declared structs/enums'),
 ])
 def test_native_module_no_transitive_exports(bootstrap, tmp_path, body, diagnostic):
     (tmp_path / 'leaf.rl').write_text('''pub def leaf() -> i32 { return 42; }
@@ -1840,7 +1840,7 @@ def test_native_module_std_aliases_and_reexports(bootstrap, tmp_path):
 @pytest.mark.parametrize('imports, body, diagnostic', [
     ('import "lib.rl" as A', 'return answer();', 'unknown function'),
     ('import "lib.rl" as A', 'return A.hidden();', 'unknown variable'),
-    ('import "lib.rl" as A', 'let x: A.Hidden = nil; return 0;', 'declared non-generic structs'),
+    ('import "lib.rl" as A', 'let x: A.Hidden = nil; return 0;', 'concrete declared structs/enums'),
     ('import "lib.rl" as A', 'return A.Box.secret();', 'private to its module'),
     ('import "lib.rl" as A\nimport "other.rl" as A', 'return 0;', 'duplicate import alias'),
     ('import "private.rl" as API', 'return API.A.answer();', 'unknown variable'),
@@ -1866,7 +1866,7 @@ def test_native_module_alias_reexport_errors(bootstrap, tmp_path, imports, body,
     ('import "lib.rl" as i32\ndef main() -> i32 { return 0; }', 'built-in type'),
     ('import "lib.rl" as A\nstruct A {}\ndef main() -> i32 { return 0; }', 'already defined'),
     ('import "lib.rl" as A\ndef A() -> i32 { return 1; }\ndef main() -> i32 { return 0; }', 'already defined'),
-    ('import "lib.rl" as A\ndef main() -> i32 { let x: Box = nil; return 0; }', 'declared non-generic structs'),
+    ('import "lib.rl" as A\ndef main() -> i32 { let x: Box = nil; return 0; }', 'concrete declared structs/enums'),
 ])
 def test_native_module_alias_conflicts(bootstrap, tmp_path, source, diagnostic):
     (tmp_path / 'lib.rl').write_text(ALIAS_LIBRARY)
@@ -1974,10 +1974,10 @@ def test_native_typealias_modules_and_reexports(bootstrap, tmp_path):
     ('struct Hidden {} pub typealias A = Vec<Hidden>;', 'non-public type'),
     ('typealias A = i32; typealias A = i64;', 'duplicate declaration'),
     ('typealias i32 = i64;', 'reserved struct name'),
-    ('typealias Callback = (i32)->i32;', 'declared non-generic structs'),
-    ('typealias Wide = f64;', 'declared non-generic structs'),
+    ('typealias Callback = (i32)->i32;', 'concrete declared structs/enums'),
+    ('typealias Wide = f64;', 'concrete declared structs/enums'),
     ('static typealias A = i32;', 'static typealias unsupported'),
-    ('typealias Nothing = Void; typealias Bad = Vec<Nothing>;', 'declared non-generic structs'),
+    ('typealias Nothing = Void; typealias Bad = Vec<Nothing>;', 'concrete declared structs/enums'),
 ])
 def test_native_typealias_errors(bootstrap, tmp_path, declarations, diagnostic):
     test_errors_preserve_output(bootstrap, tmp_path,
@@ -2197,7 +2197,7 @@ def test_native_enum_switch_differential(bootstrap, tmp_path, source, expected):
 @pytest.mark.parametrize('source, diagnostic', [
     ('enum E { case a; case a; } def main() -> i32 { return 0; }', 'duplicate enum case'),
     ('enum E { case a(Void); } def main() -> i32 { return 0; }', 'C backend supports'),
-    ('enum E<T> { case a(T); } def main() -> i32 { return 0; }', 'declaration unsupported'),
+    ('enum E<T, T> { case a(T); } def main() -> i32 { return 0; }', 'duplicate generic parameter'),
     ('enum E { case a; def a() -> Void {} } def main() -> i32 { return 0; }', 'duplicate member'),
     ('enum E { case a; } def main() -> i32 { let e = E.missing; return 0; }', 'unknown enum case'),
     ('enum E { case a(i32); } def main() -> i32 { let e = E.a; return 0; }', 'wrong enum payload count'),
@@ -2294,3 +2294,172 @@ def main() -> i32 {
     return sum + state.calls;
 }'''
     test_native_enum_switch_differential(bootstrap, tmp_path, source, 42)
+
+
+GENERIC_PROGRAMS = [
+    ((ROOT / 'selfhost/examples/generics.rl').read_text(), 42),
+    ('''enum Outcome<T, E> {
+    case ok(T); case err(E);
+    def value_or(fallback: T) -> T { return switch self { case .ok(let v): v; case .err(_): fallback; }; }
+}
+def wrap<T>(value: T) -> Outcome<T, String> { return Outcome.ok(value); }
+def empty<T>() -> Vec<T> { return Vec<T>.new(); }
+def main() -> i32 {
+    let values: Vec<Outcome<i32, String>> = empty(); values.push(wrap(42));
+    let bad: Outcome<i32, String> = Outcome.err("bad");
+    let text: Outcome<String, i32> = Outcome.ok("ok");
+    if !text.value_or("bad").equals("ok") || bad.value_or(0) != 0 { return 1; }
+    return values[0].value_or(0);
+}''', 42),
+    ('''def echo<T>(value: T, depth: i32) -> T {
+    if depth == 0 { return value; } return again(value, depth - 1);
+}
+def again<T>(value: T, depth: i32) -> T { return echo(value, depth); }
+struct State { var calls: i32; def next() -> i32 { self.calls = self.calls + 1; return self.calls; } }
+def first<T>(a: T, b: T) -> T { return a; }
+def main() -> i32 {
+    let state = State { calls: 0 };
+    let one = first(state.next(), state.next());
+    if one != 1 || state.calls != 2 { return 1; }
+    if !echo("recursive", 4).equals("recursive") { return 2; }
+    return echo(40, 8) + state.calls;
+}''', 42),
+    ('''struct Box<T> {
+    var value: T;
+    static def make(value: T) -> Box<T> { return Box<T> { value: value }; }
+    def get() -> T { return self.value; }
+    def other<U>(value: U) -> U { return value; }
+}
+def main() -> i32 {
+    let a = Box<i32>.make(40); let b = Box<String> { value: "hello" };
+    if !b.get().equals("hello") || !a.other("yes").equals("yes") { return 1; }
+    a.value = a.value + 2; return a.get();
+}''', 42),
+    ('''def identity<T>(value: T) -> T { return value; }
+def fallback<T>(value: T?, other: T) -> T { guard let present = value else { return other; } return present; }
+def main() -> i32 {
+    let present: i32? = 40; let absent: i32? = nil;
+    let copy: i32? = identity(present); let lifted: i32? = identity(2);
+    return fallback(copy, 0) + fallback(lifted, 0) + fallback(absent, 0);
+}''', 42),
+    ('''enum Node<T> { case value(T); case list(Vec<Node<T>>); }
+def copy<T>(items: Vec<T>) -> Vec<T> { let result = Vec<T>.new(); for item in items { result.push(item); } return result; }
+def main() -> i32 {
+    let nodes = Vec<Node<i32>>.new(); nodes.push(Node.value(42));
+    let saved = copy(nodes); nodes[0] = Node.value(0);
+    let root = Node.list(saved);
+    return switch root {
+        case .list(let items): switch items[0] { case .value(let n): n; default: 1; };
+        default: 2;
+    };
+}''', 42),
+    ('''enum Choice<T> { case none; case some(T); }
+typealias Number = Choice<i32>;
+def select<T>(flag: Bool, value: T) -> Choice<T> { if flag { return Choice.some(value); } return Choice.none; }
+def main() -> i32 {
+    let absent: Number = Choice.none;
+    let present: Number = select(true, 42);
+    switch absent { case .none: {} case .some(_): return 1; }
+    return switch present { case .some(let value): value; case .none: 2; };
+}''', 42),
+]
+
+
+@pytest.mark.parametrize('source, expected', GENERIC_PROGRAMS)
+def test_native_generic_differential(bootstrap, tmp_path, source, expected):
+    test_native_enum_switch_differential(bootstrap, tmp_path, source, expected)
+    first = (tmp_path / 'program.c').read_bytes()
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0 and output.read_bytes() == first
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('enum E<T> { case value(T); } def main() -> i32 { let x = E<i32, String>.value(1); return 0; }', 'wrong generic type argument count'),
+    ('enum E<T> { case none; } def main() -> i32 { let x = E.none; return 0; }', 'cannot infer generic parameter'),
+    ('enum E<T> { case value(T); } def main() -> i32 { let x: E = E.value(1); return 0; }', 'supports only'),
+    ('enum E<T> { case value(T); } def main() -> i32 { let x = E<Missing>.value(1); return 0; }', 'supports only'),
+    ('enum E<T> { case value(T); } def main() -> i32 { let x = E<i32>.value(true); return 0; }', 'expected i32'),
+    ('enum E<T> { case pair(T, T); } def main() -> i32 { let x = E.pair(1, "bad"); return 0; }', 'expected i32'),
+    ('enum E<T> { case pair(Vec<T>, Vec<T>); } def main() -> i32 { let x = E.pair(Vec<i32>.new(), Vec<String>.new()); return 0; }', 'expected Vec<i32>'),
+    ('def f<T>(a: T, b: T) -> T { return a; } def main() -> i32 { return f(1, "bad"); }', 'expected i32'),
+    ('def f<T>() -> T { return 0; } def main() -> i32 { f(); return 0; }', 'cannot infer generic parameter'),
+    ('def f<T>(a: T) -> T { return unknown; } def main() -> i32 { return f(1); }', 'unknown variable'),
+    ('def f<T>(a: T) -> T { return a; } def main() -> i32 { return f(); }', 'wrong argument count'),
+    ('def f<T, T>(a: T) -> T { return a; } def main() -> i32 { return 0; }', 'duplicate generic parameter'),
+    ('def f<T>(a: T, a: T) -> T { return a; } def main() -> i32 { return 0; }', 'duplicate parameter'),
+    ('def f<i32>(a: i32) -> i32 { return a; } def main() -> i32 { return 0; }', 'reserved generic parameter'),
+    ('def main<T>() -> i32 { return 0; }', 'main must have signature'),
+    ('enum E<T> { case value(Missing); } def main() -> i32 { return 0; }', 'supports only'),
+    ('enum E<T> { case value(Vec<T, T>); } def main() -> i32 { return 0; }', 'wrong type argument count'),
+    ('struct Box<T> { var value: T; def f<T>(x: T) -> T { return x; } } def main() -> i32 { return 0; }', 'duplicate generic parameter'),
+    ('struct Box<T> { var value: T; } def main() -> i32 { let b = Box<i32> { value: "bad" }; return 0; }', 'expected i32'),
+    ('def f<T>(items: Vec<T>) -> T { return items[0]; } def main() -> i32 { return f(1); }', 'expected Vec<i32>'),
+    ('enum Loop<T> { case next(Loop<Vec<T>>); } def main() -> i32 { let x: Loop<i32>? = nil; return 0; }', 'specialization limit'),
+    ('def grow<T>(x: T) -> Void { let xs = Vec<T>.new(); xs.push(x); grow(xs); } def main() -> i32 { grow(1); return 0; }', 'specialization limit'),
+])
+def test_native_generic_errors(bootstrap, tmp_path, source, diagnostic):
+    test_errors_preserve_output(bootstrap, tmp_path, source, diagnostic)
+
+
+def test_native_generic_modules_and_shadowing(bootstrap, tmp_path):
+    (tmp_path / 'types.rl').write_text('''pub struct T { pub var n: i32; }
+pub enum Box<T> {
+    case value(T);
+    pub def get() -> T { return switch self { case .value(let value): value; }; }
+}
+pub typealias Wrapped = Box<T>;
+def hidden<T>(value: T) -> T { return value; }
+pub def identity<T>(value: T) -> T { let local: T = value; return hidden(local); }
+pub def make() -> T { return T { n: 42 }; }
+''')
+    (tmp_path / 'api.rl').write_text('pub import "types.rl" as Types\n')
+    source = '''import "api.rl" as API
+def main() -> i32 {
+    let value = API.Types.identity(API.Types.make());
+    let box: API.Types.Wrapped = API.Types.Box<API.Types.T>.value(value);
+    let text = API.Types.Box<String>.value("yes");
+    if !text.get().equals("yes") { return 1; }
+    return API.Types.identity(box.get()).n;
+}'''
+    result, path, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
+    reference = tmp_path / 'reference'
+    compiled = compile_source(path, CompileOptions(opt_level=OptLevel.O3, output_path=reference))
+    assert compiled.success, [d.message for d in compiled.diagnostics.diagnostics]
+    assert subprocess.run([str(reference)]).returncode == 42
+    for program in ('return API.Types.hidden(42);', 'let x: API.Types.Hidden<i32>? = nil; return 0;'):
+        result, _, _ = emit(bootstrap, tmp_path, 'import "api.rl" as API\ndef main() -> i32 { ' + program + ' }')
+        assert result.returncode == 1
+
+
+def test_native_generic_instances_are_reused(bootstrap, tmp_path):
+    source = '''def identity<T>(value: T) -> T { return value; }
+def main() -> i32 { let a = identity(1); let b = identity(2); let s = identity("yes");
+    if !s.equals("yes") { return 1; } return a + b + identity(39); }
+'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    code = output.read_text()
+    # main plus exactly one concrete i32 identity and one String identity.
+    definitions = re.findall(r'^static [^\n]+ rl_f\d+\([^\n]*\) \{$', code, re.M)
+    assert len(definitions) == 3, definitions
+    assert execute_c(output, 3).returncode == 42
+
+
+def test_native_generic_ast_instances_do_not_share_locals(bootstrap, tmp_path):
+    source = '''def twice<T>(value: T) -> T { let local: T = value; return local + value; }
+def main() -> i32 {
+    let s = twice("ab"); let n = twice(21); let wide: i64 = twice(2147483648);
+    if !s.equals("abab") || wide != 4294967296 { return 1; }
+    return n;
+}'''
+    # Native templates are checked when instantiated; the primary compiler
+    # requires protocol constraints for operators on generic parameters.
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
