@@ -527,6 +527,12 @@ class MirExpressionLowerer:
         receiver = None if call.is_static else self.lower_expr(call.receiver)
         receiver_type = call.receiver.type_id if call.is_static else operand_type(receiver)
         args = [self.lower_expr(arg) for _, arg in call.arguments]
+        method = self._b.member_resolver.get_method(receiver_type, call.method_name)
+        if method is not None:
+            parameters = self._b._callee_param_types(method.signature)
+            if parameters is not None:
+                args = [self._b._coerce_operand(arg, parameters[i]) if i < len(parameters) else arg
+                        for i, arg in enumerate(args)]
 
         result_local: Optional[LocalId] = None
         void_type = self._b.type_table.void_type

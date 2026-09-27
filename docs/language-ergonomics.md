@@ -89,3 +89,35 @@ Interpolation performs formatting only: use `c_quote` when embedding text into C
 Validation: 39 interpolation, writer, string-literal and parser checks passed.
 The writer tests compile generated C and compare the executed program's exact
 output bytes, including NULs and UTF-8.
+
+## Lazy iterators
+
+`import std.iterator` adds `Iter<T>`, a lazy single-pass iterator. Its copies
+share a cursor. `iter_vec(values)` adapts a vector, and `iter_from(callback)`
+adapts any source whose callback returns `T?`. The first `nil` ends the iterator
+permanently; later reads do not call the source again. A present optional element
+is distinct from end-of-stream when `T` itself is optional.
+
+Adapters: `iter_map`, `iter_filter`, `iter_take`, `iter_enumerate`, `iter_zip`.
+Consumers: `iter_collect`, `iter_fold`, and ordinary `for value in iterator`.
+`iter_enumerate` yields `Indexed<T>` with public `index: i64` and `value` fields.
+`iter_zip` yields `Zipped<A, B>` with public `first` and `second` fields, stopping
+at the shorter input; it may consume one unmatched item from the first input.
+A nonpositive `iter_take` count reads no input. As with direct Vec iteration,
+do not structurally mutate the source vector while traversing it.
+
+```rolang
+let selected = iter_filter(iter_vec(values), { n: i32 in return n > 0; });
+let names = iter_map(iter_take(selected, 10), { n: i32 in return f"item {n}"; });
+for entry in iter_enumerate(names) { println(f"{entry.index}: {entry.value}"); }
+```
+
+Adapters retain their source and callbacks, including captured values after the
+creating function returns. Tests also exposed and fixed missing implicit optional
+argument wrapping on method calls (`Vec<i32?>.push(42)` and `.push(nil)`).
+
+See [the tiny compiler example](../examples/compiler_ergonomics.rl): payload enums,
+pattern matching, `Result` propagation across different success types, lazy
+iteration, interpolated diagnostics and indented C emission work together.
+Six O0/O3 iterator/example checks passed under AddressSanitizer and runtime
+payload checks; generated C was compiled and executed with the expected result.

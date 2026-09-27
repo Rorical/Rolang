@@ -446,6 +446,11 @@ Transparent `typealias` declarations, dictionary removal/snapshots, custom-key
 See [the API guide](docs/compiler-rewrite-foundations.md) and
 [the frontend example](examples/compiler_frontend.rl).
 
+The Python/LLVM compiler also supports `f"...{expression}..."` interpolation,
+optional `?` propagation, collection transforms, lazy iterator adapters, and
+`CodeWriter` for indented source output. See [the ergonomics guide](docs/language-ergonomics.md)
+and [the tiny compiler example](examples/compiler_ergonomics.rl).
+
 ### Self-hosting work
 
 The [Rolang-written bootstrap compiler](selfhost/README.md) lexes, parses,
