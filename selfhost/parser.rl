@@ -106,6 +106,7 @@ pub struct Parser {
     pub def modifiers() -> String {
         var text = "";
         if self.take("pub") { text = "pub "; }
+        if self.take("unsafe") { text = text + "unsafe "; }
         if self.take("static") { text = text + "static "; }
         return text;
     }
@@ -337,6 +338,7 @@ pub struct Parser {
     pub def parse() -> Void {
         while self.error.is_empty() && self.peek().kind != 0 {
             let modifiers = self.modifiers(); let token = self.peek();
+            if modifiers.contains("unsafe") && !token.text.equals("def") { self.fail(token, "unsafe modifier requires def"); return; }
             if token.text.equals("def") { self.function("", modifiers); }
             else {
                 var name = token; var kind = 0; var value = "";
@@ -355,6 +357,7 @@ pub struct Parser {
                             kind = 2; name = self.name(); generics = self.generics(); self.expect("{");
                             while self.error.is_empty() && !self.peek().text.equals("}") {
                                 let member_modifiers = self.modifiers();
+                                if member_modifiers.contains("unsafe") && !self.peek().text.equals("def") { self.fail(self.peek(), "unsafe modifier requires def"); return; }
                                 if self.peek().text.equals("def") { methods.push(self.function(name.text, member_modifiers)); }
                                 else {
                                     var mutable = false;

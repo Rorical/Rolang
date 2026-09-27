@@ -448,10 +448,14 @@ See [the API guide](docs/compiler-rewrite-foundations.md) and
 
 ### Self-hosting work
 
-The [Rolang-written bootstrap compiler](selfhost/README.md) now lexes, parses,
-checks, and emits C for signed integers, Booleans, core strings, non-generic
-structs, methods, and typed vectors with iteration.
-It is built by the existing compiler and parses its own source with `--parse`,
-producing a JSON syntax
-tree. It does not yet compile itself. Differential tests compare both its syntax
-trees and generated programs with the current compiler.
+The [Rolang-written bootstrap compiler](selfhost/README.md) lexes, parses,
+checks types, and emits standalone C for a growing subset including structs,
+methods, strings, vectors, dictionaries, optionals, and compiler-oriented I/O.
+Its real CLI can now rebuild itself from externally bundled source through
+three native generations with identical generated C; rebuilt executables also
+pass program, AST JSON, diagnostic, and output-preservation checks.
+
+Native module loading is still needed to rebuild directly from the project
+sources. Broader language coverage and ownership lowering also remain unfinished,
+so the existing Python compiler remains primary. Differential and sanitizer tests
+validate the native compiler as the rewrite progresses.

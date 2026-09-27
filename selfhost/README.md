@@ -1,21 +1,27 @@
-# Rolang-written bootstrap compiler — compiler-core code generation milestone
+# Rolang-written bootstrap compiler — bundled executable self-rebuild milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
 emits standalone C11 for the supported subset. It does not invoke Python, Lark,
 or llvmlite.
 
-**This is not full self-hosting yet.** The Python compiler still builds the
-OS-facing compiler executable. The native C backend now compiles the actual
-lexer, AST, parser, backend, runtime emitters, and JSON emitter when assembled
-into one file with imports removed and a test entry point supplied.
+**A bundled compiler executable can now rebuild itself.** Tests assemble the
+actual compiler sources into one file, removing local imports while preserving
+built-in standard-library imports. The original `main.rl` reads files, parses,
+checks types, emits C, and writes its output in every native generation.
 
-That native-compiled core emits byte-for-byte identical C to the Python-built
-bootstrap for recursive, dictionary-heavy, and StringBuilder programs. It also
-reports invalid programs and produces AST JSON. The separately compiled frontend
-parses its own source and matches all four flat AST node counts. Full executable
-self-rebuilding still needs module loading and filesystem/process/I/O support.
-Here, “stage 0” names the initial compiler, not a successfully self-rebuilt CLI.
+The Python-built stage 0 emits stage 1, which emits stage 2, which emits stage 3.
+All three generated C files must be byte-for-byte identical. Rebuild subprocesses
+run with Python and other tools absent from PATH; a C compiler is invoked only
+between generations by the test harness. One generation is instrumented with
+AddressSanitizer and UndefinedBehaviorSanitizer. Rebuilt executables compile sample
+programs, emit matching AST JSON, and retain diagnostics and output protections.
+
+**Full project self-hosting remains incomplete:** native local-module loading is
+still missing, so this verification uses external source assembly. The backend
+also remains a language subset with process-lifetime allocation; broader language
+coverage and ownership lowering remain work ahead. The Python compiler is still
+the primary compiler. Native compiler-core and frontend tests remain in place.
 
 ## Build and run
 
@@ -28,6 +34,12 @@ build/rolang-stage0 selfhost/examples/fibonacci.rl build/fibonacci.c
 cc -std=c11 -O3 build/fibonacci.c -o build/fibonacci
 build/fibonacci
 # Exit status: 88 (sum of Fibonacci values for 0 through 9).
+```
+
+Run the executable rebuild verification with:
+
+```sh
+.venv/bin/pytest -q tests/test_selfhost.py -k native_cli_rebuilds_itself
 ```
 
 For C emission the native frontend takes two paths: input `.rl` and output C. C emission
@@ -86,7 +98,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-Imports and type aliases are not lowered yet. String fields,
+General local imports and type aliases are not lowered yet. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -133,7 +145,7 @@ Python compiler's current literal-inference behavior.
 
 Strings and their byte buffers follow the same process-lifetime allocation model
 as structs. The backend emits their helpers directly into standalone C. General
-stdlib imports, output functions, string splitting/replacement,
+stdlib imports beyond the supported built-ins, string splitting/replacement,
 and additional collection operations remain future work.
 
 ## Vectors and iteration
@@ -269,12 +281,14 @@ Next steps toward actual self-compilation:
    existing frontend.
 2. **In progress:** non-generic structs/methods, core strings, signed widths,
    typed vectors, dictionaries, optional values, StringBuilder, and byte casts
-   now have C lowering. Add module loading and filesystem/process/I/O support
-   needed by the compiler itself. Enums and general generic specialization
+   now have C lowering, including the OS bridge used by the real CLI. Add
+   native module loading to remove the external source-assembly step. Enums and general generic specialization
    remain part of broader language coverage.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
-4. Make this compiler compile its own source; rebuild again with that executable.
-5. Compare bootstrap generations and run the broader language regression suite.
+4. **Verified for bundled sources:** rebuild the complete CLI through three C
+   generations. Repeat this directly from the module graph after adding imports.
+5. Generation C parity is checked for the bundle; expand broader language coverage
+   and its regression suite.
 
 A C backend and the existing C runtime can remain dependencies during those
 bootstrap generations. Porting the package manager and language server is separate
@@ -349,23 +363,57 @@ The unaliased `import std.string_builder` is accepted as a built-in module.
 General imports and import aliases still require the future module loader.
 Private builder fields, explicit release, and StringBuilder equality are rejected.
 
+## Native OS bridge and unsafe operations
+
+Unaliased imports of `std.process`, `std.fs`, `std.io`, and `std.path` select these
+built-in calls (general module loading is still pending):
+
+| Module | Supported calls |
+|---|---|
+| process | `argc`, `argv` |
+| io | `print`, `println`, `print_i32`, `println_i32`, `println_i64` |
+| fs | `fs_open`, `fs_close`, `fs_read_all`, `fs_read_line`, `fs_write_str`, `fs_seek`, `fs_tell`, `fs_flush`, `fs_eof` |
+| path | `path_join`, `path_dirname`, `path_basename`, `path_extension`, `path_exists`, `path_is_dir`, `path_is_file`, `path_resolve` |
+
+File modes are 0 for reading, 1 for writing/truncation, and 2 for appending; other
+modes fall back to reading, matching the current library. Text reads and writes
+preserve byte lengths, UTF-8, and embedded NULs. Line reads retain the newline;
+whole-file reads start at the current position. Open failures return a null
+RawPtr; flush/seek/tell return errors for null handles. Files must be closed by
+the program. `fs_open` rejects filenames containing NUL; writes larger than the
+i32 byte-count API can represent return zero. Printed strings preserve NUL bytes.
+
+Path manipulation follows the existing POSIX library. `path_resolve` uses realpath
+on macOS/Linux and returns the original input when resolution fails. Generated
+programs need the platform C headers and library, including filesystem support.
+The validation here runs on Apple Silicon macOS.
+
+`RawPtr` can be stored and passed to these wrappers. Explicit `unsafe { }` blocks
+are required for casts from integer literals to RawPtr and from RawPtr to supported
+integer types. `unsafe def` is parsed and calls to it require an unsafe block;
+its body also needs explicit unsafe blocks for pointer casts, matching the primary
+compiler. Casting a stored value to RawPtr means address-of-storage in the existing
+compiler; the native backend rejects that operation until address-of is implemented.
+General memory access, FFI declarations, File wrapper objects, process spawning,
+environment APIs, stdin, directory listing, and import aliases are not lowered yet.
+
 ## Validation
 
-On Apple Silicon macOS, validation covered all 502 bootstrap cases:
+On Apple Silicon macOS, this milestone passed:
 
-- The broad run completed **501 passing checks** in 679.94 seconds. One randomized
-  arithmetic case exceeded the 10-second limit while running the Python-built
-  reference executable. Its emitted C was identical for O0/O3 bootstrap builds.
-  The same executable and differential test passed on rerun; an exact pytest
-  rerun with a fresh O3 bootstrap also passed (**1 passed**, 36.59 seconds).
-- **50 checks** in 124.92 seconds with the bootstrap runtime instrumented using
-  AddressSanitizer and payload checks. These cover the native compiler-core and
-  frontend rebuilds, StringBuilder operations, byte/i64 boundaries, and diagnostics.
-- Generated builder C additionally runs with AddressSanitizer and
-  UndefinedBehaviorSanitizer. `detect_leaks=0` means these checks do not validate leaks.
-- **40 LLVM code-generation checks** in 15.38 seconds, including mixed integer
-  arithmetic/comparisons across every optimization level, passed for the
-  separately committed operand-promotion fix.
+- **542 bootstrap tests** in 705.77 seconds, covering O0/O3 bootstrap builds,
+  differential execution, frontend/core compilation, native CLI rebuilds,
+  AST JSON parity, diagnostics, and output preservation.
+- **42 focused checks** in 104.24 seconds with the bootstrap runtime instrumented
+  using AddressSanitizer and payload checks. These include native OS operations,
+  pointer checks, compiler-core compilation, and executable rebuilding.
+- Rebuild tests compile the actual CLI through three C generations with identical
+  C output and no Python/tools on the rebuilding executable's PATH. Stage 2 is
+  compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
+  Generated file-byte tests also use both sanitizers. `detect_leaks=0` means these
+  checks do not validate leaks.
+- **5 primary-runtime I/O regressions** in 20.10 seconds passed for NUL-preserving
+  file reads and stdout, filename rejection, and reads after a partial read.
 
 See the test command above to reproduce the standard suite.
 
@@ -375,3 +423,7 @@ comparison/division signedness. Regression tests exercise every optimization lev
 Earlier string differential tests found and fixed another Python-backend bug: UTF-8 string literals used character counts
 instead of byte lengths. A separate regression covers Unicode and embedded NULs
 across every optimization level.
+
+The OS bridge tests also found and fixed primary-runtime truncation of file reads
+and printed strings at embedded NULs. Both now preserve explicit byte lengths;
+NUL-containing filenames are rejected before opening or truncating a file.

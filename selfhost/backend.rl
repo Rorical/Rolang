@@ -5,6 +5,7 @@ import "string_codegen.rl"
 import "vector_codegen.rl"
 import "dict_codegen.rl"
 import "builder_codegen.rl"
+import "os_codegen.rl"
 import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
@@ -19,11 +20,12 @@ pub struct Backend {
     pub var next_id: i32;
     pub var depth: i32;
     pub var loop_depth: i32;
+    pub var unsafe_depth: i32;
     pub var return_type: String;
 
     pub static def new(program: Program) -> Backend {
         return Backend { program: program, functions: Dict<String, i32>.with_capacity(16, 1),
-            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, loop_depth: 0, return_type: "i32" };
+            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, loop_depth: 0, unsafe_depth: 0, return_type: "i32" };
     }
     pub def fail(token: Token, message: String) -> Void {
         if self.error.is_empty() { self.error = location(token, message); }
@@ -123,6 +125,23 @@ pub struct Backend {
         if expr.kind == 7 { return self.string_literal(token); }
         if expr.kind == 11 {
             let value = self.expression(expr.left);
+            if value.type_name.equals("RawPtr") || expr.type_name.equals("RawPtr") {
+                if self.unsafe_depth == 0 { self.fail(token, "RawPtr casts require unsafe"); return self.invalid(); }
+                if expr.type_name.equals("RawPtr") {
+                    // The existing compiler treats nonliteral casts to RawPtr as
+                    // address-of-storage operations; do not silently reinterpret values.
+                    if self.program.expressions.get(expr.left).kind != 1 {
+                        self.fail(token, "C backend supports only integer literals to RawPtr; address-of casts are not implemented"); return self.invalid();
+                    }
+                    return self.value("RawPtr", "(void *)(uintptr_t)" + value.code);
+                }
+                if value.type_name.equals("RawPtr") {
+                    if expr.type_name.equals("i64") { return self.value("i64", "rl_bits64((uint64_t)(uintptr_t)" + value.code + ")"); }
+                    if expr.type_name.equals("i32") { return self.value("i32", "rl_bits((uint32_t)(uintptr_t)" + value.code + ")"); }
+                    if expr.type_name.equals("u8") { return self.value("u8", "(uint8_t)(uintptr_t)" + value.code); }
+                }
+                self.fail(token, "C backend supports RawPtr casts with integers only"); return self.invalid();
+            }
             if !self.numeric(value.type_name) || !self.numeric(expr.type_name) { self.fail(token, "C backend supports numeric u8/i32/i64 casts only"); return self.invalid(); }
             if expr.type_name.equals("u8") { return self.value("u8", "(uint8_t)" + value.code); }
             if expr.type_name.equals("i32") { return self.value("i32", "rl_bits((uint32_t)" + value.code + ")"); }
@@ -152,6 +171,7 @@ pub struct Backend {
         if expr.kind == 6 {
             if let local = self.lookup(token.text) { self.fail(token, "local variable is not callable"); }
             if let index = self.functions.get(token.text) { return self.call(index, expr.args, "", token); }
+            if !self.stdlib_module(token.text).is_empty() { return self.stdlib_call(token, expr.args); }
             self.fail(token, "unknown function '" + token.text + "'"); return self.invalid();
         }
         if expr.kind == 9 {
@@ -223,7 +243,11 @@ pub struct Backend {
         let statement = self.program.statements.get(id);
         let token = statement.token;
         if statement.kind == 7 || statement.kind == 12 {
-            self.output.append_line("{"); let returned = self.block(statement.body, true); self.output.append_line("}"); return returned;
+            self.output.append_line("{");
+            if statement.kind == 12 { self.unsafe_depth = self.unsafe_depth + 1; }
+            let returned = self.block(statement.body, true);
+            if statement.kind == 12 { self.unsafe_depth = self.unsafe_depth - 1; }
+            self.output.append_line("}"); return returned;
         }
         if statement.kind == 10 || statement.kind == 11 {
             if self.loop_depth == 0 { self.fail(token, "loop control outside a loop"); }
@@ -345,14 +369,14 @@ pub struct Backend {
             return;
         }
         if self.is_vector(type_name) { self.supported_type(token, self.vector_element(type_name)); return; }
-        if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !type_name.equals("StringBuilder") && !self.structs.contains(type_name) {
-            self.fail(token, "C backend supports only u8, i32, i64, Bool, String, StringBuilder, collections, or declared non-generic structs");
+        if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !type_name.equals("StringBuilder") && !type_name.equals("RawPtr") && !self.structs.contains(type_name) {
+            self.fail(token, "C backend supports only u8, i32, i64, Bool, RawPtr, String, StringBuilder, collections, or declared non-generic structs");
         }
     }
     pub def validate_subset() -> Void {
         var index = 0;
         for declaration in self.program.declarations {
-            if declaration.kind == 1 && declaration.value.equals("std.string_builder") && declaration.token.text.equals("import") { index = index + 1; continue; }
+            if declaration.kind == 1 && self.builtin_module(declaration.value) && declaration.token.text.equals("import") { index = index + 1; continue; }
             if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
@@ -407,7 +431,7 @@ pub struct Backend {
             if main_function.params.len() != 0 || !main_function.return_type.equals("i32") { self.fail(main_function.token, "main must have signature def main() -> i32"); }
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
-        self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
+        self.output.append_line("#ifndef _XOPEN_SOURCE\n#define _XOPEN_SOURCE 700\n#endif\n#include <sys/stat.h>\n#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
         self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec; typedef struct rl_optional rl_optional; typedef struct rl_dict rl_dict; typedef struct rl_builder rl_builder;");
         self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
@@ -420,6 +444,7 @@ pub struct Backend {
         self.output.append_line("static int32_t rl_rem(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return 0; return a%b; }");
         emit_string_runtime(self.output);
         emit_builder_runtime(self.output);
+        emit_os_runtime(self.output);
         emit_vector_runtime(self.output);
         self.output.append_line("struct rl_optional { rl_slot value; };");
         self.output.append_line("static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof(*p)); p->value = value; return p; }");
@@ -430,6 +455,7 @@ pub struct Backend {
         while i < self.program.functions.len() && self.error.is_empty() {
             let function = self.program.functions.get(i);
             self.return_type = function.return_type;
+            self.unsafe_depth = 0;
             let scope = Dict<String, Binding>.with_capacity(8, 1);
             self.scopes.push(scope);
             if !function.owner.is_empty() && !function.modifiers.contains("static") {
@@ -447,7 +473,7 @@ pub struct Backend {
             self.scopes.pop();
             i = i + 1;
         }
-        if let index = self.functions.get("main") { self.output.append_line("int main(void) { if (atexit(rl_cleanup)) return 1; return (int)rl_f" + index.to_string() + "(); }"); }
+        if let index = self.functions.get("main") { self.output.append_line("int main(int argc, char **argv) { rl_argc = argc; rl_argv = argv; if (atexit(rl_cleanup)) return 1; return (int)rl_f" + index.to_string() + "(); }"); }
     }
 
     pub def invalid() -> Value { return Value { code: "0", type_name: "i32" }; }
@@ -461,6 +487,7 @@ pub struct Backend {
         if name.equals("i64") { return "int64_t"; }
         if name.equals("u8") { return "uint8_t"; }
         if name.equals("StringBuilder") { return "rl_builder*"; }
+        if name.equals("RawPtr") { return "void*"; }
         if name.equals("String") { return "rl_string*"; }
         if self.is_vector(name) { return "rl_vec*"; }
         if self.is_dictionary(name) { return "rl_dict*"; }
@@ -481,6 +508,7 @@ pub struct Backend {
     }
     pub def call(index: i32, values: Vec<i32>, receiver: String, token: Token) -> Value {
         let function = self.program.functions.get(index);
+        if function.modifiers.contains("unsafe") && self.unsafe_depth == 0 { self.fail(token, "unsafe function call requires unsafe"); }
         if function.params.len() != values.len() { self.fail(token, "wrong argument count"); }
         let args = StringBuilder.new(); args.append(receiver);
         var i = 0;
@@ -677,6 +705,64 @@ pub struct Backend {
         if name.equals("push") { return self.value("Void", "rl_vec_push(" + receiver + ", " + self.slot(values.get(0)) + ")"); }
         if name.equals("set") { return self.value("Void", "rl_vec_set(" + receiver + ", " + values.get(0).code + ", " + self.slot(values.get(1)) + ")"); }
         return self.value("Void", "rl_vec_resize(" + receiver + ", " + values.get(0).code + ")");
+    }
+    pub def builtin_module(name: String) -> Bool {
+        return name.equals("std.string_builder") || name.equals("std.process") || name.equals("std.fs") || name.equals("std.path") || name.equals("std.io");
+    }
+    pub def has_module(name: String) -> Bool {
+        for declaration in self.program.declarations { if declaration.kind == 1 && declaration.value.equals(name) && declaration.token.text.equals("import") { return true; } }
+        return false;
+    }
+    pub def stdlib_module(name: String) -> String {
+        if name.equals("argc") || name.equals("argv") { return "std.process"; }
+        if name.equals("print") || name.equals("println") || name.equals("print_i32") || name.equals("println_i32") || name.equals("println_i64") { return "std.io"; }
+        if name.equals("fs_open") || name.equals("fs_close") || name.equals("fs_read_all") || name.equals("fs_read_line") || name.equals("fs_write_str") || name.equals("fs_flush") || name.equals("fs_seek") || name.equals("fs_tell") || name.equals("fs_eof") { return "std.fs"; }
+        if name.equals("path_join") || name.equals("path_dirname") || name.equals("path_basename") || name.equals("path_extension") || name.equals("path_exists") || name.equals("path_is_dir") || name.equals("path_is_file") || name.equals("path_resolve") { return "std.path"; }
+        return "";
+    }
+    pub def stdlib_call(token: Token, args: Vec<i32>) -> Value {
+        let module = self.stdlib_module(token.text); let name = token.text;
+        if !self.has_module(module) { self.fail(token, name + " requires import " + module); return self.invalid(); }
+        let expected = Vec<String>.new(); var result = "i32"; var helper = "";
+        if module.equals("std.process") {
+            if name.equals("argc") { helper = "argc"; }
+            else { expected.push("i32"); result = "String"; helper = "rl_argument"; }
+        }
+        if module.equals("std.io") {
+            result = "Void"; var type_name = "String";
+            if name.equals("print_i32") || name.equals("println_i32") { type_name = "i32"; }
+            if name.equals("println_i64") { type_name = "i64"; }
+            expected.push(type_name); helper = "rl_println";
+            if name.equals("print") || name.equals("print_i32") { helper = "rl_print"; }
+        }
+        if module.equals("std.fs") {
+            if name.equals("fs_open") { expected.push("String"); expected.push("i32"); result = "RawPtr"; helper = "rl_file_open"; }
+            else {
+                expected.push("RawPtr"); helper = "rl_file_" + name.substring(3, (name.len() as i32) - 3);
+                if name.equals("fs_close") { result = "Void"; }
+                if name.equals("fs_read_all") || name.equals("fs_read_line") { result = "String"; }
+                if name.equals("fs_write_str") { expected.push("String"); helper = "rl_file_write"; }
+                if name.equals("fs_seek") { expected.push("i64"); expected.push("i32"); }
+                if name.equals("fs_tell") { result = "i64"; }
+            }
+        }
+        if module.equals("std.path") {
+            expected.push("String"); result = "String"; helper = "rl_" + name;
+            if name.equals("path_join") { expected.push("String"); }
+            if name.equals("path_exists") || name.equals("path_is_dir") || name.equals("path_is_file") { result = "Bool"; }
+        }
+        if expected.len() != args.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
+        let code = StringBuilder.new(); code.append(helper + "("); var i = 0;
+        while i < args.len() {
+            let value = self.expression_as(args.get(i), expected.get(i), token);
+            if i > 0 { code.append(", "); }
+            if module.equals("std.io") && !expected.get(i).equals("String") { code.append("rl_integer_string(" + value.code + ")"); }
+            else { code.append(value.code); }
+            i = i + 1;
+        }
+        code.append(")");
+        if name.equals("argc") { return self.value("i32", "rl_argc"); }
+        return self.value(result, code.to_string());
     }
     pub def builder_method(receiver: String, token: Token, args: Vec<i32>) -> Value {
         let name = token.text; var expected = ""; var helper = ""; var result = "Void";

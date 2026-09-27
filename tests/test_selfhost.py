@@ -119,7 +119,7 @@ def test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected):
     ('def main() -> i32 { return 999999999999999999999999999; }', 'out of i32 range'),
     ('def main() -> i64 { return 0; }', 'main must have signature'),
     ('def main() -> i32 { return "text"; }', 'expected i32'),
-    ('import std.io\ndef main() -> i32 { return 0; }', 'unsupported by C backend'),
+    ('import std.net\ndef main() -> i32 { return 0; }', 'unsupported by C backend'),
     ('def main() -> i32 { return ' + '(' * 150 + '0' + ')' * 150 + '; }', 'nesting limit'),
     ('def main() -> i32 { return ' + '+'.join(['1'] * 150) + '; }', 'nesting limit'),
 ])
@@ -1306,7 +1306,7 @@ def test_builder_generated_c_sanitizers(bootstrap, tmp_path):
 
 def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
     names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
-             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl',
+             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl', 'os_codegen.rl',
              'backend.rl', 'ast_json.rl')
     # Import loading and the OS-facing CLI are separate unfinished dependencies.
     core = '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
@@ -1336,3 +1336,147 @@ def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
     for level in (0, 3):
         run = execute_c(output, level)
         assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
+
+
+def compiler_bundle():
+    names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
+             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl',
+             'os_codegen.rl', 'backend.rl', 'ast_json.rl', 'main.rl')
+    # Preserve builtin std imports; remove only local imports until module loading exists.
+    return '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
+                              if not line.startswith('import "')) for name in names)
+
+
+def compile_c_executable(source, target, level=0, flags=()):
+    compiled = subprocess.run(['cc', '-std=c11', f'-O{level}', *flags, str(source), '-o', str(target)],
+                              capture_output=True, text=True, timeout=60)
+    assert compiled.returncode == 0, compiled.stderr
+
+
+def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
+    import os
+    source = compiler_bundle()
+    result, bundle, generated = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    first_c = generated.read_bytes()
+    # Real main.rl drives all generations, including file reads, paths, diagnostics,
+    # argv, output creation, and flush. Python is absent from the child environment.
+    environment = {**os.environ, 'PATH': str(tmp_path / 'no-tools')}
+    compiler = tmp_path / 'stage1'
+    compile_c_executable(generated, compiler, 0)
+    for stage, level in ((2, 3), (3, 0)):
+        next_c = tmp_path / f'stage{stage}.c'
+        rebuilt = subprocess.run([str(compiler), str(bundle), str(next_c)], env=environment,
+                                 capture_output=True, text=True, timeout=30)
+        assert (rebuilt.returncode, rebuilt.stdout, rebuilt.stderr) == (0, '', '')
+        assert next_c.read_bytes() == first_c
+        compiler = tmp_path / f'stage{stage}'
+        flags = ('-fsanitize=address,undefined', '-fno-sanitize-recover=all') if stage == 2 else ()
+        compile_c_executable(next_c, compiler, level, flags)
+    # The rebuilt compiler emits and runs representative programs and full AST JSON.
+    for sample, expected in (PROGRAMS[1], DICT_PROGRAMS[3], BUILDER_PROGRAMS[0]):
+        result, path, output = emit(compiler, tmp_path, sample)
+        assert result.returncode == 0, result.stdout
+        assert execute_c(output, 3).returncode == expected
+        assert parse_native(compiler, path).stdout == parse_native(bootstrap, path).stdout
+    # Keep the existing protection against overwriting the input, including symlinks.
+    alias = tmp_path / 'source-alias.rl'
+    alias.symlink_to(bundle)
+    before = bundle.read_bytes()
+    rejected = subprocess.run([str(compiler), str(bundle), str(alias)], capture_output=True, text=True)
+    assert rejected.returncode == 2 and 'must differ' in rejected.stdout
+    assert bundle.read_bytes() == before
+    test_errors_preserve_output(compiler, tmp_path, 'def main() -> i32 { return missing; }', 'unknown variable')
+    test_usage_and_io_failures(compiler, tmp_path)
+
+
+@pytest.mark.parametrize('level', [0, 3])
+def test_native_os_calls_match_reference(bootstrap, tmp_path, level):
+    source = r'''import std.process
+    import std.fs
+    import std.io
+    import std.path
+    def main() -> i32 {
+        if argc() != 4 || !argv(1).equals("λ") || !argv(-1).is_empty() || !argv(4).is_empty() { return 1; }
+        let path = argv(2); let alias = argv(3);
+        let file = fs_open(path, 1);
+        unsafe { if (file as i64) == 0 { return 2; } }
+        if fs_write_str(file, "λ\0A\nZ") != 6 || fs_tell(file) != 6 || fs_flush(file) != 0 { return 3; }
+        fs_close(file);
+        if !path_exists(path) || !path_is_file(path) || path_is_dir(path) || !path_is_dir(path_dirname(path)) { return 4; }
+        if !path_resolve(path).equals(path_resolve(alias)) { return 5; }
+        let input = fs_open(path, 0);
+        if !fs_read_line(input).equals("λ\0A\n") || !fs_read_all(input).equals("Z") { return 6; }
+        if fs_seek(input, 2, 0) != 0 || !fs_read_all(input).equals("\0A\nZ") { return 7; }
+        fs_close(input);
+        let append = fs_open(path, 2); fs_write_str(append, "!"); fs_close(append);
+        if !path_join("a/", "b").equals("a/b") || !path_join("a", "/b").equals("/b") { return 8; }
+        if !path_dirname("name").equals(".") || !path_dirname("/name").equals("/") { return 9; }
+        if !path_basename("a/b/").equals("b") || !path_extension("a/.hidden").is_empty() || !path_extension("a.b.rl").equals("rl") { return 10; }
+        if !path_resolve("nonexistent-test-file.rl").equals("nonexistent-test-file.rl") { return 11; }
+        print("λ\0"); print_i32(42); println("!"); println_i64(-9223372036854775808);
+        return 0;
+    }'''
+    result, path, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    native = tmp_path / 'native-os'
+    compile_c_executable(output, native, level)
+    reference = tmp_path / 'reference-os'
+    compiled = compile_source(path, CompileOptions(opt_level=OptLevel.O2, output_path=reference))
+    assert compiled.success, [d.message for d in compiled.diagnostics.diagnostics]
+    for executable in (native, reference):
+        data = tmp_path / 'data.bin'
+        alias = tmp_path / 'data-alias.bin'
+        if not alias.is_symlink(): alias.symlink_to(data)
+        run = subprocess.run([str(executable), 'λ', str(data), str(alias)], capture_output=True, timeout=10)
+        assert (run.returncode, run.stdout, run.stderr) == (0, 'λ\0'.encode() + b'42!\n-9223372036854775808\n', b''), (executable, run.returncode, run.stdout, run.stderr)
+        assert data.read_bytes() == 'λ\0A\nZ!'.encode()
+
+
+def test_native_file_bytes_sanitizers(bootstrap, tmp_path):
+    from test_file_bytes import FILE_SOURCE
+    result, _, output = emit(bootstrap, tmp_path, FILE_SOURCE)
+    assert result.returncode == 0, result.stdout
+    binary = tmp_path / 'file-bytes'
+    compile_c_executable(output, binary, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+    data = 'λ\0A\n'.encode() + b'x' * 4095 + b'\0' + b'y' * 4099 + b'Z'
+    path = tmp_path / 'data.bin'; path.write_bytes(data)
+    run = subprocess.run([str(binary), str(path)], capture_output=True, timeout=10)
+    assert (run.returncode, run.stdout, run.stderr) == (0, b'', b'')
+    assert path.read_bytes() == data
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('def main() -> i32 { return argc(); }', 'requires import std.process'),
+    ('import std.process\ndef main() -> i32 { return argc(1); }', 'wrong argument count'),
+    ('import std.fs\ndef main() -> i32 { fs_open(1, 0); return 0; }', 'expected String'),
+    ('import std.fs\ndef main() -> i32 { fs_close(0); return 0; }', 'expected RawPtr'),
+    ('import std.io\ndef main() -> i32 { println(1); return 0; }', 'expected String'),
+    ('import std.io as IO\ndef main() -> i32 { return 0; }', 'declaration unsupported'),
+    ('def main() -> i32 { let p = 0 as RawPtr; return 0; }', 'RawPtr casts require unsafe'),
+    ('def main() -> i32 { unsafe { let p = 0 as RawPtr; } let p = 0 as RawPtr; return 0; }', 'RawPtr casts require unsafe'),
+    ('unsafe def raw() -> RawPtr { unsafe { return 0 as RawPtr; } } def main() -> i32 { raw(); return 0; }', 'unsafe function call requires unsafe'),
+    ('def main() -> i32 { unsafe { let p = "text" as RawPtr; } return 0; }', 'integer literals'),
+    ('def main() -> i32 { unsafe { let n = 0; let p = n as RawPtr; } return 0; }', 'address-of casts'),
+    ('def main() -> i32 { unsafe { let p = 0 as RawPtr; let q = p as RawPtr; } return 0; }', 'address-of casts'),
+    ('unsafe def raw() -> RawPtr { return 0 as RawPtr; } def main() -> i32 { return 0; }', 'RawPtr casts require unsafe'),
+    ('unsafe struct S {} def main() -> i32 { return 0; }', 'unsafe modifier requires def'),
+])
+def test_native_os_errors(bootstrap, tmp_path, source, diagnostic):
+    test_optional_errors_preserve_output(bootstrap, tmp_path, source, diagnostic)
+
+
+def test_native_raw_pointer_null_operations(bootstrap, tmp_path):
+    source = '''import std.fs
+    unsafe def raw() -> RawPtr { unsafe { return 0 as RawPtr; } }
+    def main() -> i32 {
+        unsafe {
+            let p = raw(); let same = p;
+            if p != same || (p as i64) != 0 || (p as i32) != 0 || (p as u8) != 0 { return 1; }
+            fs_close(p);
+            if fs_flush(p) != -1 || fs_seek(p, 0, 0) != -1 || fs_tell(p) != -1 || fs_eof(p) != 1 { return 2; }
+            if !fs_read_all(p).is_empty() || !fs_read_line(p).is_empty() || fs_write_str(p, "x") != 0 { return 3; }
+        }
+        return 42;
+    }'''
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
