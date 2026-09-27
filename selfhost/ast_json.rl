@@ -8,8 +8,7 @@ pub struct AstJson {
     pub static def new() -> AstJson { return AstJson { out: StringBuilder.new() }; }
     pub def quoted(text: String) -> Void {
         self.out.append_byte(34 as u8);
-        var i = 0;
-        while i < (text.len() as i32) {
+        for i in 0..<(text.len() as i32) {
             let byte = text.byte_at(i);
             if byte == 34 || byte == 92 { self.out.append_byte(92 as u8); self.out.append_byte(byte as u8); }
             else {
@@ -19,7 +18,6 @@ pub struct AstJson {
                     self.out.append_byte("0123456789abcdef".byte_at(byte % 16) as u8);
                 } else { self.out.append_byte(byte as u8); }
             }
-            i = i + 1;
         }
         self.out.append_byte(34 as u8);
     }

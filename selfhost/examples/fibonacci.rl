@@ -4,7 +4,6 @@ def fib(n: i32) -> i32 {
 }
 def main() -> i32 {
     var sum = 0;
-    var i = 0;
-    while i < 10 { sum = sum + fib(i); i = i + 1; }
+    for i in 0..<10 { sum = sum + fib(i); }
     return sum;
 }

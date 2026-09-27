@@ -5,7 +5,7 @@ pub struct Expression {
     pub var token: Token;
     pub var kind: i32; // 1 integer, 2 boolean, 3 name, 4 binary, 5 unary, 6 named call
     // 7 string, 8 nil, 9 member, 10 struct literal, 11 cast, 12 index,
-    // 13 generic type reference, 14 call through an expression
+    // 13 generic type reference, 14 call through an expression, 15 index range
     pub var left: i32;
     pub var right: i32;
     pub var args: Vec<i32>;
@@ -16,7 +16,7 @@ pub struct Statement {
     pub var token: Token;
     pub var kind: i32; // 1 return, 2 let/var, 3 name assignment, 4 if, 5 while, 6 expression
     // 7 block, 8 for, 9 if-let, 10 break, 11 continue, 12 unsafe,
-    // 13 member/index assignment
+    // 13 member/index assignment, 14 guard-let, 15 boolean guard
     pub var expr: i32;
     pub var target: i32;
     pub var annotation: String;

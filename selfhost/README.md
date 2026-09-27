@@ -23,6 +23,39 @@ process-lifetime allocation. Broader language coverage, complete module semantic
 and ownership lowering remain work ahead. The Python compiler is still the
 primary compiler. Native compiler-core and frontend tests remain in place.
 
+## Syntax used by the modernized compiler
+
+The compiler sources now use interpolated diagnostics and generated fragments,
+raw multiline C templates, range loops, byte slices, and `guard let`. These are
+implemented by the native frontend/backend as well as the Python bootstrap:
+
+```rolang
+let message = f"{token.source}:{token.line}: {diagnostic}";
+guard let declaration = aliases.get(name) else { return name; }
+for i in 0..<arguments.len() { consume(arguments.get(i)); }
+let spelling = source[start..<end];
+```
+
+The scanner supports `f"..."`, `f"""..."""`, `r"..."`, `r"""..."""`, and ordinary
+triple-quoted strings. It tracks positions through nested interpolation, strings,
+and comments. Templates evaluate fields once, from left to right, using
+`to_string`; native built-ins support String, Bool, u8, i32 and i64. Raw and
+multiline literals normalize to ordinary string tokens; interpolation lowers to
+concatenation and method calls in the flat AST.
+
+`..<` and `...` produce reusable i32 `IndexRange` values. Range loops evaluate
+bounds once, support break/continue, and safely include INT32_MAX. Vec and String
+range subscripts produce clamped copies; Vec elements retain reference semantics,
+and String bounds count bytes. Omitted bounds and slice assignment are rejected.
+Native `guard let` binds an optional identifier in the surrounding scope, and
+boolean guards are also supported. The failure block must exit the current path.
+
+The broader Python-only features—generic aliases, contextual lambdas, generic
+iterator method chains, switch expressions, tuple destructuring, and named/default
+arguments—remain outside this native backend's subset. Standard library and
+example sources targeting Python/LLVM use them where appropriate. See the
+[repository modernization notes](../docs/source-modernization.md).
+
 ## Native local imports
 
 Quoted imports are resolved relative to their source file. Shared
@@ -250,20 +283,21 @@ program can be compiled by this backend.
 
 The extended syntax represented by the frontend includes:
 
-- Quoted strings (raw spelling retained), `nil`, member access, method calls,
+- Quoted/raw/multiline strings and interpolation, `nil`, member access, method calls,
   indexed access, struct literals with field labels, and numeric `as` syntax.
 - Qualified named types, generic types and parameters, optional types, array and
   dictionary types, and function types.
 - Imports and aliases, `pub` declarations, structs with stored fields and methods,
   static methods, generic functions, and transparent `typealias` declarations.
-- `for`, `if let`, `break`, `continue`, `unsafe` and ordinary nested blocks,
+- Ranges and slicing, `guard let`, boolean `guard`, `for`, `if let`, `break`,
+  `continue`, `unsafe` and ordinary nested blocks,
   assignment through members/indices, bare `return`, and typed uninitialized `var`.
 
 The JSON object contains `declarations`, `functions`, `expressions`, and
 `statements`. Methods carry their owner name and declarations store method indices.
 Function bodies and child expressions use indices into flat arrays; `-1` denotes
-an absent child. Types are canonical strings. Tokens retain spelling, line and
-byte column. Numeric node kinds are documented in `ast.rl`. This development
+an absent child. Types are canonical strings. Ordinary tokens retain spelling, line and
+byte column; raw/template strings use the normalized representation above. Numeric node kinds are documented in `ast.rl`. This development
 format may evolve with the rewrite.
 
 Every source file in this directory is parsed at O0 and O3 and compared with the
@@ -498,6 +532,6 @@ retain explicit expected results; renamed equivalents provide LLVM comparisons.
 Static methods returning a struct through a type alias are now also supported
 by the Python/LLVM compiler; this previously recorded frontend limitation has
 a dedicated O0/O3 regression test in `tests/test_generic_alias_sugar.py`.
-The newer syntax described in [the syntax guide](../docs/syntax-ergonomics.md)
-is implemented in the Python/LLVM compiler and is not yet part of the native
-compiler's supported subset.
+Native support for the newer syntax is listed in the modernization section
+above; [the full syntax guide](../docs/syntax-ergonomics.md) describes the
+Python/LLVM compiler's broader coverage.

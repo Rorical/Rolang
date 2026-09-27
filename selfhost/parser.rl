@@ -2,7 +2,7 @@ import "lexer.rl"
 import "ast.rl"
 
 pub def reserved(text: String) -> Bool {
-    return text.equals("def") || text.equals("return") || text.equals("let") || text.equals("var") || text.equals("if") || text.equals("else") || text.equals("while") || text.equals("true") || text.equals("false") || text.equals("nil") || text.equals("pub") || text.equals("static") || text.equals("struct") || text.equals("import") || text.equals("typealias") || text.equals("for") || text.equals("in") || text.equals("as") || text.equals("break") || text.equals("continue") || text.equals("unsafe");
+    return text.equals("def") || text.equals("return") || text.equals("let") || text.equals("var") || text.equals("if") || text.equals("else") || text.equals("while") || text.equals("true") || text.equals("false") || text.equals("nil") || text.equals("pub") || text.equals("static") || text.equals("struct") || text.equals("import") || text.equals("typealias") || text.equals("for") || text.equals("in") || text.equals("as") || text.equals("break") || text.equals("continue") || text.equals("unsafe") || text.equals("guard");
 }
 pub def primitive_type(text: String) -> Bool {
     return text.equals("i8") || text.equals("i16") || text.equals("i32") || text.equals("i64") || text.equals("u8") || text.equals("u16") || text.equals("u32") || text.equals("u64") || text.equals("f32") || text.equals("f64") || text.equals("Bool") || text.equals("Void") || text.equals("RawPtr");
@@ -12,8 +12,9 @@ pub def precedence(op: String) -> i32 {
     if op.equals("&&") { return 2; }
     if op.equals("==") || op.equals("!=") { return 4; }
     if op.equals("<") || op.equals(">") || op.equals("<=") || op.equals(">=") { return 4; }
-    if op.equals("+") || op.equals("-") { return 5; }
-    if op.equals("*") || op.equals("/") || op.equals("%") { return 6; }
+    if op.equals("..<") || op.equals("...") { return 5; }
+    if op.equals("+") || op.equals("-") { return 6; }
+    if op.equals("*") || op.equals("/") || op.equals("%") { return 7; }
     return 0;
 }
 pub struct Parser {
@@ -46,7 +47,7 @@ pub struct Parser {
         return false;
     }
     pub def expect(text: String) -> Void {
-        if !self.take(text) { self.fail(self.peek(), "expected '" + text + "'"); }
+        if !self.take(text) { self.fail(self.peek(), f"expected '{text}'"); }
     }
     pub def name() -> Token {
         let token = self.advance();
@@ -58,9 +59,9 @@ pub struct Parser {
         if self.depth > 128 { self.fail(self.peek(), "type nesting limit exceeded"); self.depth = self.depth - 1; return ""; }
         var text = "";
         if self.take("[") {
-            text = "[" + self.type_name();
-            if self.take(":") { text = text + ":" + self.type_name(); }
-            self.expect("]"); text = text + "]";
+            text = f"[{self.type_name()}";
+            if self.take(":") { text = f"{text}:{self.type_name()}"; }
+            self.expect("]"); text = f"{text}]";
         } else {
             if self.take("(") {
                 text = "(";
@@ -68,27 +69,27 @@ pub struct Parser {
                     while self.error.is_empty() {
                         text = text + self.type_name();
                         if !self.take(",") { break; }
-                        text = text + ",";
+                        text = f"{text},";
                     }
                     self.expect(")");
                 }
-                self.expect("->"); text = text + ")->" + self.type_name();
+                self.expect("->"); text = f"{text})->{self.type_name()}";
             } else {
                 text = self.name().text;
                 let primitive = primitive_type(text);
-                while !primitive && self.take(".") { text = text + "." + self.name().text; }
+                while !primitive && self.take(".") { text = f"{text}.{self.name().text}"; }
                 if !primitive && self.take("<") {
-                    text = text + "<";
+                    text = f"{text}<";
                     while self.error.is_empty() {
                         text = text + self.type_name();
                         if !self.take(",") { break; }
-                        text = text + ",";
+                        text = f"{text},";
                     }
-                    self.expect(">"); text = text + ">";
+                    self.expect(">"); text = f"{text}>";
                 }
             }
         }
-        if self.take("?") { text = text + "?"; }
+        if self.take("?") { text = f"{text}?"; }
         self.depth = self.depth - 1;
         return text;
     }
@@ -106,8 +107,8 @@ pub struct Parser {
     pub def modifiers() -> String {
         var text = "";
         if self.take("pub") { text = "pub "; }
-        if self.take("unsafe") { text = text + "unsafe "; }
-        if self.take("static") { text = text + "static "; }
+        if self.take("unsafe") { text = f"{text}unsafe "; }
+        if self.take("static") { text = f"{text}static "; }
         return text;
     }
     pub def add_expr(token: Token, kind: i32, left: i32, right: i32, args: Vec<i32>) -> i32 {
@@ -147,7 +148,7 @@ pub struct Parser {
             if node.kind == 3 { return node.token.text + suffix; }
             if node.kind == 13 { return node.type_name + suffix; }
             if node.kind != 9 { return ""; }
-            suffix = "." + node.token.text + suffix; current = node.left;
+            suffix = f".{node.token.text}{suffix}"; current = node.left;
         }
         return "";
     }
@@ -168,7 +169,7 @@ pub struct Parser {
                         if token.text.equals("(") { left = self.value_expression(); self.expect(")"); }
                         else {
                             if token.text.equals("-") || token.text.equals("!") || token.text.equals("+") {
-                                let operand = self.expression(7);
+                                let operand = self.expression(8);
                                 left = self.add_expr(token, 5, operand, -1, empty);
                             } else {
                                 if token.kind == 1 && !reserved(token.text) {
@@ -245,7 +246,9 @@ pub struct Parser {
             let op = self.peek(); let rank = precedence(op.text);
             if rank < minimum { break; }
             self.advance(); let right = self.expression(rank + 1);
-            left = self.add_expr(op, 4, left, right, Vec<i32>.new());
+            var kind = 4;
+            if op.text.equals("..<") || op.text.equals("...") { kind = 15; }
+            left = self.add_expr(op, kind, left, right, Vec<i32>.new());
         }
         self.depth = self.depth - 1;
         return left;
@@ -266,6 +269,11 @@ pub struct Parser {
         var token = self.peek(); var kind = 6; var expr = -1; var target = -1;
         var annotation = ""; var mutable = false;
         var body = Vec<i32>.new(); var alternative = Vec<i32>.new();
+        if self.take("guard") {
+            kind = 15;
+            if self.take("let") { kind = 14; token = self.name(); self.expect("="); }
+            expr = self.condition(); self.expect("else"); alternative = self.block();
+        } else {
         if self.take("return") {
             kind = 1;
             if !self.peek().text.equals(";") { expr = self.expression(1); }
@@ -314,6 +322,7 @@ pub struct Parser {
                 }
             }
         }
+        }
         let id = self.program.statements.len();
         self.program.statements.push(Statement { token: token, kind: kind, expr: expr, target: target, annotation: annotation, mutable: mutable, body: body, alternative: alternative });
         return id;
@@ -346,7 +355,7 @@ pub struct Parser {
                 if self.take("import") {
                     kind = 1;
                     if self.peek().kind == 4 { value = self.advance().text; }
-                    else { value = self.name().text; while self.take(".") { value = value + "." + self.name().text; } }
+                    else { value = self.name().text; while self.take(".") { value = f"{value}.{self.name().text}"; } }
                     if self.take("as") { name = self.name(); }
                     self.take(";");
                 } else {

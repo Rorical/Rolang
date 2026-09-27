@@ -257,6 +257,23 @@ def reference_type(node):
     raise AssertionError(type(node))
 
 
+def normalized_binary(op, left, right):
+    # Interpolation lowers to balanced concatenation in Python and streaming
+    # concatenation in the native scanner. Compare their ordered string parts.
+    def string_value(value):
+        return value[0] in ('string', 'concat') or (
+            value[0] == 'call' and value[1][0] == 'member' and value[1][2] == 'to_string')
+    if op == '+' and (string_value(left) or string_value(right)):
+        parts = []
+        for value in (left, right):
+            parts.extend(value[1] if value[0] == 'concat' else [value])
+        parts = [part for part in parts if part != ('string', '')]
+        if len(parts) == 1:
+            return parts[0]
+        return ('concat', parts)
+    return ('binary', op, left, right)
+
+
 def reference_expr(node):
     from rolang import ast
     if node is None:
@@ -268,7 +285,7 @@ def reference_expr(node):
     if isinstance(node, ast.TypeReference):
         return ('type', reference_type(node.type_name))
     if isinstance(node, ast.BinaryOp):
-        return ('binary', node.op, reference_expr(node.left), reference_expr(node.right))
+        return normalized_binary(node.op, reference_expr(node.left), reference_expr(node.right))
     if isinstance(node, ast.UnaryOp):
         return ('unary', node.op, reference_expr(node.operand))
     if isinstance(node, ast.Call):
@@ -295,7 +312,7 @@ def native_expr(tree, index):
     if kind == 1: return ('int', int(text))
     if kind == 2: return ('bool', text == 'true')
     if kind == 3: return ('name', text)
-    if kind == 4: return ('binary', text, child('left'), child('right'))
+    if kind == 4: return normalized_binary(text, child('left'), child('right'))
     if kind == 5: return ('unary', text, child('left'))
     if kind == 6: return ('call', ('name', text), args)
     if kind == 7:
@@ -309,6 +326,7 @@ def native_expr(tree, index):
     if kind == 12: return ('index', child('left'), child('right'))
     if kind == 13: return ('type', node['type_name'])
     if kind == 14: return ('call', child('left'), args)
+    if kind == 15: return ('struct', 'IndexRange', [('start', child('left')), ('end', child('right')), ('inclusive', ('bool', text == '...'))])
     raise AssertionError(kind)
 
 
@@ -324,6 +342,11 @@ def reference_statement(node):
             pattern, value = node.condition
             return ('iflet', pattern.name, reference_expr(value), block(node.then_block), block(node.else_block))
         return ('if', reference_expr(node.condition), block(node.then_block), block(node.else_block))
+    if isinstance(node, ast.GuardStmt):
+        if isinstance(node.condition, tuple):
+            pattern, value = node.condition
+            return ('guardlet', pattern.name, reference_expr(value), block(node.else_block))
+        return ('guard', reference_expr(node.condition), block(node.else_block))
     if isinstance(node, ast.WhileStmt): return ('while', reference_expr(node.condition), block(node.body))
     if isinstance(node, ast.ForStmt): return ('for', node.pattern.name, reference_expr(node.iterable), block(node.body))
     if isinstance(node, ast.BreakStmt): return ('break',)
@@ -350,6 +373,8 @@ def native_statement(tree, index):
     if kind == 10: return ('break',)
     if kind == 11: return ('continue',)
     if kind == 12: return ('unsafe', body)
+    if kind == 14: return ('guardlet', name, expr, alternative)
+    if kind == 15: return ('guard', expr, alternative)
     raise AssertionError(kind)
 
 
@@ -1287,7 +1312,7 @@ def test_builder_and_bytes_match_reference(bootstrap, tmp_path, source, expected
     ('let b: u8 = 256;', 'out of u8 range'),
     ('let b: i64 = 9223372036854775808;', 'out of i64 range'),
     ('let b = -9223372036854775809;', 'out of i64 range'),
-    ('let b = 255 as u8; b.to_string();', 'method unsupported'),
+    ('let b = 255 as u8; b.unknown();', 'method unsupported'),
     ('let b: u8 = -1;', 'out of u8 range'),
     ('let xs = Vec<u8>.new(); xs[0] = 256;', 'out of u8 range'),
     ('let xs = Dict<u8, i32>.with_capacity(1, 0); xs[256] = 0;', 'out of u8 range'),
@@ -1307,7 +1332,7 @@ def test_builder_generated_c_sanitizers(bootstrap, tmp_path):
 
 def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
     names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
-             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl', 'os_codegen.rl',
+             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl', 'os_codegen.rl', 'range_codegen.rl',
              'backend.rl', 'ast_json.rl')
     # Exercise the compiler core independently of the module loader and CLI.
     core = '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
@@ -1959,3 +1984,91 @@ def test_native_typealias_recursive_struct(bootstrap, tmp_path):
         return sum;
     }'''
     test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+@pytest.mark.parametrize('source', [
+    r'''def main() -> i32 {
+        let path = r"C:\cache\new";
+        let text = f"{path}: {41 + 1}, {{literal}} {true} {255 as u8}";
+        if !text.equals("C:\\cache\\new: 42, {literal} true 255") { return 1; }
+        return 0;
+    }''',
+    '''def main() -> i32 {
+        let text = f"""first\n{f"{40 + 2}"}\n{{last}}""";
+        if !text.equals("first\\n42\\n{last}") { return 1; }
+        let code = r"""printf("\\n");\n""";
+        if !code.equals("printf(\\"\\\\n\\");\\n") { return 2; }
+        return 0;
+    }''',
+    r'''struct State { var n: i32; }
+    def next(s: State) -> i32 { s.n = s.n + 1; return s.n; }
+    def main() -> i32 {
+        let s = State { n: 0 };
+        let text = f"{next(s)}:{next(s)}:{\"}\" /* } */}";
+        if s.n != 2 || !text.equals("1:2:}") { return 1; }
+        return 0;
+    }'''.replace(r'\"', '"'),
+])
+def test_modern_strings(bootstrap, tmp_path, source):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 0)
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('def main() -> i32 { let s = f"oops }"; return 0; }', "unescaped"),
+    ('def main() -> i32 { let s = f"{42', "unterminated interpolation"),
+    ('def main() -> i32 { let s = r"unfinished', "unterminated string"),
+    ('def main() -> i32 { let s = """unfinished', "unterminated string"),
+])
+def test_modern_string_errors(bootstrap, tmp_path, source, diagnostic):
+    test_errors_preserve_output(bootstrap, tmp_path, source, diagnostic)
+
+
+@pytest.mark.parametrize('source', [
+    '''def main() -> i32 {
+        var sum = 0;
+        for i in 0..<5 { if i == 2 { continue; } sum = sum + i; }
+        let edge = 2147483646...2147483647;
+        for i in edge { sum = sum + 1; }
+        for i in edge { sum = sum + 1; }
+        for i in 4..<1 { return 1; }
+        if sum != 12 { return 2; }
+        return 0;
+    }''',
+    '''struct Node { var value: i32; }
+    def main() -> i32 {
+        let nodes = Vec<Node>.new();
+        for i in 0..<4 { nodes.push(Node { value: i }); }
+        let selected = nodes[1...2];
+        if selected.len() != 2 || selected.get(0).value != 1 { return 1; }
+        let shared = selected.get(1); shared.value = 42;
+        if nodes.get(2).value != 42 { return 2; }
+        selected.set(0, Node { value: 99 });
+        if nodes.get(1).value != 1 || nodes[-4...99].len() != 4 { return 3; }
+        if !"猫abc"[3..<5].equals("ab") || !"a\\0b"[1...2].equals("\\0b") { return 4; }
+        return 0;
+    }''',
+    '''def read(value: i32?) -> i32 {
+        guard let found = value else { return -1; }
+        guard found > 0 else { return 0; }
+        return found;
+    }
+    def main() -> i32 {
+        if read(nil) != -1 || read(42) != 42 || read(-3) != 0 { return 1; }
+        let values = Vec<i32?>.new(); values.push(nil); values.push(42);
+        var sum = 0;
+        for value in values { guard let n = value else { continue; } sum = sum + n; }
+        return sum - 42;
+    }''',
+])
+def test_modern_control(bootstrap, tmp_path, source):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 0)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('let x: i32? = 1; guard let n = x else {} return n;', 'guard else must exit'),
+    ('let x: i32? = 1; guard let n = x else { return n; } return n;', 'unknown variable'),
+    ('guard let n = 42 else { return 0; } return n;', 'requires an optional'),
+    ('let v = Vec<i32>.new(); v[0..<1] = 42; return 0;', 'expected i32'),
+])
+def test_modern_control_errors(bootstrap, tmp_path, body, diagnostic):
+    test_errors_preserve_output(bootstrap, tmp_path, 'def main() -> i32 {'+body+'}', diagnostic)
