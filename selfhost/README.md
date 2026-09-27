@@ -1,4 +1,4 @@
-# Rolang-written bootstrap compiler — struct code generation milestone
+# Rolang-written bootstrap compiler — string code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
@@ -8,8 +8,8 @@ or llvmlite.
 **This is not full self-hosting yet.** The existing Python compiler builds this
 compiler. Its frontend parses every `.rl` file in this directory and exposes the
 syntax tree as JSON. Its C backend cannot yet compile those files: generic
-specialization, imports, strings, collections, and standard-library calls remain
-to be implemented. Non-generic structs and methods now emit C. Here, “stage 0”
+specialization, imports, collections, and most standard-library calls remain
+to be implemented. Non-generic structs, methods, and core strings now emit C. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
 
 ## Build and run
@@ -39,11 +39,11 @@ that resolve to the same path are rejected, including symlink aliases.
 
 | Area | Supported |
 |---|---|
-| Functions | `def name(parameters) -> i32/Bool/Struct/Void`, forward calls, recursion, mutual recursion |
+| Functions | `def name(parameters) -> i32/i64/Bool/String/Struct/Void`, forward calls, recursion, mutual recursion |
 | Entry point | Exactly one `def main() -> i32` |
-| Variables | Initialized `let`/`var`, optional explicit `i32`/`Bool`/struct annotation, lexical block scopes, assignment to `var` |
+| Variables | Initialized `let`/`var`, optional explicit `i32`/`i64`/`Bool`/`String`/struct annotation, lexical block scopes, assignment to `var` |
 | Statements | `return`, `if { } else { }`, `while { }`, expression statements |
-| Expressions | Decimal i32 integers, Boolean literals, variables, calls, parentheses |
+| Expressions | Decimal i32 integers, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
 | Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
 | Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
@@ -80,7 +80,8 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-No strings, collections, imports, or type aliases are lowered yet.
+Collections, imports, and type aliases are not lowered yet. String fields,
+parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
 them at normal process exit (including runtime division-by-zero exits). Objects
@@ -91,6 +92,38 @@ rather than given incorrect destruction timing. ARC remains a future milestone.
 
 Evaluation preserves source argument/initializer order. Field assignment follows
 the existing compiler: evaluate the right-hand side, then resolve the target.
+
+## Strings and signed widths
+
+The backend supports built-in `String` without importing a standard-library file:
+
+- String literals and `+`/`concat` concatenation.
+- `len` (returns `i64`), `is_empty`, `equals`, and `compare_to`.
+- `contains`, `starts_with`, `ends_with`, and `find_char`.
+- `byte_at`/`char_at` and `substring`.
+- `i32.to_string()` and `i64.to_string()`.
+
+Strings preserve UTF-8 bytes and embedded NULs. Lengths and indices count bytes;
+`char_at` has the same byte behavior as the existing library. Out-of-range byte
+access returns `-1`. Substring clamps negative starts to zero, caps the requested
+length at the remaining bytes, and returns an empty string for nonpositive
+lengths or starts past the end. Comparisons use unsigned byte order and return
+`-1`, `0`, or `1`. Use `equals` for equality; string comparison operators are not
+supported by this subset. Literal escapes follow the existing frontend, including
+its treatment of unknown escapes (discard the backslash).
+
+Signed `i64` values support arithmetic, comparisons, parameters, fields, returns,
+and widening from `i32`. Explicit `as i32` narrowing retains the low 32 bits;
+`as i64` widens with sign extension. Arithmetic wraps at the result width and
+handles minimum-signed-value division by `-1` without C undefined behavior.
+Decimal literals still have the bootstrap's i32 range: larger i64 values must
+currently be obtained through calculations, casts, or string lengths. Other
+numeric widths and cast categories are rejected.
+
+Strings and their byte buffers follow the same process-lifetime allocation model
+as structs. The backend emits their helpers directly into standalone C. General
+stdlib imports, output functions, StringBuilder, string splitting/replacement,
+and collection operations remain future work.
 
 ## Self-parsing frontend
 
@@ -134,6 +167,7 @@ including unreachable ones, before publishing output.
 - `ast_json.rl`: deterministic syntax-tree serialization.
 - `parser.rl`: recursive-descent statements and precedence-climbing expressions.
 - `backend.rl`: name resolution, type checking, return checks, and C emission.
+- `string_codegen.rl`: emitted byte-string and signed 64-bit C helpers.
 - `main.rl`: command-line and file I/O.
 
 Syntax-tree indices avoid cycles and permit later arena-style representations.
@@ -164,7 +198,9 @@ The tests build the Rolang-written compiler at O0 and O3, then:
 - compare the expanded frontend against the Python syntax trees for its own
   sources and compound-type/operator fixtures;
 - check malformed extended syntax, type/block nesting limits, source positions,
-  JSON escaping, and explicit C-backend rejection.
+  JSON escaping, and explicit C-backend rejection;
+- compare string operations, UTF-8/NUL handling, substring bounds, numeric
+  conversion, and signed 64-bit boundaries against the existing compiler.
 
 ## Deliberate limits and next milestones
 
@@ -184,8 +220,9 @@ Next steps toward actual self-compilation:
 
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
-2. **In progress:** non-generic structs/methods now have type checking and C
-   lowering. Add strings/collections, imports, enums, and generic specialization.
+2. **In progress:** non-generic structs/methods, core strings, and signed widths
+   now have type checking and C lowering. Add collections, imports, enums, and
+   generic specialization.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
 5. Compare bootstrap generations and run the broader language regression suite.
@@ -198,16 +235,19 @@ from achieving compiler self-hosting.
 
 On Apple Silicon macOS, this milestone passed:
 
-- **250 bootstrap tests** in 239.70 seconds, including O0/O3 self-parsing,
-  complete tree comparisons, differential struct/method execution, and
-  generated-C AddressSanitizer/UndefinedBehaviorSanitizer checks.
-- **104 sanitizer checks** in 177.60 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. These include
-  self-parsing, struct programs, malformed declarations, invalid field/method
-  access, and the allocation workload. `detect_leaks=0` means these checks
-  do not validate leaks.
+- **294 bootstrap tests** in 322.72 seconds, including O0/O3 self-parsing,
+  differential execution of strings/structs/numeric operations, diagnostics,
+  and generated-C AddressSanitizer/UndefinedBehaviorSanitizer checks.
+- **64 sanitizer checks** in 146.24 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These cover native
+  self-parsing, string programs, UTF-8/NULs, malformed calls, substring bounds,
+  and signed-width boundaries. `detect_leaks=0` means these do not validate leaks.
+- **55 focused Python-compiler/library checks** for the UTF-8 literal fix:
+  29 literal/context tests and 26 existing string codegen/runtime/library tests.
 
 See the test command above to reproduce the standard suite.
 
-No existing Python compiler/runtime implementation is changed by this milestone.
-The new compiler is source-level Rolang code using the existing library.
+The native compiler remains source-level Rolang code. Differential testing also
+found and fixed a Python-backend bug: UTF-8 string literals used character counts
+instead of byte lengths. A separate regression covers Unicode and embedded NULs
+across every optimization level.

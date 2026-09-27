@@ -117,8 +117,8 @@ def test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected):
     ('def f(n: i32) -> i32 { return n; } def main() -> i32 { return f(); }', 'wrong argument count'),
     ('def main() -> i32 { return 2147483648; }', 'out of i32 range'),
     ('def main() -> i32 { return 999999999999999999999999999; }', 'out of i32 range'),
-    ('def main() -> i64 { return 0; }', 'only i32 and Bool'),
-    ('def main() -> i32 { return "text"; }', 'unsupported by C backend'),
+    ('def main() -> i64 { return 0; }', 'main must have signature'),
+    ('def main() -> i32 { return "text"; }', 'expected i32'),
     ('import std.io\ndef main() -> i32 { return 0; }', 'unsupported by C backend'),
     ('def main() -> i32 { return ' + '(' * 150 + '0' + ')' * 150 + '; }', 'nesting limit'),
     ('def main() -> i32 { return ' + '+'.join(['1'] * 150) + '; }', 'nesting limit'),
@@ -460,11 +460,10 @@ def test_extended_parse_errors(bootstrap, tmp_path, source, diagnostic):
 
 @pytest.mark.parametrize('body', [
     'return "text";', 'let x = nil; return 0;', 'let x = S { field: 1 }; return 0;',
-    'let x = Vec<i32>.new(); return 0;', 'return 1 as i32;', 'return a[0];',
+    'let x = Vec<i32>.new(); return 0;', 'return a[0];',
     'x.field = 1; return 0;', 'for x in xs { break; } return 0;',
     'if let x = y { return x; } return 0;', 'unsafe { return 0; }',
     'var x: i32; return 0;', 'return;',
-    'return 0; let unreachable = "still unsupported";',
 ])
 def test_extended_syntax_c_gate(bootstrap, tmp_path, body):
     result, path, output = emit(bootstrap, tmp_path, 'def main() -> i32 {' + body + '}')
@@ -641,6 +640,100 @@ def test_struct_diagnostics_preserve_output(bootstrap, tmp_path, source, diagnos
 
 def test_struct_c_sanitizers(bootstrap, tmp_path):
     for source, expected in (STRUCT_PROGRAMS[2], STRUCT_PROGRAMS[8]):
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (native.returncode, native.stderr) == (expected, '')
+
+
+STRING_PROGRAMS = [
+    ('''def message(n: i32) -> String { return "value=" + n.to_string(); }
+    def main() -> i32 { let a = message(-42); if !a.equals("value=-42") { return 1; }
+        if !a.concat("!").equals("value=-42!") { return 2; }
+        if a.len() != 9 || "".len() != 0 || !"".is_empty() { return 3; } return 0; }''', 0),
+    (r'''def main() -> i32 {
+        let s = "A\0λ😀\n\t\r\"\\\q";
+        if s.len() != 14 { return 1; }
+        if s.byte_at(1) != 0 || s.byte_at(2) != 206 || s.char_at(3) != 187 { return 2; }
+        if s.byte_at(-1) != -1 || s.byte_at(99) != -1 { return 3; }
+        if !s.contains("\0λ") || !s.starts_with("A\0") || !s.ends_with("\\q") { return 4; }
+        if s.find_char(0, -9) != 1 || s.find_char(999, 0) != -1 { return 5; }
+        if !s.substring(1, 3).equals("\0λ") { return 6; } return 0;
+    }''', 0),
+    ('''def main() -> i32 { let s = "abc";
+        if !s.substring(-2, 2).equals("ab") { return 1; }
+        if !s.substring(1, 2147483647).equals("bc") { return 2; }
+        if !s.substring(99, 1).is_empty() || !s.substring(0, -1).is_empty() { return 3; }
+        if !s.contains("") || !s.starts_with("") || !s.ends_with("") { return 4; }
+        if s.contains("abcd") || s.starts_with("abcd") || s.ends_with("abcd") { return 5; }
+        if s.compare_to("abd") != -1 || s.compare_to("ab") != 1 || s.compare_to("abc") != 0 { return 6; }
+        return s.find_char(98, 0);
+    }''', 1),
+    ('''struct Token { pub var text: String; pub var offset: i64;
+        pub def append(text: String) -> Void { self.text = self.text + text; }
+        pub def read() -> String { return self.text; }
+    }
+    def main() -> i32 { let token = Token { text: "x", offset: 4 }; let alias = token;
+        alias.append("y"); if !token.read().equals("xy") { return 1; }
+        token.offset = token.offset + token.text.len(); return token.offset as i32;
+    }''', 6),
+    ('''def widen(x: i64) -> i64 { return x + 1; }
+    def main() -> i32 {
+        var n: i64 = 2147483647; n = widen(n);
+        if !n.to_string().equals("2147483648") { return 1; }
+        if (n as i32) != -2147483648 { return 2; }
+        let min = n * (n * 2);
+        if !min.to_string().equals("-9223372036854775808") { return 3; }
+        if min / -1 != min || min % -1 != 0 || -min != min { return 4; }
+        if min - 1 + 1 != min || min + min != 0 { return 5; }
+        if !(-2147483648).to_string().equals("-2147483648") { return 6; }
+        return 0;
+    }''', 0),
+    ('''struct State { pub var n: i32;
+        pub def next() -> String { self.n = self.n + 1; return self.n.to_string(); }
+    }
+    def main() -> i32 { let s = State { n: 0 }; let text = s.next() + s.next();
+        if !text.equals("12") { return 1; }
+        if !s.next().concat(s.next()).equals("34") { return 2; }
+        var i = 0; var many = ""; while i < 100 { many = many + "x"; i = i + 1; }
+        return many.len() as i32;
+    }''', 100),
+    ('def main() -> i32 { let s = "first\nsecond"; return s.len() as i32; }', 12),
+]
+
+
+@pytest.mark.parametrize('source, expected', STRING_PROGRAMS)
+def test_string_program_matches_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('let s: String = 1; return 0;', 'expected String'),
+    ('return "abc".len();', 'expected i32'),
+    ('let s = "abc" + 1; return 0;', 'expected String'),
+    ('let b = "a" == "a"; return 0;', 'String.equals'),
+    ('let b = "a" < "b"; return 0;', 'integer operands'),
+    ('return "a".byte_at();', 'wrong argument count'),
+    ('return "a".byte_at("b");', 'expected i32'),
+    ('return "a".byte_at(1 as i64);', 'expected i32'),
+    ('return "a".len(1) as i32;', 'wrong argument count'),
+    ('let s = "a".substring(0); return 0;', 'wrong argument count'),
+    ('let s = "a".replace("a", "b"); return 0;', 'method unsupported'),
+    ('let s = (1).to_string(2); return 0;', 'wrong argument count'),
+    ('return "a" as i32;', 'numeric i32/i64 casts'),
+    ('return 1 as Bool;', 'numeric i32/i64 casts'),
+    ('let x: i32 = 1 as i64; return 0;', 'expected i32'),
+])
+def test_string_diagnostics_preserve_output(bootstrap, tmp_path, body, diagnostic):
+    output = tmp_path / 'program.c'; output.write_text('existing output')
+    result, _, _ = emit(bootstrap, tmp_path, 'def main() -> i32 {' + body + '}')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stdout
+    assert output.read_text() == 'existing output'
+
+
+def test_string_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in (STRING_PROGRAMS[1], STRING_PROGRAMS[2], STRING_PROGRAMS[4], STRING_PROGRAMS[5]):
         result, _, output = emit(bootstrap, tmp_path, source)
         assert result.returncode == 0, result.stdout
         native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))

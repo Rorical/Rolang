@@ -1,6 +1,7 @@
 import "lexer.rl"
 import "ast.rl"
 import "parser.rl"
+import "string_codegen.rl"
 import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
@@ -46,7 +47,7 @@ pub struct Backend {
         return nil;
     }
     pub def require_type(token: Token, actual: String, expected: String) -> Void {
-        if !actual.equals(expected) { self.fail(token, "expected " + expected + ", got " + actual); }
+        if !actual.equals(expected) && !(actual.equals("i32") && expected.equals("i64")) { self.fail(token, "expected " + expected + ", got " + actual); }
     }
     pub def integer(token: Token, allow_min: Bool) -> String {
         var n: i64 = 0;
@@ -79,6 +80,13 @@ pub struct Backend {
     pub def emit_expression(id: i32) -> Value {
         let expr = self.program.expressions.get(id);
         let token = expr.token;
+        if expr.kind == 7 { return self.string_literal(token); }
+        if expr.kind == 11 {
+            let value = self.expression(expr.left);
+            if !self.numeric(value.type_name) || !self.numeric(expr.type_name) { self.fail(token, "C backend supports numeric i32/i64 casts only"); return self.invalid(); }
+            if expr.type_name.equals("i32") { return self.value("i32", "rl_bits((uint32_t)" + value.code + ")"); }
+            return self.value("i64", "(int64_t)" + value.code);
+        }
         if expr.kind == 1 { return self.value("i32", self.integer(token, false)); }
         if expr.kind == 2 {
             if token.text.equals("true") { return self.value("Bool", "1"); }
@@ -94,8 +102,9 @@ pub struct Backend {
             if token.text.equals("-") && inner.kind == 1 { return self.value("i32", self.integer(inner.token, true)); }
             let value = self.expression(expr.left);
             if token.text.equals("!") { self.require_type(token, value.type_name, "Bool"); return self.value("Bool", "!" + value.code); }
-            self.require_type(token, value.type_name, "i32");
+            if !self.numeric(value.type_name) { self.fail(token, "expected integer operand"); }
             if token.text.equals("+") { return value; }
+            if value.type_name.equals("i64") { return self.value("i64", "rl_neg64(" + value.code + ")"); }
             return self.value("i32", "rl_neg(" + value.code + ")");
         }
         if expr.kind == 6 {
@@ -126,21 +135,27 @@ pub struct Backend {
             return result;
         }
         let right = self.expression(expr.right);
+        if op.equals("+") && left.type_name.equals("String") {
+            self.require_type(token, right.type_name, "String");
+            return self.value("String", "rl_string_concat(" + left.code + ", " + right.code + ")");
+        }
         if op.equals("==") || op.equals("!=") {
-            self.require_type(token, right.type_name, left.type_name);
+            if !(self.numeric(left.type_name) && self.numeric(right.type_name)) { self.require_type(token, right.type_name, left.type_name); }
+            if left.type_name.equals("String") { self.fail(token, "use String.equals for string comparison"); }
             if left.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
             if self.structs.contains(left.type_name) { self.fail(token, "cannot compare struct values"); }
             return self.value("Bool", left.code + " " + op + " " + right.code);
         }
-        self.require_type(token, left.type_name, "i32");
-        self.require_type(token, right.type_name, "i32");
+        if !self.numeric(left.type_name) || !self.numeric(right.type_name) { self.fail(token, "expected integer operands"); }
         if op.equals("<") || op.equals(">") || op.equals("<=") || op.equals(">=") { return self.value("Bool", left.code + " " + op + " " + right.code); }
         var helper = "rl_add";
         if op.equals("-") { helper = "rl_sub"; }
         if op.equals("*") { helper = "rl_mul"; }
         if op.equals("/") { helper = "rl_div"; }
         if op.equals("%") { helper = "rl_rem"; }
-        return self.value("i32", helper + "(" + left.code + ", " + right.code + ")");
+        var type_name = "i32";
+        if left.type_name.equals("i64") || right.type_name.equals("i64") { type_name = "i64"; helper = helper + "64"; }
+        return self.value(type_name, helper + "(" + left.code + ", " + right.code + ")");
     }
     pub def block(body: Vec<i32>, nested: Bool) -> Bool {
         if nested { self.scopes.push(Dict<String, Binding>.with_capacity(8, 1)); }
@@ -190,9 +205,11 @@ pub struct Backend {
             if scope.contains(token.text) { self.fail(token, "duplicate local '" + token.text + "'"); }
             if !statement.annotation.is_empty() { self.require_type(token, value.type_name, statement.annotation); }
             if value.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
+            var type_name = value.type_name;
+            if !statement.annotation.is_empty() { type_name = statement.annotation; }
             let name = self.fresh();
-            self.output.append_line(self.c_type(value.type_name) + " " + name + " = " + value.code + ";");
-            scope.set(token.text, Binding { code: name, type_name: value.type_name, mutable: statement.mutable });
+            self.output.append_line(self.c_type(type_name) + " " + name + " = " + value.code + ";");
+            scope.set(token.text, Binding { code: name, type_name: type_name, mutable: statement.mutable });
         }
         if statement.kind == 3 {
             if let binding = self.lookup(token.text) {
@@ -230,8 +247,8 @@ pub struct Backend {
     }
     // Validate every node, including unreachable constructs, before emission.
     pub def supported_type(token: Token, type_name: String) -> Void {
-        if !type_name.equals("i32") && !type_name.equals("Bool") && !self.structs.contains(type_name) {
-            self.fail(token, "C backend supports only i32 and Bool types or declared non-generic structs");
+        if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !self.structs.contains(type_name) {
+            self.fail(token, "C backend supports only i32, i64, Bool, String, or declared non-generic structs");
         }
     }
     pub def validate_subset() -> Void {
@@ -267,7 +284,7 @@ pub struct Backend {
             if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
-            if expression.kind > 6 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
+            if expression.kind > 6 && expression.kind != 7 && expression.kind != 11 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
         }
         for statement in self.program.statements {
             if statement.kind > 6 && statement.kind != 13 { self.fail(statement.token, "statement unsupported by C backend"); }
@@ -293,6 +310,7 @@ pub struct Backend {
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
         self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
+        self.output.append_line("typedef struct rl_string rl_string;");
         self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
         self.output.append_line("static int32_t rl_add(int32_t a,int32_t b) { return rl_bits((uint32_t)a+(uint32_t)b); }");
@@ -302,6 +320,7 @@ pub struct Backend {
         self.output.append_line("static void rl_zero(void) { fputs(\"division by zero\\n\", stderr); exit(1); }");
         self.output.append_line("static int32_t rl_div(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return INT32_MIN; return a/b; }");
         self.output.append_line("static int32_t rl_rem(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return 0; return a%b; }");
+        emit_string_runtime(self.output);
         i = 0;
         while i < self.program.functions.len() { self.output.append_line(self.signature(i) + ";"); i = i + 1; }
         i = 0;
@@ -335,6 +354,8 @@ pub struct Backend {
     }
     pub def c_type(name: String) -> String {
         if name.equals("Void") { return "void"; }
+        if name.equals("i64") { return "int64_t"; }
+        if name.equals("String") { return "rl_string*"; }
         let index = self.struct_index(name);
         if index >= 0 { return "rl_s" + index.to_string() + "*"; }
         return "int32_t";
@@ -375,6 +396,7 @@ pub struct Backend {
         if !static_call {
             let object = self.expression(member.left); owner = object.type_name; code = object.code;
         }
+        if !static_call && (owner.equals("String") || self.numeric(owner)) { return self.builtin_method(owner, code, member.token, expr.args); }
         if let index = self.functions.get(owner + "." + member.token.text) {
             let function = self.program.functions.get(index);
             if function.modifiers.contains("static") != static_call { self.fail(member.token, "static/instance method receiver mismatch"); return self.invalid(); }
@@ -423,5 +445,62 @@ pub struct Backend {
             if field == 0 { self.output.append_line("unsigned char rl_empty;"); }
             self.output.append_line("};"); i = i + 1;
         }
+    }
+
+    pub def numeric(name: String) -> Bool { return name.equals("i32") || name.equals("i64"); }
+    pub def string_literal(token: Token) -> Value {
+        let text = StringBuilder.new(); text.append_byte(34 as u8);
+        var i = 1; var length = 0;
+        while i < (token.text.len() as i32) - 1 {
+            var byte = token.text.byte_at(i); i = i + 1;
+            if byte == 92 {
+                byte = token.text.byte_at(i); i = i + 1;
+                if byte == 110 { byte = 10; }
+                else { if byte == 116 { byte = 9; }
+                else { if byte == 114 { byte = 13; }
+                else { if byte == 48 { byte = 0; } } } }
+            }
+            text.append_byte(92 as u8);
+            text.append_byte((48 + byte / 64) as u8);
+            text.append_byte((48 + (byte / 8) % 8) as u8);
+            text.append_byte((48 + byte % 8) as u8);
+            length = length + 1;
+        }
+        text.append_byte(34 as u8);
+        return self.value("String", "rl_string_new((const unsigned char *)" + text.to_string() + ", " + length.to_string() + ")");
+    }
+    pub def builtin_method(owner: String, receiver: String, token: Token, args: Vec<i32>) -> Value {
+        let name = token.text; let expected = Vec<String>.new();
+        var result = "i32"; var helper = "";
+        if self.numeric(owner) {
+            if name.equals("to_string") { helper = "rl_integer_string"; result = "String"; }
+        } else {
+            if name.equals("len") { result = "i64"; helper = "length"; }
+            if name.equals("is_empty") { result = "Bool"; helper = "empty"; }
+            if name.equals("equals") || name.equals("compare_to") {
+                expected.push("String"); helper = "rl_string_compare";
+                if name.equals("equals") { result = "Bool"; }
+            }
+            if name.equals("concat") { expected.push("String"); helper = "rl_string_concat"; result = "String"; }
+            if name.equals("contains") || name.equals("starts_with") || name.equals("ends_with") {
+                expected.push("String"); helper = "rl_string_" + name; result = "Bool";
+            }
+            if name.equals("byte_at") || name.equals("char_at") { expected.push("i32"); helper = "rl_string_byte"; }
+            if name.equals("find_char") { expected.push("i32"); expected.push("i32"); helper = "rl_string_find_char"; }
+            if name.equals("substring") { expected.push("i32"); expected.push("i32"); helper = "rl_string_substring"; result = "String"; }
+        }
+        if helper.is_empty() { self.fail(token, "method unsupported by C backend"); return self.invalid(); }
+        if expected.len() != args.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
+        let code = StringBuilder.new(); code.append(helper + "(" + receiver);
+        var i = 0;
+        while i < args.len() {
+            let value = self.expression(args.get(i)); self.require_type(token, value.type_name, expected.get(i));
+            code.append(", " + value.code); i = i + 1;
+        }
+        code.append(")");
+        if helper.equals("length") { return self.value("i64", receiver + "->length"); }
+        if helper.equals("empty") { return self.value("Bool", receiver + "->length == 0"); }
+        if name.equals("equals") { code.append(" == 0"); }
+        return self.value(result, code.to_string());
     }
 }
