@@ -257,3 +257,35 @@ pub extension f64 {
         unsafe { return String.from_handle(rt_f64_to_string_handle(self)); }
     }
 }
+
+// Formatting uses the same ordinary to_string method for builtins and user types.
+pub extension String {
+    pub def to_string() -> String { return self; }
+}
+pub extension Bool {
+    pub def to_string() -> String { if self { return "true"; } return "false"; }
+}
+pub extension i8 {
+    pub def to_string() -> String { return (self as i64).to_string(); }
+}
+pub extension i16 {
+    pub def to_string() -> String { return (self as i64).to_string(); }
+}
+pub extension u8 {
+    pub def to_string() -> String { return (self as i64).to_string(); }
+}
+pub extension u16 {
+    pub def to_string() -> String { return (self as i64).to_string(); }
+}
+pub extension u32 {
+    pub def to_string() -> String { return (self as i64).to_string(); }
+}
+pub extension f32 {
+    pub def to_string() -> String { return (self as f64).to_string(); }
+}
+pub extern "C" def rt_u64_to_string_handle(value: u64) -> RawPtr;
+pub extension u64 {
+    pub def to_string() -> String {
+        unsafe { return String.from_handle(rt_u64_to_string_handle(self)); }
+    }
+}

@@ -286,7 +286,8 @@ lvalue_suffix: "." IDENT -> lvalue_member
              | "." INT -> lvalue_tuple_member
              | "[" expr_list "]" -> lvalue_subscript
 
-primary_expr: type_member_expr
+primary_expr: interpolated_string
+            | type_member_expr
             | literal
             | struct_literal
             | IDENT -> ident_expr
@@ -334,6 +335,14 @@ TYPE_ID.10: "type_id"
 ALIGN_OF.10: "align_of"
 DROP_OF.10: "drop_of"
 CLONE_OF.10: "clone_of"
+
+// Explicit interpolation; ordinary STRING tokens keep their existing meaning.
+interpolated_string: FSTRING_START interpolation_part* "\""
+?interpolation_part: interpolation_text | interpolation_value
+interpolation_text.10: FSTRING_TEXT
+interpolation_value: "{" expr "}"
+FSTRING_START.5: "f\""
+FSTRING_TEXT.6: /([^"\\{}]|\\.|\{\{|\}\})+/
 
 // ========================= Lexer Rules =========================
 IDENT: /[a-zA-Z_][a-zA-Z0-9_]*/

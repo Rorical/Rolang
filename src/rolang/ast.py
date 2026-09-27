@@ -209,6 +209,7 @@ class Call(Expr):
     """Function call: func(args)"""
     callee: Optional[Expr] = None
     arguments: list[Argument] = field(default_factory=list)
+    is_interpolation: bool = False
 
 
 @dataclass

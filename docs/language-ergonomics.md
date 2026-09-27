@@ -47,3 +47,45 @@ Specialized call signatures preserve optional argument wrapping. Closure names
 include their enclosing function identity, avoiding collisions between functions
 and generic specializations. Collection execution and monomorphization checks:
 39 passed with AddressSanitizer and runtime payload checking enabled.
+
+## Interpolated strings and code output
+
+Use explicit `f"..."` templates. Normal strings never interpolate:
+
+```rolang
+let message = f"{path}:{line}:{column}: expected {name}";
+let braces = f"{{{42}}}"; // {42}
+```
+
+Fields accept expressions, including calls, struct literals and nested templates.
+`{{` and `}}` emit literal braces. Existing backslash escapes work in text.
+Whitespace, UTF-8 and embedded NULs are preserved. Fields evaluate once in
+left-to-right order and call ordinary `to_string()` methods. All integer widths,
+Bool, f32/f64 and String have conversions; user types can define their own
+`to_string() -> String`. Missing conversions and non-String results are errors.
+There is no implicit conversion in ordinary strings or arithmetic. Precision and
+alignment format specifiers are not part of this syntax.
+
+`import std.code_writer` provides `CodeWriter.new()` (four spaces),
+`CodeWriter.with_indent(unit)`, `write`, `line`, `indent`, `dedent`, `clear` and
+`to_string`. Embedded newlines are indented, blank lines stay blank, successive
+writes continue the same line, and `to_string()` returns an independent snapshot.
+`dedent()` returns false at depth zero without changing state.
+
+```rolang
+let writer = CodeWriter.new();
+writer.line("int main(void) {");
+writer.indent();
+writer.line(f"return {value};");
+writer.dedent();
+writer.line("}");
+```
+
+`c_quote(text)` returns a complete quoted C byte-string literal. It escapes
+quotes, backslashes, control bytes, non-ASCII bytes and question marks; fixed
+three-digit octal escapes avoid consuming following digits and avoid trigraphs.
+Interpolation performs formatting only: use `c_quote` when embedding text into C.
+
+Validation: 39 interpolation, writer, string-literal and parser checks passed.
+The writer tests compile generated C and compare the executed program's exact
+output bytes, including NULs and UTF-8.

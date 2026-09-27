@@ -3,7 +3,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional
-from lark import Lark, Transformer, Token, Tree
+from lark import Lark, Transformer, Token, Tree, v_args
 
 from . import ast
 
@@ -19,6 +19,10 @@ GRAMMAR_PATH = Path(__file__).parent / "grammar.lark"
 
 class RoLangTransformer(Transformer):
     """Transforms Lark parse tree to RoLang AST."""
+
+    def __init__(self, source: str = "") -> None:
+        super().__init__()
+        self.source = source
 
     def _span_from_meta(self, meta) -> Optional[ast.Span]:
         """Extract source location from Lark meta."""
@@ -37,6 +41,9 @@ class RoLangTransformer(Transformer):
     def _transform_tree(self, tree):
         """Transform a tree and attach span info to the resulting AST node."""
         result = super()._transform_tree(tree)
+        if tree.data in ("interpolation_text", "interpolation_value"):
+            result._template_start = tree.meta.start_pos
+            result._template_end = tree.meta.end_pos
         if isinstance(result, ast.Node) and result.span is None:
             span = self._span_from_meta(tree.meta)
             if span:
@@ -1163,6 +1170,44 @@ class RoLangTransformer(Transformer):
         value = self._unescape_string(value)
         return ast.Literal(value=value, kind="string")
 
+    def interpolation_text(self, items: list) -> ast.Literal:
+        raw = str(items[0]).replace("{{", "{").replace("}}", "}")
+        return ast.Literal(value=self._unescape_string(raw), kind="string")
+
+    def interpolation_value(self, items: list) -> ast.Call:
+        value = items[0]
+        return ast.Call(callee=ast.MemberAccess(object=value, member="to_string",
+                                                span=value.span),
+                        arguments=[], span=value.span, is_interpolation=True)
+
+    @v_args(meta=True)
+    def interpolated_string(self, meta, items: list) -> ast.Expr:
+        # Lark ignores whitespace globally, including whitespace-only text
+        # between template fields. Restore literal gaps from their exact source
+        # spans; expression spans include braces, so their trivia stays code.
+        parts = []
+        cursor = items[0].end_pos
+        for part in items[1:]:
+            if part._template_start > cursor:
+                raw = self.source[cursor:part._template_start]
+                parts.append(ast.Literal(value=self._unescape_string(raw), kind="string"))
+            parts.append(part)
+            cursor = part._template_end
+        if cursor < meta.end_pos - 1:
+            raw = self.source[cursor:meta.end_pos - 1]
+            parts.append(ast.Literal(value=self._unescape_string(raw), kind="string"))
+        if not parts:
+            return ast.Literal(value="", kind="string")
+        # A balanced concatenation tree avoids quadratic copying in long
+        # templates and retains left-to-right, exactly-once evaluation.
+        def combine(start, end):
+            if end - start == 1:
+                return parts[start]
+            mid = (start + end) // 2
+            return ast.BinaryOp(left=combine(start, mid), op="+",
+                                right=combine(mid, end), span=parts[start].span)
+        return combine(0, len(parts))
+
     def char_literal(self, items: list) -> ast.Literal:
         token = items[0]
         raw = token.value if hasattr(token, 'value') else str(token)
@@ -1252,7 +1297,7 @@ def parse(source: str) -> ast.Program:
     """
     parser = get_parser()
     tree = parser.parse(source)
-    transformer = RoLangTransformer()
+    transformer = RoLangTransformer(source)
     return transformer.transform(tree)
 
 

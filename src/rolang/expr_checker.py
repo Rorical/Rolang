@@ -56,6 +56,11 @@ class ExprChecker:
     def _infer_expr(self, expr: ast.Expr) -> TypeId:
         """Infer the type of an expression (bottom-up)."""
         result = self._do_infer_expr(expr)
+        if isinstance(expr, ast.Call) and expr.is_interpolation:
+            if not self._c.type_table.is_string(result) and not self._c.type_table.is_error(result):
+                self._c._error(TypeErrorKind.TYPE_MISMATCH,
+                              "Interpolation requires to_string() to return String")
+                result = self._c.type_table.error_type
         self._c.expr_types[id(expr)] = result
         return result
 

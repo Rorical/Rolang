@@ -3386,6 +3386,14 @@ int32_t rt_string_starts_with(void* s, void* p) { return rt_str_starts_with(rt_s
 int32_t rt_string_ends_with(void* s, void* suffix) { return rt_str_ends_with(rt_string_obj_value(s), rt_string_obj_value(suffix)); }
 void* rt_string_concat_handle(void* a, void* b) { return rt_string_handle_from_value(rt_str_concat(rt_string_obj_value(a), rt_string_obj_value(b))); }
 void* rt_int_to_string_handle(int64_t value) { return rt_string_handle_from_value(rt_int_to_string(value)); }
+void* rt_u64_to_string_handle(uint64_t value) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
+    char* data = (char*)malloc((size_t)len + 1);
+    if (!data) rt_panic("out of memory formatting integer");
+    memcpy(data, buf, (size_t)len + 1);
+    return rt_string_handle_from_value((StringVal){data, (int64_t)len});
+}
 void* rt_f64_to_string_handle(double value) { return rt_string_handle_from_value(rt_f64_to_string(value)); }
 void* rt_string_repeat_handle(void* s, int32_t count) { return rt_string_handle_from_value(rt_str_repeat(rt_string_obj_value(s), count)); }
 int32_t rt_string_char_at(void* s, int32_t index) { return rt_str_char_at(rt_string_obj_value(s), index); }
