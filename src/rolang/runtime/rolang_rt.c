@@ -3687,13 +3687,41 @@ void* rt_file_read_all(void* file) {
     return (void*)buf;
 }
 
+/* Keep byte counts separate from C terminators: file contents can contain NUL.
+ * This also supports non-seekable streams and reads from the current position. */
+static StringVal rt_file_read_text(void* file, int line) {
+    StringVal out = {NULL, 0};
+    if (!file) return out;
+    size_t capacity = 4096, length = 0;
+    char* data = malloc(capacity);
+    if (!data) return out;
+    for (;;) {
+        if (length == capacity - 1) {
+            if (capacity > SIZE_MAX / 2 || capacity > INT64_MAX / 2) {
+                free(data); return out;
+            }
+            size_t next_capacity = capacity * 2;
+            char* next = realloc(data, next_capacity);
+            if (!next) { free(data); return out; }
+            data = next; capacity = next_capacity;
+        }
+        if (line) {
+            int c = fgetc((FILE*)file);
+            if (c == EOF) break;
+            data[length++] = (char)c;
+            if (c == '\n') break;
+        } else {
+            size_t n = fread(data + length, 1, capacity - length - 1, (FILE*)file);
+            length += n;
+            if (!n) break;
+        }
+    }
+    data[length] = '\0'; out.data = data; out.len = (int64_t)length;
+    return out;
+}
+
 StringVal rt_file_read_all_s(void* file) {
-    StringVal sv = {NULL, 0};
-    char* data = (char*)rt_file_read_all(file);
-    if (!data) return sv;
-    sv.data = data;
-    sv.len = (int64_t)strlen(data);
-    return sv;
+    return rt_file_read_text(file, 0);
 }
 
 void* rt_file_read_line(void* file) {
@@ -3723,12 +3751,7 @@ void* rt_file_read_line(void* file) {
 }
 
 StringVal rt_file_read_line_s(void* file) {
-    StringVal sv = {NULL, 0};
-    char* data = (char*)rt_file_read_line(file);
-    if (!data) return sv;
-    sv.data = data;
-    sv.len = (int64_t)strlen(data);
-    return sv;
+    return rt_file_read_text(file, 1);
 }
 
 int32_t rt_file_write_str(void* file, const void* str) {
@@ -3749,6 +3772,7 @@ void* rt_file_open_s(StringVal path, StringVal mode) {
     return rt_file_open(path.data, mode.data);
 }
 int32_t rt_file_write_s(void* file, StringVal s) {
+    if (s.len < 0 || s.len > INT32_MAX) return 0;
     return rt_file_write(file, s.data, (int32_t)s.len);
 }
 int64_t rt_file_get_size_s(StringVal path) {
@@ -3767,7 +3791,7 @@ void* rt_file_open_string(void* path, void* mode) {
  * on every platform. Returns a FILE* (as void*) or NULL on failure. */
 void* rt_file_open_handle(void* path, int32_t mode) {
     StringVal p = rt_string_obj_value(path);
-    if (p.data == NULL) return NULL;
+    if (p.data == NULL || p.len <= 0 || memchr(p.data, 0, (size_t)p.len)) return NULL;
     const char* m;
     switch (mode) {
         case 1:  m = "wb"; break;
