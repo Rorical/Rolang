@@ -1,13 +1,14 @@
-# Rolang-written bootstrap compiler — bundled executable self-rebuild milestone
+# Rolang-written bootstrap compiler — native module self-rebuild milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
 emits standalone C11 for the supported subset. It does not invoke Python, Lark,
 or llvmlite.
 
-**A bundled compiler executable can now rebuild itself.** Tests assemble the
-actual compiler sources into one file, removing local imports while preserving
-built-in standard-library imports. The original `main.rl` reads files, parses,
+**The compiler executable rebuilds directly from `selfhost/main.rl`.** Its native
+module loader reads local imports, resolves paths relative to each importing file,
+deduplicates canonical paths, and merges parsed syntax trees with index remapping.
+No external source concatenation is needed. The original CLI reads files, parses,
 checks types, emits C, and writes its output in every native generation.
 
 The Python-built stage 0 emits stage 1, which emits stage 2, which emits stage 3.
@@ -17,11 +18,26 @@ between generations by the test harness. One generation is instrumented with
 AddressSanitizer and UndefinedBehaviorSanitizer. Rebuilt executables compile sample
 programs, emit matching AST JSON, and retain diagnostics and output protections.
 
-**Full project self-hosting remains incomplete:** native local-module loading is
-still missing, so this verification uses external source assembly. The backend
-also remains a language subset with process-lifetime allocation; broader language
-coverage and ownership lowering remain work ahead. The Python compiler is still
-the primary compiler. Native compiler-core and frontend tests remain in place.
+**The rewrite remains incomplete:** the backend is a language subset with
+process-lifetime allocation. Broader language coverage, complete module semantics,
+and ownership lowering remain work ahead. The Python compiler is still the
+primary compiler. Native compiler-core and frontend tests remain in place.
+
+## Native local imports
+
+Unaliased quoted imports are resolved relative to their source file. Shared
+dependencies, symlink aliases, and cycles are loaded once. Diagnostics carry the
+originating file and position. Compilation refuses to overwrite any loaded source;
+`--parse` remains a single-file syntax operation and does not read imports.
+
+The initial module subset requires public functions, methods, structs, and fields
+throughout a multi-file program, except its root `main`. Exports must have globally
+unique names; they are visible throughout the loaded graph. Private declarations,
+import aliases, escaped import paths, and imported entrypoints are rejected.
+Module-local namespaces and exact import visibility remain future work. Standard
+library free-function calls require their import in the calling file. Import depth
+is limited to 128. Output path protection uses canonical paths, not hard-link
+identity.
 
 ## Build and run
 
@@ -36,6 +52,15 @@ build/fibonacci
 # Exit status: 88 (sum of Fibonacci values for 0 through 9).
 ```
 
+Rebuild directly from the project sources:
+
+```sh
+build/rolang-stage0 selfhost/main.rl build/stage1.c
+cc -std=c11 -O3 build/stage1.c -o build/stage1
+build/stage1 selfhost/main.rl build/stage2.c
+cmp build/stage1.c build/stage2.c
+```
+
 Run the executable rebuild verification with:
 
 ```sh
@@ -47,7 +72,7 @@ needs no Python or C compiler on PATH. Compiling the resulting C requires a C11
 compiler; the resulting program needs no Rolang runtime.
 
 Exit codes: 0 for successful emission or parsing, 1 for a frontend diagnostic, and 2 for
-usage/file errors. Diagnostics currently go to stdout and use `path:line:column`,
+usage/root-file errors (missing imports are frontend diagnostics). Diagnostics currently go to stdout and use `path:line:column`,
 with one-based byte columns. Only the first frontend error is reported.
 Existing output is left untouched on lexer/parser/type errors. Input/output paths
 that resolve to the same path are rejected, including symlink aliases.
@@ -98,7 +123,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-General local imports and type aliases are not lowered yet. String fields,
+Local imports support the public-export subset above; type aliases are not lowered yet. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -281,13 +306,13 @@ Next steps toward actual self-compilation:
    existing frontend.
 2. **In progress:** non-generic structs/methods, core strings, signed widths,
    typed vectors, dictionaries, optional values, StringBuilder, and byte casts
-   now have C lowering, including the OS bridge used by the real CLI. Add
-   native module loading to remove the external source-assembly step. Enums and general generic specialization
+   now have C lowering, including the OS bridge and native module loader used by
+   the real CLI. Enums and general generic specialization
    remain part of broader language coverage.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
-4. **Verified for bundled sources:** rebuild the complete CLI through three C
-   generations. Repeat this directly from the module graph after adding imports.
-5. Generation C parity is checked for the bundle; expand broader language coverage
+4. **Verified from project sources:** rebuild the complete CLI through three C
+   generations directly from `selfhost/main.rl`.
+5. Generation C parity is checked for the module graph; expand broader language coverage
    and its regression suite.
 
 A C backend and the existing C runtime can remain dependencies during those
@@ -360,13 +385,13 @@ capacity for reuse. Buffer growth checks length and allocation-size overflow.
 Allocations follow the same process-lifetime arena as other native objects.
 
 The unaliased `import std.string_builder` is accepted as a built-in module.
-General imports and import aliases still require the future module loader.
+Local imports use the module subset described above; import aliases remain unsupported.
 Private builder fields, explicit release, and StringBuilder equality are rejected.
 
 ## Native OS bridge and unsafe operations
 
 Unaliased imports of `std.process`, `std.fs`, `std.io`, and `std.path` select these
-built-in calls (general module loading is still pending):
+built-in calls:
 
 | Module | Supported calls |
 |---|---|
@@ -401,18 +426,21 @@ environment APIs, stdin, directory listing, and import aliases are not lowered y
 
 On Apple Silicon macOS, this milestone passed:
 
-- **542 bootstrap tests** in 705.77 seconds, covering O0/O3 bootstrap builds,
-  differential execution, frontend/core compilation, native CLI rebuilds,
-  AST JSON parity, diagnostics, and output preservation.
-- **42 focused checks** in 104.24 seconds with the bootstrap runtime instrumented
-  using AddressSanitizer and payload checks. These include native OS operations,
-  pointer checks, compiler-core compilation, and executable rebuilding.
+- The **578-case bootstrap suite** completed in 689.26 seconds with 577 passes
+  and one depth-limit diagnostic failure in an O0 fixture built before its fix.
+  A fresh **10-check targeted run passed** in 71.86 seconds, including that case,
+  missing-entrypoint diagnostics, and direct rebuilds launched outside the repo.
+- **38 focused checks passed** in 73.15 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These cover module
+  loading, cycles, deduplication, depth limits, source diagnostics, compiler-core
+  compilation, and executable rebuilding.
 - Rebuild tests compile the actual CLI through three C generations with identical
   C output and no Python/tools on the rebuilding executable's PATH. Stage 2 is
   compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
   Generated file-byte tests also use both sanitizers. `detect_leaks=0` means these
   checks do not validate leaks.
-- **5 primary-runtime I/O regressions** in 20.10 seconds passed for NUL-preserving
+- The preceding I/O milestone also passed **5 primary-runtime regressions**
+  in 20.10 seconds for NUL-preserving
   file reads and stdout, filename rejection, and reads after a partial read.
 
 See the test command above to reproduce the standard suite.

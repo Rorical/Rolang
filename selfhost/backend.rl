@@ -566,7 +566,7 @@ pub struct Backend {
         var i = 0;
         while i < expr.args.len() && self.error.is_empty() {
             let label = expr.labels.get(i);
-            let token = Token { text: label, kind: 1, line: expr.token.line, column: expr.token.column };
+            let token = Token { text: label, kind: 1, line: expr.token.line, column: expr.token.column, source: expr.token.source };
             let field = self.field_index(expr.type_name, token);
             if field < 0 { return self.invalid(); }
             if seen.contains(label) { self.fail(token, "duplicate field initializer"); }
@@ -709,8 +709,8 @@ pub struct Backend {
     pub def builtin_module(name: String) -> Bool {
         return name.equals("std.string_builder") || name.equals("std.process") || name.equals("std.fs") || name.equals("std.path") || name.equals("std.io");
     }
-    pub def has_module(name: String) -> Bool {
-        for declaration in self.program.declarations { if declaration.kind == 1 && declaration.value.equals(name) && declaration.token.text.equals("import") { return true; } }
+    pub def has_module(name: String, source: String) -> Bool {
+        for declaration in self.program.declarations { if declaration.kind == 1 && declaration.value.equals(name) && declaration.token.text.equals("import") && declaration.token.source.equals(source) { return true; } }
         return false;
     }
     pub def stdlib_module(name: String) -> String {
@@ -722,7 +722,7 @@ pub struct Backend {
     }
     pub def stdlib_call(token: Token, args: Vec<i32>) -> Value {
         let module = self.stdlib_module(token.text); let name = token.text;
-        if !self.has_module(module) { self.fail(token, name + " requires import " + module); return self.invalid(); }
+        if !self.has_module(module, token.source) { self.fail(token, name + " requires import " + module); return self.invalid(); }
         let expected = Vec<String>.new(); var result = "i32"; var helper = "";
         if module.equals("std.process") {
             if name.equals("argc") { helper = "argc"; }

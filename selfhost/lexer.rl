@@ -4,13 +4,16 @@ pub struct Token {
     pub var kind: i32; // 0 EOF, 1 identifier, 2 decimal integer, 3 punctuation, 4 quoted string
     pub var line: i32;
     pub var column: i32;
+    pub var source: String;
 }
 pub struct LexResult {
     pub var tokens: Vec<Token>;
     pub var error: String;
 }
 pub def location(token: Token, message: String) -> String {
-    return token.line.to_string() + ":" + token.column.to_string() + ": " + message;
+    var prefix = "";
+    if !token.source.is_empty() { prefix = token.source + ":"; }
+    return prefix + token.line.to_string() + ":" + token.column.to_string() + ": " + message;
 }
 pub def identifier_start(c: i32) -> Bool {
     return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
@@ -34,7 +37,7 @@ pub def lex(source: String) -> LexResult {
             }
         }
         if c == 47 && pos + 1 < length && source.byte_at(pos + 1) == 42 {
-            let opening = Token { text: "/*", kind: 3, line: line, column: column };
+            let opening = Token { text: "/*", kind: 3, line: line, column: column, source: "" };
             pos = pos + 2; column = column + 2;
             var closed = false;
             while pos < length {
@@ -50,7 +53,7 @@ pub def lex(source: String) -> LexResult {
         }
         if c == 34 {
             let start = pos;
-            let opening = Token { text: "", kind: 4, line: line, column: column };
+            let opening = Token { text: "", kind: 4, line: line, column: column, source: "" };
             pos = pos + 1; column = column + 1;
             var closed = false;
             var escaped = false;
@@ -96,14 +99,14 @@ pub def lex(source: String) -> LexResult {
                 }
                 let spelling = source.substring(start, pos - start);
                 if !(spelling.equals("->") || spelling.equals("==") || spelling.equals("!=") || spelling.equals("<=") || spelling.equals(">=") || spelling.equals("&&") || spelling.equals("||") || "(){}[]?.:;,+-*/%=<>!".contains(spelling)) {
-                    let bad = Token { text: spelling, kind: 3, line: line, column: column };
+                    let bad = Token { text: spelling, kind: 3, line: line, column: column, source: "" };
                     return LexResult { tokens: tokens, error: location(bad, "unsupported character") };
                 }
             }
         }
-        tokens.push(Token { text: source.substring(start, pos - start), kind: kind, line: line, column: start_column });
+        tokens.push(Token { text: source.substring(start, pos - start), kind: kind, line: line, column: start_column, source: "" });
         column = column + pos - start;
     }
-    tokens.push(Token { text: "", kind: 0, line: line, column: column });
+    tokens.push(Token { text: "", kind: 0, line: line, column: column, source: "" });
     return LexResult { tokens: tokens, error: "" };
 }

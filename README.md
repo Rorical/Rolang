@@ -451,11 +451,11 @@ See [the API guide](docs/compiler-rewrite-foundations.md) and
 The [Rolang-written bootstrap compiler](selfhost/README.md) lexes, parses,
 checks types, and emits standalone C for a growing subset including structs,
 methods, strings, vectors, dictionaries, optionals, and compiler-oriented I/O.
-Its real CLI can now rebuild itself from externally bundled source through
+Its real CLI can now rebuild itself directly from `selfhost/main.rl` through
 three native generations with identical generated C; rebuilt executables also
 pass program, AST JSON, diagnostic, and output-preservation checks.
 
-Native module loading is still needed to rebuild directly from the project
-sources. Broader language coverage and ownership lowering also remain unfinished,
+The native module loader supports public exports with globally unique names.
+Full module semantics, broader language coverage, and ownership lowering remain unfinished,
 so the existing Python compiler remains primary. Differential and sanitizer tests
 validate the native compiler as the rewrite progresses.

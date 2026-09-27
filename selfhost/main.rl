@@ -2,6 +2,7 @@ import "lexer.rl"
 import "parser.rl"
 import "backend.rl"
 import "ast_json.rl"
+import "modules.rl"
 import std.fs
 import std.process
 import std.io
@@ -29,9 +30,19 @@ def main() -> i32 {
     parser.parse();
     if !parser.error.is_empty() { println(input + ":" + parser.error); return 1; }
     if parse_only { let json = AstJson.new(); json.program(parser.program); println(json.out.to_string()); return 0; }
-    let backend = Backend.new(parser.program);
+    let modules = Modules.new();
+    modules.load(input, parser.program, 0);
+    if !modules.error.is_empty() { println(modules.error); return 1; }
+    if modules.paths.contains(path_resolve(output)) { println("input and output paths must differ"); return 2; }
+    modules.validate();
+    if !modules.error.is_empty() { println(modules.error); return 1; }
+    let backend = Backend.new(modules.program);
     backend.generate();
-    if !backend.error.is_empty() { println(input + ":" + backend.error); return 1; }
+    if !backend.error.is_empty() {
+        if backend.error.equals("1:1: missing main function") { println(input + ":" + backend.error); }
+        else { println(backend.error); }
+        return 1;
+    }
     let text = backend.output.to_string();
     let destination = fs_open(output, 1);
     unsafe { if (destination as i64) == 0 { println("cannot open output: " + output); return 2; } }

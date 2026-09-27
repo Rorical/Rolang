@@ -1169,7 +1169,7 @@ def test_dict_constructor_runtime_errors(bootstrap, tmp_path, capacity, key_kind
 
 
 def test_native_backend_compiles_its_frontend(bootstrap, tmp_path):
-    # Until module loading exists, assemble the actual frontend source files.
+    # Exercise the actual frontend independently of the CLI and module loader.
     # No source implementation is substituted: only import declarations are removed.
     source = '\n'.join('\n'.join(
         line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
@@ -1308,7 +1308,7 @@ def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
     names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
              'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl', 'os_codegen.rl',
              'backend.rl', 'ast_json.rl')
-    # Import loading and the OS-facing CLI are separate unfinished dependencies.
+    # Exercise the compiler core independently of the module loader and CLI.
     core = '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
                               if not line.startswith('import ')) for name in names)
     driver = '''def verify_generated(source: String, expected: String) -> Bool {
@@ -1338,15 +1338,6 @@ def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
         assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
 
 
-def compiler_bundle():
-    names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
-             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl',
-             'os_codegen.rl', 'backend.rl', 'ast_json.rl', 'main.rl')
-    # Preserve builtin std imports; remove only local imports until module loading exists.
-    return '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
-                              if not line.startswith('import "')) for name in names)
-
-
 def compile_c_executable(source, target, level=0, flags=()):
     compiled = subprocess.run(['cc', '-std=c11', f'-O{level}', *flags, str(source), '-o', str(target)],
                               capture_output=True, text=True, timeout=60)
@@ -1355,8 +1346,10 @@ def compile_c_executable(source, target, level=0, flags=()):
 
 def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
     import os
-    source = compiler_bundle()
-    result, bundle, generated = emit(bootstrap, tmp_path, source)
+    project_entry = ROOT / "selfhost" / "main.rl"
+    generated = tmp_path / "stage1.c"
+    result = subprocess.run([str(bootstrap), str(project_entry), str(generated)],
+                            capture_output=True, text=True, timeout=30, cwd=tmp_path)
     assert result.returncode == 0, result.stdout
     first_c = generated.read_bytes()
     # Real main.rl drives all generations, including file reads, paths, diagnostics,
@@ -1366,8 +1359,8 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
     compile_c_executable(generated, compiler, 0)
     for stage, level in ((2, 3), (3, 0)):
         next_c = tmp_path / f'stage{stage}.c'
-        rebuilt = subprocess.run([str(compiler), str(bundle), str(next_c)], env=environment,
-                                 capture_output=True, text=True, timeout=30)
+        rebuilt = subprocess.run([str(compiler), str(project_entry), str(next_c)], env=environment,
+                                 capture_output=True, text=True, timeout=30, cwd=tmp_path)
         assert (rebuilt.returncode, rebuilt.stdout, rebuilt.stderr) == (0, '', '')
         assert next_c.read_bytes() == first_c
         compiler = tmp_path / f'stage{stage}'
@@ -1381,11 +1374,11 @@ def test_native_cli_rebuilds_itself(bootstrap, tmp_path):
         assert parse_native(compiler, path).stdout == parse_native(bootstrap, path).stdout
     # Keep the existing protection against overwriting the input, including symlinks.
     alias = tmp_path / 'source-alias.rl'
-    alias.symlink_to(bundle)
-    before = bundle.read_bytes()
-    rejected = subprocess.run([str(compiler), str(bundle), str(alias)], capture_output=True, text=True)
+    alias.symlink_to(path)
+    before = path.read_bytes()
+    rejected = subprocess.run([str(compiler), str(path), str(alias)], capture_output=True, text=True)
     assert rejected.returncode == 2 and 'must differ' in rejected.stdout
-    assert bundle.read_bytes() == before
+    assert path.read_bytes() == before
     test_errors_preserve_output(compiler, tmp_path, 'def main() -> i32 { return missing; }', 'unknown variable')
     test_usage_and_io_failures(compiler, tmp_path)
 
@@ -1480,3 +1473,85 @@ def test_native_raw_pointer_null_operations(bootstrap, tmp_path):
         return 42;
     }'''
     test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+def test_native_modules_merge_and_deduplicate(bootstrap, tmp_path):
+    folder = tmp_path / 'lib'
+    folder.mkdir()
+    (folder / 'data.rl').write_text('''pub struct Cell { pub var value: i32;
+        pub def add(n: i32) -> i32 { return self.value + n; }
+    }
+    pub def base() -> i32 { let xs = Vec<i32>.new(); xs.push(20); return xs[0]; }
+    ''')
+    (folder / 'left.rl').write_text('''import "data.rl"
+    pub def left() -> i32 { let c = Cell { value: base() }; return c.add(1); }''')
+    (folder / 'right.rl').write_text('''import "data.rl"
+    import "../program.rl"
+    pub def right() -> i32 { var n = 0; while n < 21 { n = n + 1; } return n; }''')
+    (folder / 'alias.rl').symlink_to(folder / 'data.rl')
+    source = '''import "lib/left.rl"
+    import "lib/right.rl"
+    import "lib/alias.rl"
+    def main() -> i32 { if true { return left() + right(); } return 1; }'''
+    result, path, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        assert execute_c(output, level).returncode == 42
+    # All source files, including dependencies reached through symlinks, are protected.
+    target = folder / 'alias.rl'
+    before = target.read_bytes()
+    rejected = subprocess.run([str(bootstrap), str(path), str(target)], capture_output=True, text=True)
+    assert rejected.returncode == 2 and 'must differ' in rejected.stdout
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize('dependency, source, diagnostic', [
+    ('pub def value() -> i32 { return absent; }', 'import "dep.rl"', 'unknown variable'),
+    ('pub def value() -> i32 { return ; }', 'import "dep.rl"', 'expected i32, got Void'),
+    ('pub def value() -> i32 { return ); }', 'import "dep.rl"', 'expected expression'),
+    ('/*', 'import "dep.rl"', 'unterminated block comment'),
+    ('def value() -> i32 { return 1; }', 'import "dep.rl"', 'require public functions'),
+    ('struct Hidden { pub var x: i32; }', 'import "dep.rl"', 'require public structs'),
+    ('pub struct Hidden { var x: i32; }', 'import "dep.rl"', 'require public fields'),
+    ('pub def main() -> i32 { return 1; }', 'import "dep.rl"', 'imported main unsupported'),
+    ('pub def value() -> i32 { return 1; }', 'import "dep.rl" as D', 'aliases unsupported'),
+    ('', 'import "missing.rl"', 'cannot open import'),
+    ('', 'import ""', 'empty or escaped import paths'),
+    ('', r'import "dep\x2erl"', 'empty or escaped import paths'),
+    ('import std.io\npub def value() -> i32 { return 1; }', 'import "dep.rl"', 'requires import std.io'),
+])
+def test_native_module_errors_preserve_output(bootstrap, tmp_path, dependency, source, diagnostic):
+    dep = tmp_path / 'dep.rl'
+    dep.write_text(dependency)
+    body = 'println("bad");' if diagnostic == 'requires import std.io' else ''
+    output = tmp_path / 'program.c'
+    output.write_text('keep output')
+    result, _, _ = emit(bootstrap, tmp_path, source + '\ndef main() -> i32 {' + body + 'return 0;}')
+    assert result.returncode == 1, result.stdout
+    assert diagnostic in result.stdout
+    assert output.read_text() == 'keep output'
+    if diagnostic in ('unknown variable', 'expected i32, got Void', 'expected expression', 'unterminated block comment'):
+        assert str(dep) + ':1:' in result.stdout
+
+
+def test_native_parse_does_not_load_imports(bootstrap, tmp_path):
+    path = tmp_path / 'syntax.rl'
+    path.write_text('import "does-not-exist.rl"\ndef main() -> i32 { return 0; }')
+    result = parse_native(bootstrap, path)
+    assert result.returncode == 0, result.stdout
+    assert 'does-not-exist.rl' in result.stdout
+
+
+def test_native_module_duplicate_exports(bootstrap, tmp_path):
+    for name in ('a', 'b'):
+        (tmp_path / f'{name}.rl').write_text('pub def value() -> i32 { return 1; }')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "a.rl"\nimport "b.rl"\ndef main() -> i32 { return value(); }',
+        'duplicate function')
+
+
+def test_native_module_depth_limit(bootstrap, tmp_path):
+    for index in range(130):
+        (tmp_path / f'dep{index}.rl').write_text(f'import "dep{index + 1}.rl"' if index < 129 else '')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "dep0.rl"\ndef main() -> i32 { return 0; }', 'module nesting limit exceeded')
