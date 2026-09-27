@@ -289,7 +289,9 @@ class OpsMemoryMixin:
             name="str_ptr"
         )
 
-        length = ir.Constant(self.type_cache.i64, len(value))
+        # Runtime String lengths count UTF-8 bytes, excluding only the terminator.
+        # Counting Python characters truncates multibyte literals.
+        length = ir.Constant(self.type_cache.i64, len(string_bytes) - 1)
 
         # Allocate a std String heap object whose first payload field is
         # the runtime-owned StringVal handle.
