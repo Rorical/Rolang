@@ -121,3 +121,15 @@ pattern matching, `Result` propagation across different success types, lazy
 iteration, interpolated diagnostics and indented C emission work together.
 Six O0/O3 iterator/example checks passed under AddressSanitizer and runtime
 payload checks; generated C was compiled and executed with the expected result.
+
+## Final combined validation
+
+- All 41 new checks passed: 35 language/collection/interpolation/writer checks
+  plus 6 iterator/example checks. Execution cases cover O0 and O3 with
+  AddressSanitizer and runtime payload validation enabled.
+- 151 existing compiler-foundation, contextual-literal, HIR and MIR checks passed.
+- Both native CLI bootstrap checks passed (O0/O3 seeds): three generations still
+  emit byte-identical C when rebuilding from the original self-hosted sources.
+
+The additions above are complete for the Python/LLVM compiler. Porting the new
+syntax and library coverage to the self-hosted C backend is a separate step.
