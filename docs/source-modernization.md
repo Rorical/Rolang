@@ -45,8 +45,9 @@ Explicit user imports retain their normal lookup rules.
   plus five existing runtime leak/lifetime regression checks.
 - 82 standard-library, iterator, collection, file-byte, switch, and guard checks.
 - 40 range and import-system checks, including core-named source files.
-- 30 native syntax/bootstrap checks, including three identical generated C
-  generations and the existing sanitized native generation.
+- 728 native compiler checks: 698 existing regression cases plus 30 syntax/
+  bootstrap cases. These include full-source AST comparisons at O0/O3, three
+  identical generated C generations, and the sanitized native generation.
 - Nine changed programs compiled and executed before/after at O3; exit codes,
   stdout, and stderr matched. Benchmark checksums: JSON `85400000`, Mandelbrot
   `42970365`, n-body `2446731634`.

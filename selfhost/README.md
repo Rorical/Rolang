@@ -54,7 +54,9 @@ The broader Python-only features—generic aliases, contextual lambdas, generic
 iterator method chains, switch expressions, tuple destructuring, and named/default
 arguments—remain outside this native backend's subset. Standard library and
 example sources targeting Python/LLVM use them where appropriate. See the
-[repository modernization notes](../docs/source-modernization.md).
+[repository modernization notes](../docs/source-modernization.md). The migration
+passes all 728 native compiler checks (698 regression cases and 30 syntax/bootstrap
+cases), including the O0/O3 source-tree comparisons and three-generation rebuild.
 
 ## Native local imports
 
