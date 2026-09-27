@@ -450,7 +450,7 @@ See [the API guide](docs/compiler-rewrite-foundations.md) and
 
 The [Rolang-written bootstrap compiler](selfhost/README.md) now lexes, parses,
 checks, and emits C for signed integers, Booleans, core strings, non-generic
-structs, and methods.
+structs, methods, and typed vectors with iteration.
 It is built by the existing compiler and parses its own source with `--parse`,
 producing a JSON syntax
 tree. It does not yet compile itself. Differential tests compare both its syntax

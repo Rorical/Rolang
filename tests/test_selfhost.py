@@ -460,9 +460,9 @@ def test_extended_parse_errors(bootstrap, tmp_path, source, diagnostic):
 
 @pytest.mark.parametrize('body', [
     'return "text";', 'let x = nil; return 0;', 'let x = S { field: 1 }; return 0;',
-    'let x = Vec<i32>.new(); return 0;', 'return a[0];',
+    'return a[0];',
     'x.field = 1; return 0;', 'for x in xs { break; } return 0;',
-    'if let x = y { return x; } return 0;', 'unsafe { return 0; }',
+    'if let x = y { return x; } return 0;',
     'var x: i32; return 0;', 'return;',
 ])
 def test_extended_syntax_c_gate(bootstrap, tmp_path, body):
@@ -734,6 +734,145 @@ def test_string_diagnostics_preserve_output(bootstrap, tmp_path, body, diagnosti
 
 def test_string_c_sanitizers(bootstrap, tmp_path):
     for source, expected in (STRING_PROGRAMS[1], STRING_PROGRAMS[2], STRING_PROGRAMS[4], STRING_PROGRAMS[5]):
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (native.returncode, native.stderr) == (expected, '')
+
+
+VECTOR_PROGRAMS = [
+    ('''def main() -> i32 {
+        let xs = Vec<i32>.with_capacity(-1); var i = 0;
+        while i < 1000 { xs.push(i); i = i + 1; }
+        let alias = xs; alias.set(3, 42); xs[4] = 8;
+        xs.resize(2048); xs.resize(2);
+        if xs.len() != 1000 || xs.get(3) != 42 || alias[4] != 8 { return 1; }
+        if xs.pop() != 999 || xs.len() != 999 { return 2; }
+        return 0;
+    }''', 0),
+    ('''struct Token { pub var text: String; pub var start: i32; }
+    def scan(text: String) -> Vec<Token> {
+        let out = Vec<Token>.new(); var start = 0; var i = 0;
+        while i <= (text.len() as i32) {
+            if i == (text.len() as i32) || text.byte_at(i) == 32 {
+                if i > start { out.push(Token { text: text.substring(start, i - start), start: start }); }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+    def main() -> i32 {
+        let tokens = scan("let answer = 42 ;");
+        if tokens.len() != 5 || !tokens.get(3).text.equals("42") { return 1; }
+        let token = tokens.get(1); token.text = "result";
+        if !tokens[1].text.equals("result") { return 2; }
+        var length = 0; for token in tokens { length = length + (token.text.len() as i32); }
+        return length;
+    }''', 13),
+    ('''def main() -> i32 {
+        let outer = Vec<Vec<i64>>.new(); let inner = Vec<i64>.new();
+        inner.push(2147483647); inner.push((2147483647 as i64) + 1);
+        outer.push(inner); outer[0][0] = -5;
+        if inner.get(0) != -5 || outer.get(0).pop() != ((2147483647 as i64) + 1) { return 1; }
+        let flags = Vec<Bool>.new(); flags.push(true); flags.push(false);
+        if flags.pop() || !flags.pop() || flags.pop() { return 2; }
+        let texts = Vec<String>.new(); texts.push("λ"); texts.push("a" + "b");
+        if !texts.pop().equals("ab") || !texts.pop().equals("λ") { return 3; }
+        return 0;
+    }''', 0),
+    ('''def main() -> i32 {
+        let xs = Vec<i32>.new(); xs.push(1); var sum = 0;
+        for x in xs {
+            if x < 5 { xs.push(x + 1); }
+            if x == 2 { continue; }
+            if x == 4 { break; }
+            sum = sum + x;
+        }
+        var i = 0;
+        while true { i = i + 1; if i < 3 { continue; } break; }
+        { let sum = 99; if sum != 99 { return 1; } }
+        unsafe { if i != 3 { return 2; } }
+        return sum + xs.len();
+    }''', 9),
+    ('''def main() -> i32 {
+        let xs = Vec<i32>.new(); xs.push(2); xs.push(3); var sum = 0;
+        for x in xs { for y in xs { if y == 3 { break; } sum = sum + x * y; } }
+        let empty = Vec<i32>.new(); for x in empty { return 1; }
+        if empty.pop() != 0 { return 2; }
+        return sum;
+    }''', 10),
+    ('''struct State {
+        pub var items: Vec<i32>;
+        pub def index() -> i32 { self.items.push(2); return 0; }
+        pub def value() -> i32 { self.items = Vec<i32>.new(); self.items.push(9); return 7; }
+    }
+    def main() -> i32 {
+        let original = Vec<i32>.new(); original.push(1); let state = State { items: original };
+        state.items[state.index()] = state.value();
+        return original[0] * 10 + state.items[0];
+    }''', 79),
+    ('''def same(xs: Vec<i32>) -> Vec<i32> { xs.push(8); return xs; }
+    def main() -> i32 {
+        let xs = Vec<i32>.new(); let ys = same(xs); ys.push(9);
+        var total = 0; var current = xs;
+        for x in current { current = Vec<i32>.new(); total = total + x; }
+        return total;
+    }''', 17),
+]
+
+
+@pytest.mark.parametrize('source, expected', VECTOR_PROGRAMS)
+def test_vector_program_matches_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('let xs = Vec<Void>.new(); return 0;', 'supports only'),
+    ('let xs = Vec<Missing>.new(); return 0;', 'supports only'),
+    ('let xs = Vec<i32, Bool>.new(); return 0;', 'supports only'),
+    ('let xs = Vec<Vec<Missing>>.new(); return 0;', 'supports only'),
+    ('let xs: Vec<i32> = Vec<i64>.new(); return 0;', 'expected Vec<i32>'),
+    ('let xs = Vec<i32>.new(); xs.push(true); return 0;', 'expected i32'),
+    ('let xs = Vec<String>.new(); xs.push(1); return 0;', 'expected String'),
+    ('let xs = Vec<i32>.new(); return xs[true];', 'expected i32'),
+    ('let xs = Vec<i32>.new(); xs[0] = "bad"; return 0;', 'expected i32'),
+    ('let xs = Vec<i32>.new(); xs.set(0, false); return 0;', 'expected i32'),
+    ('let xs = Vec<i32>.new(1); return 0;', 'wrong argument count'),
+    ('let xs = Vec<i32>.with_capacity(); return 0;', 'wrong argument count'),
+    ('let xs = Vec<i32>.with_capacity(true); return 0;', 'expected i32'),
+    ('let xs = Vec<i32>.missing(); return 0;', 'unknown Vec constructor'),
+    ('let xs = Vec<i32>.new(); xs.free(); return 0;', 'Vec method unsupported'),
+    ('let xs = Vec<i32>.new(); xs.pop(0); return 0;', 'wrong argument count'),
+    ('let xs = Vec<i32>.new(); xs.get(); return 0;', 'wrong argument count'),
+    ('let xs = Vec<i32>.new(); let same = xs == xs; return 0;', 'cannot compare struct'),
+    ('let x = Vec<i32>; return 0;', "expected expression"),
+    ('break; return 0;', 'loop control outside a loop'),
+    ('continue; return 0;', 'loop control outside a loop'),
+    ('for x in 1 {} return 0;', 'iterable must be a Vec'),
+    ('let xs = Vec<i32>.new(); for x in xs { x = 1; } return 0;', 'cannot assign to let'),
+    ('let xs = Vec<i32>.new(); for x in xs { let x = 1; } return 0;', 'duplicate local'),
+    ('let xs = Vec<i32>.new(); for x in xs {} return x;', 'unknown variable'),
+])
+def test_vector_diagnostics_preserve_output(bootstrap, tmp_path, body, diagnostic):
+    output = tmp_path / 'program.c'; output.write_text('existing output')
+    result, _, _ = emit(bootstrap, tmp_path, 'def main() -> i32 {' + body + '}')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stdout
+    assert output.read_text() == 'existing output'
+
+
+@pytest.mark.parametrize('action', ['xs.get(0);', 'xs.set(0, 1);', 'xs[-1];', 'xs[1] = 2;'])
+def test_vector_bounds_fail_at_runtime(bootstrap, tmp_path, action):
+    result, _, output = emit(bootstrap, tmp_path, 'def main() -> i32 { let xs = Vec<i32>.new(); ' + action + ' return 0; }')
+    assert result.returncode == 0, result.stdout
+    native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+    assert native.returncode == 1
+    assert native.stderr == 'Vec index out of bounds\n'
+
+
+def test_vector_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in VECTOR_PROGRAMS[:4]:
         result, _, output = emit(bootstrap, tmp_path, source)
         assert result.returncode == 0, result.stdout
         native = execute_c(output, 3, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))

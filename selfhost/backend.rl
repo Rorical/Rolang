@@ -2,6 +2,7 @@ import "lexer.rl"
 import "ast.rl"
 import "parser.rl"
 import "string_codegen.rl"
+import "vector_codegen.rl"
 import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
@@ -15,11 +16,12 @@ pub struct Backend {
     pub var error: String;
     pub var next_id: i32;
     pub var depth: i32;
+    pub var loop_depth: i32;
     pub var return_type: String;
 
     pub static def new(program: Program) -> Backend {
         return Backend { program: program, functions: Dict<String, i32>.with_capacity(16, 1),
-            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, return_type: "i32" };
+            structs: Dict<String, i32>.with_capacity(16, 1), scopes: Vec<Dict<String, Binding>>.new(), output: StringBuilder.new(), error: "", next_id: 0, depth: 0, loop_depth: 0, return_type: "i32" };
     }
     pub def fail(token: Token, message: String) -> Void {
         if self.error.is_empty() { self.error = location(token, message); }
@@ -119,6 +121,11 @@ pub struct Backend {
             let declaration = self.program.declarations.get(self.struct_index(object.type_name));
             return self.value(declaration.fields.get(field).type_name, object.code + "->rl_m" + field.to_string());
         }
+        if expr.kind == 12 {
+            let object = self.expression(expr.left);
+            let index = self.expression(expr.right);
+            return self.vector_get(object, index, token);
+        }
         if expr.kind == 10 { return self.construct(expr); }
         if expr.kind == 14 { return self.method_call(expr); }
         if expr.kind != 4 { self.fail(token, "expression unsupported by C backend"); return self.invalid(); }
@@ -143,7 +150,7 @@ pub struct Backend {
             if !(self.numeric(left.type_name) && self.numeric(right.type_name)) { self.require_type(token, right.type_name, left.type_name); }
             if left.type_name.equals("String") { self.fail(token, "use String.equals for string comparison"); }
             if left.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
-            if self.structs.contains(left.type_name) { self.fail(token, "cannot compare struct values"); }
+            if self.structs.contains(left.type_name) || self.is_vector(left.type_name) { self.fail(token, "cannot compare struct values"); }
             return self.value("Bool", left.code + " " + op + " " + right.code);
         }
         if !self.numeric(left.type_name) || !self.numeric(right.type_name) { self.fail(token, "expected integer operands"); }
@@ -169,8 +176,25 @@ pub struct Backend {
     pub def statement(id: i32) -> Bool {
         let statement = self.program.statements.get(id);
         let token = statement.token;
+        if statement.kind == 7 || statement.kind == 12 {
+            self.output.append_line("{"); let returned = self.block(statement.body, true); self.output.append_line("}"); return returned;
+        }
+        if statement.kind == 10 || statement.kind == 11 {
+            if self.loop_depth == 0 { self.fail(token, "loop control outside a loop"); }
+            if statement.kind == 10 { self.output.append_line("break;"); } else { self.output.append_line("continue;"); }
+            return false;
+        }
+        if statement.kind == 8 { return self.for_loop(statement); }
         if statement.kind == 13 {
             let target = self.program.expressions.get(statement.target);
+            if target.kind == 12 {
+                // Indexed assignment follows method-call order: receiver, index, RHS.
+                let object = self.expression(target.left); let index = self.expression(target.right);
+                let value = self.expression(statement.expr);
+                if !self.is_vector(object.type_name) { self.fail(token, "index receiver must be a Vec"); return false; }
+                self.require_type(token, index.type_name, "i32"); self.require_type(token, value.type_name, self.vector_element(object.type_name));
+                self.output.append_line("rl_vec_set(" + object.code + ", " + index.code + ", " + self.slot(value) + ");"); return false;
+            }
             if target.kind != 9 { self.fail(token, "assignment unsupported by C backend"); return false; }
             // Rolang evaluates an assignment's RHS before resolving its target.
             let value = self.expression(statement.expr);
@@ -190,7 +214,9 @@ pub struct Backend {
             let condition = self.expression(statement.expr);
             self.require_type(token, condition.type_name, "Bool");
             self.output.append_line("if (!" + condition.code + ") break;");
+            self.loop_depth = self.loop_depth + 1;
             self.block(statement.body, true);
+            self.loop_depth = self.loop_depth - 1;
             self.output.append_line("}");
             return false;
         }
@@ -247,6 +273,7 @@ pub struct Backend {
     }
     // Validate every node, including unreachable constructs, before emission.
     pub def supported_type(token: Token, type_name: String) -> Void {
+        if self.is_vector(type_name) { self.supported_type(token, self.vector_element(type_name)); return; }
         if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !self.structs.contains(type_name) {
             self.fail(token, "C backend supports only i32, i64, Bool, String, or declared non-generic structs");
         }
@@ -257,7 +284,7 @@ pub struct Backend {
             if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
-                if self.structs.contains(name) || primitive_type(name) || name.equals("String") { self.fail(declaration.token, "duplicate or reserved struct name"); }
+                if self.structs.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") { self.fail(declaration.token, "duplicate or reserved struct name"); }
                 self.structs.set(name, index);
             }
             index = index + 1;
@@ -284,11 +311,11 @@ pub struct Backend {
             if function.owner.is_empty() && self.structs.contains(function.token.text) { self.fail(function.token, "function conflicts with struct name"); }
         }
         for expression in self.program.expressions {
-            if expression.kind > 6 && expression.kind != 7 && expression.kind != 11 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
+            if expression.kind > 6 && expression.kind != 7 && expression.kind != 11 && expression.kind != 12 && expression.kind != 13 && expression.kind != 9 && expression.kind != 10 && expression.kind != 14 { self.fail(expression.token, "expression unsupported by C backend"); }
         }
         for statement in self.program.statements {
-            if statement.kind > 6 && statement.kind != 13 { self.fail(statement.token, "statement unsupported by C backend"); }
-            if statement.expr < 0 && statement.kind != 1 { self.fail(statement.token, "C backend requires an expression or initializer"); }
+            if statement.kind == 9 { self.fail(statement.token, "statement unsupported by C backend"); }
+            if statement.expr < 0 && (statement.kind == 2 || statement.kind == 3 || statement.kind == 4 || statement.kind == 5 || statement.kind == 6 || statement.kind == 8 || statement.kind == 13) { self.fail(statement.token, "C backend requires an expression or initializer"); }
             if !statement.annotation.is_empty() { self.supported_type(statement.token, statement.annotation); }
         }
     }
@@ -310,7 +337,7 @@ pub struct Backend {
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
         self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
-        self.output.append_line("typedef struct rl_string rl_string;");
+        self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec;");
         self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
         self.output.append_line("static int32_t rl_add(int32_t a,int32_t b) { return rl_bits((uint32_t)a+(uint32_t)b); }");
@@ -321,6 +348,7 @@ pub struct Backend {
         self.output.append_line("static int32_t rl_div(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return INT32_MIN; return a/b; }");
         self.output.append_line("static int32_t rl_rem(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return 0; return a%b; }");
         emit_string_runtime(self.output);
+        emit_vector_runtime(self.output);
         i = 0;
         while i < self.program.functions.len() { self.output.append_line(self.signature(i) + ";"); i = i + 1; }
         i = 0;
@@ -356,6 +384,7 @@ pub struct Backend {
         if name.equals("Void") { return "void"; }
         if name.equals("i64") { return "int64_t"; }
         if name.equals("String") { return "rl_string*"; }
+        if self.is_vector(name) { return "rl_vec*"; }
         let index = self.struct_index(name);
         if index >= 0 { return "rl_s" + index.to_string() + "*"; }
         return "int32_t";
@@ -388,6 +417,11 @@ pub struct Backend {
         let member = self.program.expressions.get(expr.left);
         if member.kind != 9 { self.fail(expr.token, "call target unsupported by C backend"); return self.invalid(); }
         let receiver = self.program.expressions.get(member.left);
+        if receiver.kind == 13 {
+            self.supported_type(receiver.token, receiver.type_name);
+            if self.is_vector(receiver.type_name) { return self.vector_constructor(receiver.type_name, member.token, expr.args); }
+            self.fail(receiver.token, "generic receiver unsupported by C backend"); return self.invalid();
+        }
         var owner = ""; var code = ""; var static_call = false;
         if receiver.kind == 3 && self.structs.contains(receiver.token.text) {
             if let local = self.lookup(receiver.token.text) { static_call = false; }
@@ -396,6 +430,7 @@ pub struct Backend {
         if !static_call {
             let object = self.expression(member.left); owner = object.type_name; code = object.code;
         }
+        if !static_call && self.is_vector(owner) { return self.vector_method(owner, code, member.token, expr.args); }
         if !static_call && (owner.equals("String") || self.numeric(owner)) { return self.builtin_method(owner, code, member.token, expr.args); }
         if let index = self.functions.get(owner + "." + member.token.text) {
             let function = self.program.functions.get(index);
@@ -502,5 +537,61 @@ pub struct Backend {
         if helper.equals("empty") { return self.value("Bool", receiver + "->length == 0"); }
         if name.equals("equals") { code.append(" == 0"); }
         return self.value(result, code.to_string());
+    }
+
+    pub def is_vector(name: String) -> Bool { return name.starts_with("Vec<") && name.ends_with(">"); }
+    pub def vector_element(name: String) -> String { return name.substring(4, (name.len() as i32) - 5); }
+    pub def slot(value: Value) -> String {
+        if self.numeric(value.type_name) || value.type_name.equals("Bool") { return "((rl_slot){.number = " + value.code + "})"; }
+        return "((rl_slot){.reference = " + value.code + "})";
+    }
+    pub def unpack(type_name: String, expression: String) -> Value {
+        var field = "reference";
+        if self.numeric(type_name) || type_name.equals("Bool") { field = "number"; }
+        return self.value(type_name, "(" + self.c_type(type_name) + ")(" + expression + ")." + field);
+    }
+    pub def vector_get(object: Value, index: Value, token: Token) -> Value {
+        if !self.is_vector(object.type_name) { self.fail(token, "index receiver must be a Vec"); return self.invalid(); }
+        self.require_type(token, index.type_name, "i32");
+        return self.unpack(self.vector_element(object.type_name), "rl_vec_get(" + object.code + ", " + index.code + ")");
+    }
+    pub def vector_constructor(type_name: String, token: Token, args: Vec<i32>) -> Value {
+        var capacity = "8"; var count = 0;
+        if token.text.equals("with_capacity") { count = 1; }
+        else { if !token.text.equals("new") { self.fail(token, "unknown Vec constructor"); return self.invalid(); } }
+        if args.len() != count { self.fail(token, "wrong argument count"); return self.invalid(); }
+        if count == 1 { let value = self.expression(args.get(0)); self.require_type(token, value.type_name, "i32"); capacity = value.code; }
+        return self.value(type_name, "rl_vec_new(" + capacity + ")");
+    }
+    pub def vector_method(owner: String, receiver: String, token: Token, args: Vec<i32>) -> Value {
+        let name = token.text; let element = self.vector_element(owner); let expected = Vec<String>.new();
+        if name.equals("push") { expected.push(element); }
+        else {
+            if name.equals("get") || name.equals("resize") { expected.push("i32"); }
+            else {
+                if name.equals("set") { expected.push("i32"); expected.push(element); }
+                else { if !name.equals("len") && !name.equals("pop") { self.fail(token, "Vec method unsupported by C backend"); return self.invalid(); } }
+            }
+        }
+        if args.len() != expected.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
+        let values = Vec<Value>.new(); var i = 0;
+        while i < args.len() { let value = self.expression(args.get(i)); self.require_type(token, value.type_name, expected.get(i)); values.push(value); i = i + 1; }
+        if name.equals("len") { return self.value("i32", receiver + "->length"); }
+        if name.equals("pop") { return self.unpack(element, "rl_vec_pop(" + receiver + ")"); }
+        if name.equals("get") { return self.unpack(element, "rl_vec_get(" + receiver + ", " + values.get(0).code + ")"); }
+        if name.equals("push") { return self.value("Void", "rl_vec_push(" + receiver + ", " + self.slot(values.get(0)) + ")"); }
+        if name.equals("set") { return self.value("Void", "rl_vec_set(" + receiver + ", " + values.get(0).code + ", " + self.slot(values.get(1)) + ")"); }
+        return self.value("Void", "rl_vec_resize(" + receiver + ", " + values.get(0).code + ")");
+    }
+    pub def for_loop(statement: Statement) -> Bool {
+        let object = self.expression(statement.expr);
+        if !self.is_vector(object.type_name) { self.fail(statement.token, "for-loop iterable must be a Vec"); return false; }
+        let element = self.vector_element(object.type_name); let index = self.fresh();
+        self.output.append_line("for (int32_t " + index + " = 0; " + index + " < " + object.code + "->length; ++" + index + ") {");
+        let value = self.unpack(element, "rl_vec_get(" + object.code + ", " + index + ")");
+        let scope = Dict<String, Binding>.with_capacity(8, 1);
+        scope.set(statement.token.text, Binding { code: value.code, type_name: element, mutable: false }); self.scopes.push(scope);
+        self.loop_depth = self.loop_depth + 1; self.block(statement.body, false); self.loop_depth = self.loop_depth - 1;
+        self.scopes.pop(); self.output.append_line("}"); return false;
     }
 }

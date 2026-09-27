@@ -1,4 +1,4 @@
-# Rolang-written bootstrap compiler — string code generation milestone
+# Rolang-written bootstrap compiler — vector code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
@@ -8,8 +8,9 @@ or llvmlite.
 **This is not full self-hosting yet.** The existing Python compiler builds this
 compiler. Its frontend parses every `.rl` file in this directory and exposes the
 syntax tree as JSON. Its C backend cannot yet compile those files: generic
-specialization, imports, collections, and most standard-library calls remain
-to be implemented. Non-generic structs, methods, and core strings now emit C. Here, “stage 0”
+specialization, imports, dictionaries, optional values, and some standard-library
+calls remain to be implemented. Non-generic structs, methods, core strings, and
+typed vectors now emit C. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
 
 ## Build and run
@@ -42,10 +43,11 @@ that resolve to the same path are rejected, including symlink aliases.
 | Functions | `def name(parameters) -> i32/i64/Bool/String/Struct/Void`, forward calls, recursion, mutual recursion |
 | Entry point | Exactly one `def main() -> i32` |
 | Variables | Initialized `let`/`var`, optional explicit `i32`/`i64`/`Bool`/`String`/struct annotation, lexical block scopes, assignment to `var` |
-| Statements | `return`, `if { } else { }`, `while { }`, expression statements |
+| Statements | `return`, `if { } else { }`, `while`, `for` over vectors, `break`/`continue`, nested/unsafe blocks, expression statements |
 | Expressions | Decimal i32 integers, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
 | Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
+| Collections | Typed `Vec<T>`, nested vectors, indexed access/assignment, constructors and core methods |
 | Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
 
 Function arguments are immutable. Conditions require Bool. Arguments, assignments,
@@ -80,7 +82,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-Collections, imports, and type aliases are not lowered yet. String fields,
+Dictionaries, imports, and type aliases are not lowered yet. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -123,7 +125,40 @@ numeric widths and cast categories are rejected.
 Strings and their byte buffers follow the same process-lifetime allocation model
 as structs. The backend emits their helpers directly into standalone C. General
 stdlib imports, output functions, StringBuilder, string splitting/replacement,
-and collection operations remain future work.
+and additional collection operations remain future work.
+
+## Vectors and iteration
+
+`Vec<T>` is now a built-in typed collection in the C backend. Its element type can
+be `i32`, `i64`, `Bool`, `String`, a declared non-generic struct, or another vector.
+Vector types are invariant: `Vec<i32>` and `Vec<i64>` are distinct types. Individual
+`i32` values can still widen when inserted into `Vec<i64>`.
+
+Supported operations:
+
+- `Vec<T>.new()` and `Vec<T>.with_capacity(capacity)`.
+- `push`, `get`, `set`, `pop`, `len`, and `resize`.
+- Indexed reads and writes (`items[index]`, `items[index] = value`).
+- `for item in items`, including growth during iteration, nested loops, `break`,
+  and `continue`. The iterable is evaluated once; length is checked each iteration.
+
+`resize` grows capacity without changing length. Invalid indices exit with a
+runtime bounds diagnostic. Empty `pop` follows the current library's zero-slot
+behavior: zero/false for scalars and a null reference for heap elements. Callers
+must ensure a nonempty vector before using a popped heap object. Explicit `free`,
+raw handles, iterator objects, collection literals, and general user-defined
+generic specialization remain unsupported.
+
+Vector references preserve aliasing across calls, fields, and returned values.
+Indexed assignment evaluates the receiver, index, and value in that order, as in
+the existing compiler; ordinary field assignment continues to evaluate its value
+first. Loop variables are immutable and scoped to the loop body.
+
+Elements occupy typed numeric/reference slots, avoiding pointer/integer aliasing.
+Resized buffers, vectors, and referenced objects use the bootstrap's process-wide
+allocation lifetime; ARC reclamation is still pending. The differential suite
+includes a small token scanner with `Vec<Token>`, nested vectors, mixed scalar and
+heap elements, growth/aliasing, and mutation during iteration.
 
 ## Self-parsing frontend
 
@@ -168,6 +203,7 @@ including unreachable ones, before publishing output.
 - `parser.rl`: recursive-descent statements and precedence-climbing expressions.
 - `backend.rl`: name resolution, type checking, return checks, and C emission.
 - `string_codegen.rl`: emitted byte-string and signed 64-bit C helpers.
+- `vector_codegen.rl`: emitted vector storage, growth, and bounds checks.
 - `main.rl`: command-line and file I/O.
 
 Syntax-tree indices avoid cycles and permit later arena-style representations.
@@ -200,7 +236,9 @@ The tests build the Rolang-written compiler at O0 and O3, then:
 - check malformed extended syntax, type/block nesting limits, source positions,
   JSON escaping, and explicit C-backend rejection;
 - compare string operations, UTF-8/NUL handling, substring bounds, numeric
-  conversion, and signed 64-bit boundaries against the existing compiler.
+  conversion, and signed 64-bit boundaries against the existing compiler;
+- compare typed vector storage, heap aliasing, indexed assignment order, loops,
+  capacity growth, and token scanning; check invalid indices under sanitizers.
 
 ## Deliberate limits and next milestones
 
@@ -220,9 +258,9 @@ Next steps toward actual self-compilation:
 
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
-2. **In progress:** non-generic structs/methods, core strings, and signed widths
-   now have type checking and C lowering. Add collections, imports, enums, and
-   generic specialization.
+2. **In progress:** non-generic structs/methods, core strings, signed widths,
+   and typed vectors now have C lowering. Add dictionaries, optional values,
+   imports, enums, and general generic specialization.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
 5. Compare bootstrap generations and run the broader language regression suite.
@@ -235,19 +273,18 @@ from achieving compiler self-hosting.
 
 On Apple Silicon macOS, this milestone passed:
 
-- **294 bootstrap tests** in 322.72 seconds, including O0/O3 self-parsing,
-  differential execution of strings/structs/numeric operations, diagnostics,
-  and generated-C AddressSanitizer/UndefinedBehaviorSanitizer checks.
-- **64 sanitizer checks** in 146.24 seconds with the bootstrap runtime
+- **366 bootstrap tests** in 441.41 seconds, including O0/O3 self-parsing,
+  differential execution of vectors/loops, strings, structs and numeric
+  operations, diagnostics, and generated-C sanitizer checks.
+- **90 sanitizer checks** in 161.91 seconds with the bootstrap runtime
   instrumented using AddressSanitizer and payload checks. These cover native
-  self-parsing, string programs, UTF-8/NULs, malformed calls, substring bounds,
-  and signed-width boundaries. `detect_leaks=0` means these do not validate leaks.
-- **55 focused Python-compiler/library checks** for the UTF-8 literal fix:
-  29 literal/context tests and 26 existing string codegen/runtime/library tests.
+  self-parsing, typed/nested vectors, bounds failures, aliasing, iteration,
+  token scanning, and malformed vector operations. `detect_leaks=0` means
+  these do not validate leaks.
 
 See the test command above to reproduce the standard suite.
 
-The native compiler remains source-level Rolang code. Differential testing also
-found and fixed a Python-backend bug: UTF-8 string literals used character counts
+This milestone changes only source-level bootstrap code and tests. Earlier
+string differential tests found and fixed a Python-backend bug: UTF-8 string literals used character counts
 instead of byte lengths. A separate regression covers Unicode and embedded NULs
 across every optimization level.
