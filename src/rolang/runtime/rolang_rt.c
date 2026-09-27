@@ -2872,7 +2872,7 @@ void rt_string_destroy(StringVal s) {
 void rt_io_print_str(void* s_obj) {
     StringVal s = rt_string_obj_value(s_obj);
     if (s.data && s.len > 0) {
-        printf("%.*s", (int)s.len, s.data);
+        fwrite(s.data, 1, (size_t)s.len, stdout);
     }
 }
 

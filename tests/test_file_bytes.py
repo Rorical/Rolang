@@ -41,3 +41,16 @@ def test_file_readers_preserve_nul_bytes(tmp_path, level):
     run = subprocess.run([str(binary), str(path)], capture_output=True, timeout=10)
     assert (run.returncode, run.stdout, run.stderr) == (0, b'', b'')
     assert path.read_bytes() == data
+
+
+@pytest.mark.parametrize('level', [OptLevel.O0, OptLevel.O3])
+def test_print_preserves_nul_bytes(tmp_path, level):
+    source = tmp_path / 'print.rl'
+    source.write_text(r'''import std.io
+def main() -> i32 { print("λ\0A"); println("\0Z"); return 0; }
+''')
+    binary = tmp_path / 'print'
+    compiled = compile_source(source, CompileOptions(opt_level=level, output_path=binary))
+    assert compiled.success, [d.message for d in compiled.diagnostics.diagnostics]
+    run = subprocess.run([str(binary)], capture_output=True, timeout=10)
+    assert (run.returncode, run.stdout, run.stderr) == (0, 'λ\0A\0Z\n'.encode(), b'')
