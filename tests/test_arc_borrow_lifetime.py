@@ -40,3 +40,18 @@ def main() -> i32 {
 }
 ''', level)
     assert (run.returncode, run.stderr) == (0, '')
+
+
+@pytest.mark.parametrize('level', [OptLevel.O0, OptLevel.O3])
+def test_readonly_call_keeps_temporary_field_owner_alive(tmp_path, level):
+    run = build_run(tmp_path, '''
+struct Holder { var value: String; }
+def make() -> Holder { return Holder { value: "ke" + "pt" }; }
+def main() -> i32 {
+    unsafe {
+        let size = rt_string_len(make().value);
+        return (size as i32) - 4;
+    }
+}
+''', level)
+    assert (run.returncode, run.stderr) == (0, '')

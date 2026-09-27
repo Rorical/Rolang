@@ -41,7 +41,7 @@ Explicit user imports retain their normal lookup rules.
 
 ## Validation
 
-- 30 ARC checks, including O0/O3 lifetime programs with ASAN and payload checks,
+- 32 ARC checks, including O0/O3 lifetime programs with ASAN and payload checks,
   plus five existing runtime leak/lifetime regression checks.
 - 82 standard-library, iterator, collection, file-byte, switch, and guard checks.
 - 40 range and import-system checks, including core-named source files.
