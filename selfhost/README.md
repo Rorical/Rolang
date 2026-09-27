@@ -1,23 +1,21 @@
-# Rolang-written bootstrap compiler — dictionary code generation milestone
+# Rolang-written bootstrap compiler — compiler-core code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
 emits standalone C11 for the supported subset. It does not invoke Python, Lark,
 or llvmlite.
 
-**This is not full self-hosting yet.** The existing Python compiler builds this
-compiler. Its frontend parses every `.rl` file in this directory and exposes the
-syntax tree as JSON. Its C backend cannot yet compile those files: generic
-specialization, imports, and some standard-library calls remain to be
-implemented. Non-generic structs, methods, core strings, typed vectors,
-dictionaries, and optional values now emit C. Here, “stage 0”
-names this initial subset compiler, not a successfully self-rebuilt compiler.
+**This is not full self-hosting yet.** The Python compiler still builds the
+OS-facing compiler executable. The native C backend now compiles the actual
+lexer, AST, parser, backend, runtime emitters, and JSON emitter when assembled
+into one file with imports removed and a test entry point supplied.
 
-The native backend can now compile the actual lexer, AST, and parser sources
-when assembled into one file with import declarations removed. That generated
-frontend parses its own source and matches the Python-built bootstrap's flat AST
-node counts; it also rejects malformed input. This checks native frontend code
-generation, while full compiler rebuilding still requires the dependencies above.
+That native-compiled core emits byte-for-byte identical C to the Python-built
+bootstrap for recursive, dictionary-heavy, and StringBuilder programs. It also
+reports invalid programs and produces AST JSON. The separately compiled frontend
+parses its own source and matches all four flat AST node counts. Full executable
+self-rebuilding still needs module loading and filesystem/process/I/O support.
+Here, “stage 0” names the initial compiler, not a successfully self-rebuilt CLI.
 
 ## Build and run
 
@@ -46,11 +44,11 @@ that resolve to the same path are rejected, including symlink aliases.
 
 | Area | Supported |
 |---|---|
-| Functions | `def name(parameters) -> i32/i64/Bool/String/Struct/Void`, forward calls, recursion, mutual recursion |
+| Functions | Supported value types and `Void` returns, forward calls, recursion, mutual recursion |
 | Entry point | Exactly one `def main() -> i32` |
 | Variables | Initialized `let`/`var`, optional explicit `i32`/`i64`/`Bool`/`String`/struct annotation, lexical block scopes, assignment to `var` |
 | Statements | `if let`, `return`, `if { } else { }`, `while`, `for` over vectors, `break`/`continue`, nested/unsafe blocks, expression statements |
-| Expressions | Decimal i32 integers, Boolean/string literals, variables, calls, numeric casts, parentheses |
+| Expressions | Decimal i32/i64 integers, checked byte literals, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
 | Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
 | Collections | Typed `Vec<T>` and `Dict<K,V>`, nested collections, indexed access/assignment, constructors and core methods |
@@ -64,7 +62,7 @@ is not accepted as proof of a return. `Void` functions permit bare returns and
 fallthrough.
 
 Integer arithmetic follows the existing compiler's wrapping i32 behavior,
-including `INT32_MIN / -1` and `% -1`. Out-of-range literals are rejected. Division
+including `INT32_MIN / -1` and `% -1`. Literals outside the requested numeric range are rejected. Division
 by zero terminates the generated program with an error. The C backend avoids
 signed-overflow undefined behavior, emits explicit temporaries for left-to-right
 evaluation, preserves Boolean short-circuiting, and mangles all source names.
@@ -124,13 +122,18 @@ Signed `i64` values support arithmetic, comparisons, parameters, fields, returns
 and widening from `i32`. Explicit `as i32` narrowing retains the low 32 bits;
 `as i64` widens with sign extension. Arithmetic wraps at the result width and
 handles minimum-signed-value division by `-1` without C undefined behavior.
-Decimal literals still have the bootstrap's i32 range: larger i64 values must
-currently be obtained through calculations, casts, or string lengths. Other
-numeric widths and cast categories are rejected.
+Decimal literals infer i32 or i64 by range, or use an explicit numeric context.
+Both signed minima are supported; digits are range-checked without overflowing
+the compiler's own arithmetic. Leading zeros remain decimal in emitted C.
+`u8` supports byte casts, wrapping arithmetic, comparisons, storage, and widening
+with zero extension to i32/i64. Casts to u8 retain the low eight bits. Direct byte
+literals are checked against 0–255; other numeric widths remain unsupported.
+Use explicit byte casts for field/index writes to stay compatible with the
+Python compiler's current literal-inference behavior.
 
 Strings and their byte buffers follow the same process-lifetime allocation model
 as structs. The backend emits their helpers directly into standalone C. General
-stdlib imports, output functions, StringBuilder, string splitting/replacement,
+stdlib imports, output functions, string splitting/replacement,
 and additional collection operations remain future work.
 
 ## Vectors and iteration
@@ -265,8 +268,8 @@ Next steps toward actual self-compilation:
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
 2. **In progress:** non-generic structs/methods, core strings, signed widths,
-   typed vectors, dictionaries, and optional values now have C lowering. Add
-   module loading, StringBuilder, byte casts, and filesystem/process/I/O support
+   typed vectors, dictionaries, optional values, StringBuilder, and byte casts
+   now have C lowering. Add module loading and filesystem/process/I/O support
    needed by the compiler itself. Enums and general generic specialization
    remain part of broader language coverage.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
@@ -332,26 +335,43 @@ and dictionary iteration remain unsupported. The reference LLVM compiler's
 optional-collection limitation also affects optional-valued dictionaries; native
 execution tests cover those directly.
 
+## StringBuilder
+
+`StringBuilder.new()` creates a shared mutable byte buffer. The C backend supports
+`append`, `append_line`, `append_byte`, `len`, `clear`, and `to_string`.
+Appending preserves UTF-8 bytes and embedded NULs. Byte appends accept explicit
+u8 casts or checked byte literals. `len` counts bytes. `to_string` copies the
+buffer so later appends/clears do not mutate an existing snapshot; `clear` keeps
+capacity for reuse. Buffer growth checks length and allocation-size overflow.
+Allocations follow the same process-lifetime arena as other native objects.
+
+The unaliased `import std.string_builder` is accepted as a built-in module.
+General imports and import aliases still require the future module loader.
+Private builder fields, explicit release, and StringBuilder equality are rejected.
+
 ## Validation
 
-On Apple Silicon macOS, this milestone passed:
+On Apple Silicon macOS, validation covered all 502 bootstrap cases:
 
-- **452 bootstrap checks** in 516.94 seconds: O0/O3 bootstrap builds, frontend
-  syntax parity, differential execution, diagnostics, and generated-C sanitizers.
-- **2 additional native-frontend rebuild checks** in 44.18 seconds, added after
-  the broad run started. Both bootstrap optimization levels compile the actual
-  lexer/AST/parser sources; generated C at O0/O3 parses those same sources and
-  matches all four flat AST node counts. Malformed input is also checked.
-  Together these runs cover all **454 current cases**.
-- **86 dictionary/optional checks** in 192.22 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. Generated dictionary C
-  also runs with AddressSanitizer and UndefinedBehaviorSanitizer, including
-  growth/removal, snapshots, nested collections, optional payloads, and errors.
-  `detect_leaks=0` means these checks do not validate leaks.
+- The broad run completed **501 passing checks** in 679.94 seconds. One randomized
+  arithmetic case exceeded the 10-second limit while running the Python-built
+  reference executable. Its emitted C was identical for O0/O3 bootstrap builds.
+  The same executable and differential test passed on rerun; an exact pytest
+  rerun with a fresh O3 bootstrap also passed (**1 passed**, 36.59 seconds).
+- **50 checks** in 124.92 seconds with the bootstrap runtime instrumented using
+  AddressSanitizer and payload checks. These cover the native compiler-core and
+  frontend rebuilds, StringBuilder operations, byte/i64 boundaries, and diagnostics.
+- Generated builder C additionally runs with AddressSanitizer and
+  UndefinedBehaviorSanitizer. `detect_leaks=0` means these checks do not validate leaks.
+- **40 LLVM code-generation checks** in 15.38 seconds, including mixed integer
+  arithmetic/comparisons across every optimization level, passed for the
+  separately committed operand-promotion fix.
 
 See the test command above to reproduce the standard suite.
 
-This milestone changes only source-level bootstrap code and tests. Earlier
-string differential tests found and fixed a Python-backend bug: UTF-8 string literals used character counts
+These differential checks also found and fixed an LLVM backend bug: mixed-width
+integer operations sign-extended unsigned operands and could use the wrong
+comparison/division signedness. Regression tests exercise every optimization level.
+Earlier string differential tests found and fixed another Python-backend bug: UTF-8 string literals used character counts
 instead of byte lengths. A separate regression covers Unicode and embedded NULs
 across every optimization level.

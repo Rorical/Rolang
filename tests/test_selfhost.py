@@ -720,8 +720,8 @@ def test_string_program_matches_reference(bootstrap, tmp_path, source, expected)
     ('let s = "a".substring(0); return 0;', 'wrong argument count'),
     ('let s = "a".replace("a", "b"); return 0;', 'method unsupported'),
     ('let s = (1).to_string(2); return 0;', 'wrong argument count'),
-    ('return "a" as i32;', 'numeric i32/i64 casts'),
-    ('return 1 as Bool;', 'numeric i32/i64 casts'),
+    ('return "a" as i32;', 'numeric u8/i32/i64 casts'),
+    ('return 1 as Bool;', 'numeric u8/i32/i64 casts'),
     ('let x: i32 = 1 as i64; return 0;', 'expected i32'),
 ])
 def test_string_diagnostics_preserve_output(bootstrap, tmp_path, body, diagnostic):
@@ -1195,6 +1195,143 @@ def test_native_backend_compiles_its_frontend(bootstrap, tmp_path):
         return 42;
     }}'''
     result, _, output = emit(bootstrap, tmp_path, source + '\n' + driver)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level)
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
+
+
+BUILDER_PROGRAMS = [
+    ('''import std.string_builder
+    def main() -> i32 {
+        let b = StringBuilder.new();
+        if b.len() != 0 || !b.to_string().is_empty() { return 1; }
+        b.append("λ\\0中"); b.append_byte(255); b.append_line("!");
+        let first = b.to_string();
+        if first.len() != 9 || first.byte_at(6) != 255 || first.byte_at(8) != 10 { return 2; }
+        b.clear(); b.append("replacement");
+        if first.len() != 9 || b.len() != 11 { return 3; }
+        b.append(b.to_string());
+        if !b.to_string().equals("replacementreplacement") { return 4; }
+        return 42;
+    }''', 42),
+    ('''import std.string_builder
+    struct Holder { var text: StringBuilder; }
+    def fill(b: StringBuilder) -> StringBuilder { b.append_line("start"); return b; }
+    def main() -> i32 {
+        let original = StringBuilder.new(); let h = Holder { text: fill(original) };
+        let snapshot = h.text.to_string(); var i = 0;
+        while i < 4096 { h.text.append_byte((i % 256) as u8); i = i + 1; }
+        if original.len() != 4102 || !snapshot.equals("start\\n") { return 1; }
+        let text = original.to_string(); i = 0;
+        while i < 4096 { if text.byte_at(i + 6) != i % 256 { return 2; } i = i + 1; }
+        let builders = Vec<StringBuilder>.new(); builders.push(original);
+        builders[0].clear(); if h.text.len() != 0 { return 3; }
+        return 42;
+    }''', 42),
+    ('''def byte(x: u8) -> u8 { return x; }
+    def constant() -> u8 { return 255; }
+    def optional(x: u8?) -> i32 { if let value = x { return value; } return -1; }
+    struct Byte { var value: u8; }
+    def main() -> i32 {
+        var a: u8 = 255; let one: u8 = 1;
+        if (a + one) != 0 || (one - a) != 2 || (a * a) != 1 { return 1; }
+        if (-a) != 1 || (a / (2 as u8)) != 127 || (a % (2 as u8)) != 1 { return 2; }
+        if a + 1 != 256 || a + (1 as i64) != 256 { return 3; }
+        if a < 0 || a <= -1 || a == -1 { return 4; }
+        if ((-1) as u8) != 255 || (256 as u8) != 0 { return 5; }
+        let wide: i64 = a; let signed: i32 = a;
+        if wide != 255 || signed != 255 { return 6; }
+        a = 42 as u8; let box = Byte { value: 255 as u8 }; box.value = 42 as u8;
+        if byte(255) != constant() || optional(255) != 255 || optional(nil) != -1 { return 7; }
+        return box.value;
+    }''', 42),
+    ('''def main() -> i32 {
+        let bytes = Vec<u8>.new(); bytes.push(255); bytes.push(42); bytes[0] = 1 as u8; bytes.set(0, 255);
+        let table = Dict<u8, u8>.with_capacity(1, 0); table.set(255, 42); table[42] = 255 as u8;
+        if let n = table[42] { if n != 255 { return 1; } } else { return 2; }
+        if bytes[0] != 255 { return 3; }
+        if let n = table.get(255) { return n; } return 4;
+    }''', 42),
+]
+
+
+BUILDER_PROGRAMS.append(('''def maximum() -> i64 { return 9223372036854775807; }
+def main() -> i32 {
+    let min = -9223372036854775808; let max = maximum();
+    if max + 1 != min || min - 1 != max || min / -1 != min || min % -1 != 0 { return 1; }
+    let optional: i64? = 9223372036854775807;
+    if let value = optional { if value != max { return 2; } } else { return 3; }
+    let wide = 2147483648; if wide - 1 != 2147483647 { return 4; }
+    if !min.to_string().equals("-9223372036854775808") { return 5; }
+    let zeroes = 00042; return zeroes;
+}''', 42))
+
+
+@pytest.mark.parametrize('source, expected', BUILDER_PROGRAMS)
+def test_builder_and_bytes_match_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('let b = StringBuilder.new(1);', 'wrong argument count'),
+    ('let b = StringBuilder.new(); b.append(1);', 'expected String'),
+    ('let b = StringBuilder.new(); b.append_byte(256);', 'out of u8 range'),
+    ('let b = StringBuilder.new(); let x = 42; b.append_byte(x);', 'expected u8'),
+    ('let b = StringBuilder.new(); b.append_byte(true);', 'expected u8'),
+    ('let b = StringBuilder.new(); b.len(1);', 'wrong argument count'),
+    ('let b = StringBuilder.new(); b.free();', 'StringBuilder method unsupported'),
+    ('let b = StringBuilder.clear();', 'unknown StringBuilder constructor'),
+    ('let b = StringBuilder.new(); let same = b == b;', 'cannot compare struct values'),
+    ('let b: u8 = 256;', 'out of u8 range'),
+    ('let b: i64 = 9223372036854775808;', 'out of i64 range'),
+    ('let b = -9223372036854775809;', 'out of i64 range'),
+    ('let b = 255 as u8; b.to_string();', 'method unsupported'),
+    ('let b: u8 = -1;', 'out of u8 range'),
+    ('let xs = Vec<u8>.new(); xs[0] = 256;', 'out of u8 range'),
+    ('let xs = Dict<u8, i32>.with_capacity(1, 0); xs[256] = 0;', 'out of u8 range'),
+])
+def test_builder_byte_errors(bootstrap, tmp_path, body, diagnostic):
+    test_optional_errors_preserve_output(bootstrap, tmp_path,
+        'import std.string_builder\ndef main() -> i32 {' + body + ' return 0; }', diagnostic)
+
+
+def test_builder_generated_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in BUILDER_PROGRAMS:
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        run = execute_c(output, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (expected, '', '')
+
+
+def test_native_backend_compiles_compiler_core(bootstrap, tmp_path):
+    names = ('lexer.rl', 'ast.rl', 'parser.rl', 'string_codegen.rl',
+             'vector_codegen.rl', 'dict_codegen.rl', 'builder_codegen.rl',
+             'backend.rl', 'ast_json.rl')
+    # Import loading and the OS-facing CLI are separate unfinished dependencies.
+    core = '\n'.join('\n'.join(line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
+                              if not line.startswith('import ')) for name in names)
+    driver = '''def verify_generated(source: String, expected: String) -> Bool {
+        let scanned = lex(source); if !scanned.error.is_empty() { return false; }
+        let parser = Parser.new(scanned.tokens); parser.parse();
+        if !parser.error.is_empty() { return false; }
+        let backend = Backend.new(parser.program); backend.generate();
+        return backend.error.is_empty() && backend.output.to_string().equals(expected);
+    }
+    def main() -> i32 {
+    '''
+    for index, source in enumerate((PROGRAMS[1][0], DICT_PROGRAMS[3][0], BUILDER_PROGRAMS[0][0])):
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        driver += f'if !verify_generated({json.dumps(source, ensure_ascii=False)}, {json.dumps(output.read_text(), ensure_ascii=False)}) {{ return {index + 1}; }}\n'
+    driver += '''let parser = Parser.new(lex("def main() -> i32 { return missing; }").tokens);
+        parser.parse(); let backend = Backend.new(parser.program); backend.generate();
+        if !backend.error.contains("unknown variable") { return 4; }
+        let json = AstJson.new(); json.program(parser.program);
+        if !json.out.to_string().contains("missing") { return 5; }
+        return 42;
+    }'''
+    result, _, output = emit(bootstrap, tmp_path, core + '\n' + driver)
     assert result.returncode == 0, result.stdout
     for level in (0, 3):
         run = execute_c(output, level)

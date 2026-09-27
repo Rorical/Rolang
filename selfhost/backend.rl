@@ -4,6 +4,7 @@ import "parser.rl"
 import "string_codegen.rl"
 import "vector_codegen.rl"
 import "dict_codegen.rl"
+import "builder_codegen.rl"
 import std.string_builder
 
 pub struct Binding { pub var code: String; pub var type_name: String; pub var mutable: Bool; }
@@ -49,8 +50,23 @@ pub struct Backend {
         }
         return nil;
     }
+    pub def widens(actual: String, expected: String) -> Bool {
+        return (actual.equals("i32") && expected.equals("i64")) || (actual.equals("u8") && (expected.equals("i32") || expected.equals("i64")));
+    }
+    pub def expression_as(id: i32, expected: String, token: Token) -> Value {
+        let expr = self.program.expressions.get(id); var inner = expected;
+        if self.is_optional(inner) { inner = self.optional_inner(inner); }
+        if self.numeric(inner) {
+            if expr.kind == 1 { return self.coerce(self.integer_value(expr.token, false, inner), expected, token); }
+            if expr.kind == 5 && expr.token.text.equals("-") {
+                let literal = self.program.expressions.get(expr.left);
+                if literal.kind == 1 { return self.coerce(self.integer_value(literal.token, true, inner), expected, token); }
+            }
+        }
+        return self.coerce(self.expression(id), expected, token);
+    }
     pub def require_type(token: Token, actual: String, expected: String) -> Void {
-        if !actual.equals(expected) && !(actual.equals("i32") && expected.equals("i64")) { self.fail(token, "expected " + expected + ", got " + actual); }
+        if !actual.equals(expected) && !self.widens(actual, expected) { self.fail(token, "expected " + expected + ", got " + actual); }
     }
     pub def is_optional(name: String) -> Bool { return name.ends_with("?"); }
     pub def optional_inner(name: String) -> String { return name.substring(0, (name.len() as i32) - 1); }
@@ -60,27 +76,33 @@ pub struct Backend {
         if self.is_optional(expected) {
             if value.type_name.equals("nil") { return self.value(expected, "NULL"); }
             let inner = self.optional_inner(expected);
-            if value.type_name.equals(inner) || (value.type_name.equals("i32") && inner.equals("i64")) {
+            if value.type_name.equals(inner) || self.widens(value.type_name, inner) {
                 return self.value(expected, "rl_some(" + self.slot(value) + ")");
             }
         }
         self.require_type(token, value.type_name, expected); return value;
     }
-    pub def integer(token: Token, allow_min: Bool) -> String {
-        var n: i64 = 0;
-        var i = 0;
-        while i < (token.text.len() as i32) {
-            let digit = (token.text.byte_at(i) - 48) as i64;
-            if n > (2147483648 - digit) / 10 { self.fail(token, "integer literal out of i32 range"); return "0"; }
-            n = n * 10 + digit;
-            i = i + 1;
+    pub def integer_value(token: Token, negative: Bool, expected: String) -> Value {
+        var start = 0; let length = token.text.len() as i32;
+        while start < length - 1 && token.text.byte_at(start) == 48 { start = start + 1; }
+        let digits = token.text.substring(start, length - start);
+        var type_name = expected; var limit = "2147483647";
+        if negative { limit = "2147483648"; }
+        if type_name.is_empty() {
+            type_name = "i32";
+            if digits.len() > limit.len() || (digits.len() == limit.len() && digits.compare_to(limit) > 0) { type_name = "i64"; }
         }
-        if n == 2147483648 {
-            if allow_min { return "INT32_MIN"; }
-            self.fail(token, "integer literal out of i32 range"); return "0";
+        if type_name.equals("i64") { limit = "9223372036854775807"; if negative { limit = "9223372036854775808"; } }
+        if type_name.equals("u8") { limit = "255"; if negative { limit = "0"; } }
+        if digits.len() > limit.len() || (digits.len() == limit.len() && digits.compare_to(limit) > 0) {
+            self.fail(token, "integer literal out of " + type_name + " range"); return self.invalid();
         }
-        if allow_min { return "(-" + n.to_string() + ")"; }
-        return n.to_string();
+        if negative && digits.equals("2147483648") && type_name.equals("i32") { return self.value("i32", "INT32_MIN"); }
+        if negative && digits.equals("9223372036854775808") && type_name.equals("i64") { return self.value("i64", "INT64_MIN"); }
+        var code = digits;
+        if type_name.equals("i64") { code = "INT64_C(" + digits + ")"; }
+        if negative { code = "(-" + code + ")"; }
+        return self.value(type_name, code);
     }
     pub def expression(id: i32) -> Value {
         if !self.error.is_empty() { return Value { code: "0", type_name: "i32" }; }
@@ -101,11 +123,12 @@ pub struct Backend {
         if expr.kind == 7 { return self.string_literal(token); }
         if expr.kind == 11 {
             let value = self.expression(expr.left);
-            if !self.numeric(value.type_name) || !self.numeric(expr.type_name) { self.fail(token, "C backend supports numeric i32/i64 casts only"); return self.invalid(); }
+            if !self.numeric(value.type_name) || !self.numeric(expr.type_name) { self.fail(token, "C backend supports numeric u8/i32/i64 casts only"); return self.invalid(); }
+            if expr.type_name.equals("u8") { return self.value("u8", "(uint8_t)" + value.code); }
             if expr.type_name.equals("i32") { return self.value("i32", "rl_bits((uint32_t)" + value.code + ")"); }
             return self.value("i64", "(int64_t)" + value.code);
         }
-        if expr.kind == 1 { return self.value("i32", self.integer(token, false)); }
+        if expr.kind == 1 { return self.integer_value(token, false, ""); }
         if expr.kind == 2 {
             if token.text.equals("true") { return self.value("Bool", "1"); }
             return self.value("Bool", "0");
@@ -117,12 +140,13 @@ pub struct Backend {
         }
         if expr.kind == 5 {
             let inner = self.program.expressions.get(expr.left);
-            if token.text.equals("-") && inner.kind == 1 { return self.value("i32", self.integer(inner.token, true)); }
+            if token.text.equals("-") && inner.kind == 1 { return self.integer_value(inner.token, true, ""); }
             let value = self.expression(expr.left);
             if token.text.equals("!") { self.require_type(token, value.type_name, "Bool"); return self.value("Bool", "!" + value.code); }
             if !self.numeric(value.type_name) { self.fail(token, "expected integer operand"); }
             if token.text.equals("+") { return value; }
             if value.type_name.equals("i64") { return self.value("i64", "rl_neg64(" + value.code + ")"); }
+            if value.type_name.equals("u8") { return self.value("u8", "(uint8_t)rl_neg(" + value.code + ")"); }
             return self.value("i32", "rl_neg(" + value.code + ")");
         }
         if expr.kind == 6 {
@@ -139,7 +163,7 @@ pub struct Backend {
         }
         if expr.kind == 12 {
             let object = self.expression(expr.left);
-            let index = self.expression(expr.right);
+            let index = self.index_value(object, expr.right, token);
             if self.is_dictionary(object.type_name) {
                 let key = self.coerce(index, self.dict_key(object.type_name), token);
                 return self.value(self.dict_value(object.type_name) + "?", "rl_dict_get(" + object.code + ", " + self.slot(key) + ")");
@@ -171,7 +195,7 @@ pub struct Backend {
             if left.type_name.equals("String") { self.fail(token, "use String.equals for string comparison"); }
             if left.type_name.equals("Void") { self.fail(token, "Void is not a value"); }
             if self.is_optional(left.type_name) || left.type_name.equals("nil") { self.fail(token, "optional comparison unsupported; use if let"); }
-            if self.structs.contains(left.type_name) || self.is_vector(left.type_name) || self.is_dictionary(left.type_name) { self.fail(token, "cannot compare struct values"); }
+            if left.type_name.equals("StringBuilder") || self.structs.contains(left.type_name) || self.is_vector(left.type_name) || self.is_dictionary(left.type_name) { self.fail(token, "cannot compare struct values"); }
             return self.value("Bool", left.code + " " + op + " " + right.code);
         }
         if !self.numeric(left.type_name) || !self.numeric(right.type_name) { self.fail(token, "expected integer operands"); }
@@ -182,6 +206,7 @@ pub struct Backend {
         if op.equals("/") { helper = "rl_div"; }
         if op.equals("%") { helper = "rl_rem"; }
         var type_name = "i32";
+        if left.type_name.equals("u8") && right.type_name.equals("u8") { type_name = "u8"; }
         if left.type_name.equals("i64") || right.type_name.equals("i64") { type_name = "i64"; helper = helper + "64"; }
         return self.value(type_name, helper + "(" + left.code + ", " + right.code + ")");
     }
@@ -211,8 +236,11 @@ pub struct Backend {
             let target = self.program.expressions.get(statement.target);
             if target.kind == 12 {
                 // Indexed assignment follows method-call order: receiver, index, RHS.
-                let object = self.expression(target.left); let index = self.expression(target.right);
-                var value = self.expression(statement.expr);
+                let object = self.expression(target.left); let index = self.index_value(object, target.right, token);
+                if !self.is_vector(object.type_name) && !self.is_dictionary(object.type_name) { self.fail(token, "index receiver must be a Vec or Dict"); return false; }
+                var expected = self.vector_element(object.type_name);
+                if self.is_dictionary(object.type_name) { expected = self.dict_value(object.type_name); }
+                var value = self.expression_as(statement.expr, expected, token);
                 if self.is_dictionary(object.type_name) {
                     let key = self.coerce(index, self.dict_key(object.type_name), token);
                     value = self.coerce(value, self.dict_value(object.type_name), token);
@@ -248,7 +276,14 @@ pub struct Backend {
             return false;
         }
         var value = Value { code: "NULL", type_name: "nil" };
-        if statement.expr >= 0 { value = self.expression(statement.expr); }
+        if statement.expr >= 0 {
+            var expected = "";
+            if statement.kind == 1 { expected = self.return_type; }
+            if statement.kind == 2 { expected = statement.annotation; }
+            if statement.kind == 3 { if let binding = self.lookup(token.text) { expected = binding.type_name; } }
+            if expected.is_empty() { value = self.expression(statement.expr); }
+            else { value = self.expression_as(statement.expr, expected, token); }
+        }
         if statement.kind == 1 {
             value = self.coerce(value, self.return_type, token);
             self.output.append_line("return " + value.code + ";");
@@ -310,17 +345,18 @@ pub struct Backend {
             return;
         }
         if self.is_vector(type_name) { self.supported_type(token, self.vector_element(type_name)); return; }
-        if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !self.structs.contains(type_name) {
-            self.fail(token, "C backend supports only i32, i64, Bool, String, or declared non-generic structs");
+        if !self.numeric(type_name) && !type_name.equals("Bool") && !type_name.equals("String") && !type_name.equals("StringBuilder") && !self.structs.contains(type_name) {
+            self.fail(token, "C backend supports only u8, i32, i64, Bool, String, StringBuilder, collections, or declared non-generic structs");
         }
     }
     pub def validate_subset() -> Void {
         var index = 0;
         for declaration in self.program.declarations {
+            if declaration.kind == 1 && declaration.value.equals("std.string_builder") && declaration.token.text.equals("import") { index = index + 1; continue; }
             if declaration.kind != 2 || declaration.generics.len() != 0 { self.fail(declaration.token, "declaration unsupported by C backend"); }
             else {
                 let name = declaration.token.text;
-                if self.structs.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") || name.equals("Dict") { self.fail(declaration.token, "duplicate or reserved struct name"); }
+                if self.structs.contains(name) || primitive_type(name) || name.equals("String") || name.equals("Vec") || name.equals("Dict") || name.equals("StringBuilder") { self.fail(declaration.token, "duplicate or reserved struct name"); }
                 self.structs.set(name, index);
             }
             index = index + 1;
@@ -372,7 +408,7 @@ pub struct Backend {
         } else { self.error = "1:1: missing main function"; }
         if !self.error.is_empty() { return; }
         self.output.append_line("#include <stdint.h>\n#include <limits.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>");
-        self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec; typedef struct rl_optional rl_optional; typedef struct rl_dict rl_dict;");
+        self.output.append_line("typedef struct rl_string rl_string; typedef struct rl_vec rl_vec; typedef struct rl_optional rl_optional; typedef struct rl_dict rl_dict; typedef struct rl_builder rl_builder;");
         self.emit_structs();
         self.output.append_line("static int32_t rl_bits(uint32_t x) { int32_t y; memcpy(&y, &x, 4); return y; }");
         self.output.append_line("static int32_t rl_add(int32_t a,int32_t b) { return rl_bits((uint32_t)a+(uint32_t)b); }");
@@ -383,6 +419,7 @@ pub struct Backend {
         self.output.append_line("static int32_t rl_div(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return INT32_MIN; return a/b; }");
         self.output.append_line("static int32_t rl_rem(int32_t a,int32_t b) { if(!b) rl_zero(); if(a==INT32_MIN && b==-1) return 0; return a%b; }");
         emit_string_runtime(self.output);
+        emit_builder_runtime(self.output);
         emit_vector_runtime(self.output);
         self.output.append_line("struct rl_optional { rl_slot value; };");
         self.output.append_line("static rl_optional *rl_some(rl_slot value) { rl_optional *p = rl_allocate(sizeof(*p)); p->value = value; return p; }");
@@ -422,6 +459,8 @@ pub struct Backend {
         if self.is_optional(name) { return "rl_optional*"; }
         if name.equals("Void") { return "void"; }
         if name.equals("i64") { return "int64_t"; }
+        if name.equals("u8") { return "uint8_t"; }
+        if name.equals("StringBuilder") { return "rl_builder*"; }
         if name.equals("String") { return "rl_string*"; }
         if self.is_vector(name) { return "rl_vec*"; }
         if self.is_dictionary(name) { return "rl_dict*"; }
@@ -446,8 +485,9 @@ pub struct Backend {
         let args = StringBuilder.new(); args.append(receiver);
         var i = 0;
         while i < values.len() {
-            var value = self.expression(values.get(i));
-            if i < function.params.len() { value = self.coerce(value, function.params.get(i).type_name, token); }
+            var value = self.invalid();
+            if i < function.params.len() { value = self.expression_as(values.get(i), function.params.get(i).type_name, token); }
+            else { value = self.expression(values.get(i)); }
             if i > 0 || !receiver.is_empty() { args.append(", "); }
             args.append(value.code); i = i + 1;
         }
@@ -464,12 +504,20 @@ pub struct Backend {
             self.fail(receiver.token, "generic receiver unsupported by C backend"); return self.invalid();
         }
         var owner = ""; var code = ""; var static_call = false;
-        if receiver.kind == 3 && self.structs.contains(receiver.token.text) {
+        if receiver.kind == 3 && (self.structs.contains(receiver.token.text) || receiver.token.text.equals("StringBuilder")) {
             if let local = self.lookup(receiver.token.text) { static_call = false; }
             else { static_call = true; owner = receiver.token.text; }
         }
         if !static_call {
             let object = self.expression(member.left); owner = object.type_name; code = object.code;
+        }
+        if owner.equals("StringBuilder") {
+            if static_call {
+                if !member.token.text.equals("new") { self.fail(member.token, "unknown StringBuilder constructor"); return self.invalid(); }
+                if expr.args.len() != 0 { self.fail(member.token, "wrong argument count"); return self.invalid(); }
+                return self.value("StringBuilder", "rl_builder_new()");
+            }
+            return self.builder_method(code, member.token, expr.args);
         }
         if !static_call && self.is_dictionary(owner) { return self.dict_method(owner, code, member.token, expr.args); }
         if !static_call && self.is_vector(owner) { return self.vector_method(owner, code, member.token, expr.args); }
@@ -495,7 +543,7 @@ pub struct Backend {
             if field < 0 { return self.invalid(); }
             if seen.contains(label) { self.fail(token, "duplicate field initializer"); }
             seen.set(label, 1);
-            let value = self.coerce(self.expression(expr.args.get(i)), declaration.fields.get(field).type_name, token);
+            let value = self.expression_as(expr.args.get(i), declaration.fields.get(field).type_name, token);
             self.output.append_line(result.code + "->rl_m" + field.to_string() + " = " + value.code + ";");
             i = i + 1;
         }
@@ -509,10 +557,11 @@ pub struct Backend {
         self.output.append_line("static void *rl_allocate(size_t size) { void *p = calloc(1, size); rl_allocation *a = malloc(sizeof(*a)); if (!p || !a) { free(p); free(a); fputs(\"allocation failed\\n\", stderr); exit(1); } a->object = p; a->next = rl_allocations; rl_allocations = a; return p; }");
         var i = 0;
         while i < self.program.declarations.len() {
-            self.output.append_line("typedef struct rl_s" + i.to_string() + " rl_s" + i.to_string() + ";"); i = i + 1;
+            if self.program.declarations.get(i).kind == 2 { self.output.append_line("typedef struct rl_s" + i.to_string() + " rl_s" + i.to_string() + ";"); } i = i + 1;
         }
         i = 0;
         for declaration in self.program.declarations {
+            if declaration.kind != 2 { i = i + 1; continue; }
             self.output.append_line("struct rl_s" + i.to_string() + " {");
             var field = 0;
             for property in declaration.fields {
@@ -523,7 +572,7 @@ pub struct Backend {
         }
     }
 
-    pub def numeric(name: String) -> Bool { return name.equals("i32") || name.equals("i64"); }
+    pub def numeric(name: String) -> Bool { return name.equals("u8") || name.equals("i32") || name.equals("i64"); }
     pub def string_literal(token: Token) -> Value {
         let text = StringBuilder.new(); text.append_byte(34 as u8);
         var i = 1; var length = 0;
@@ -549,7 +598,7 @@ pub struct Backend {
         let name = token.text; let expected = Vec<String>.new();
         var result = "i32"; var helper = "";
         if self.numeric(owner) {
-            if name.equals("to_string") { helper = "rl_integer_string"; result = "String"; }
+            if name.equals("to_string") && !owner.equals("u8") { helper = "rl_integer_string"; result = "String"; }
         } else {
             if name.equals("len") { result = "i64"; helper = "length"; }
             if name.equals("is_empty") { result = "Bool"; helper = "empty"; }
@@ -570,7 +619,7 @@ pub struct Backend {
         let code = StringBuilder.new(); code.append(helper + "(" + receiver);
         var i = 0;
         while i < args.len() {
-            let value = self.coerce(self.expression(args.get(i)), expected.get(i), token);
+            let value = self.expression_as(args.get(i), expected.get(i), token);
             code.append(", " + value.code); i = i + 1;
         }
         code.append(")");
@@ -590,6 +639,11 @@ pub struct Backend {
         var field = "reference";
         if self.numeric(type_name) || type_name.equals("Bool") { field = "number"; }
         return self.value(type_name, "(" + self.c_type(type_name) + ")(" + expression + ")." + field);
+    }
+    pub def index_value(object: Value, id: i32, token: Token) -> Value {
+        if self.is_dictionary(object.type_name) { return self.expression_as(id, self.dict_key(object.type_name), token); }
+        if self.is_vector(object.type_name) { return self.expression_as(id, "i32", token); }
+        return self.expression(id);
     }
     pub def vector_get(object: Value, index: Value, token: Token) -> Value {
         if !self.is_vector(object.type_name) { self.fail(token, "index receiver must be a Vec or Dict"); return self.invalid(); }
@@ -616,13 +670,29 @@ pub struct Backend {
         }
         if args.len() != expected.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
         let values = Vec<Value>.new(); var i = 0;
-        while i < args.len() { let value = self.coerce(self.expression(args.get(i)), expected.get(i), token); values.push(value); i = i + 1; }
+        while i < args.len() { let value = self.expression_as(args.get(i), expected.get(i), token); values.push(value); i = i + 1; }
         if name.equals("len") { return self.value("i32", receiver + "->length"); }
         if name.equals("pop") { return self.unpack(element, "rl_vec_pop(" + receiver + ")"); }
         if name.equals("get") { return self.unpack(element, "rl_vec_get(" + receiver + ", " + values.get(0).code + ")"); }
         if name.equals("push") { return self.value("Void", "rl_vec_push(" + receiver + ", " + self.slot(values.get(0)) + ")"); }
         if name.equals("set") { return self.value("Void", "rl_vec_set(" + receiver + ", " + values.get(0).code + ", " + self.slot(values.get(1)) + ")"); }
         return self.value("Void", "rl_vec_resize(" + receiver + ", " + values.get(0).code + ")");
+    }
+    pub def builder_method(receiver: String, token: Token, args: Vec<i32>) -> Value {
+        let name = token.text; var expected = ""; var helper = ""; var result = "Void";
+        if name.equals("append") { expected = "String"; helper = "rl_builder_append"; }
+        if name.equals("append_line") { expected = "String"; helper = "rl_builder_line"; }
+        if name.equals("append_byte") { expected = "u8"; helper = "rl_builder_byte"; }
+        if name.equals("clear") { helper = "rl_builder_clear"; }
+        if name.equals("to_string") { helper = "rl_builder_text"; result = "String"; }
+        if name.equals("len") { helper = "length"; result = "i64"; }
+        if helper.is_empty() { self.fail(token, "StringBuilder method unsupported by C backend"); return self.invalid(); }
+        var count = 0; if !expected.is_empty() { count = 1; }
+        if args.len() != count { self.fail(token, "wrong argument count"); return self.invalid(); }
+        if helper.equals("length") { return self.value("i64", receiver + "->length"); }
+        var code = helper + "(" + receiver;
+        if count == 1 { let value = self.expression_as(args.get(0), expected, token); code = code + ", " + value.code; }
+        return self.value(result, code + ")");
     }
     pub def is_dictionary(name: String) -> Bool { return name.starts_with("Dict<") && name.ends_with(">"); }
     pub def dict_separator(name: String) -> i32 {
@@ -669,7 +739,7 @@ pub struct Backend {
         else { if !name.equals("len") && !name.equals("clear") && !name.equals("keys") && !name.equals("values") { self.fail(token, "Dict method unsupported by C backend"); return self.invalid(); } } } } }
         if args.len() != expected.len() { self.fail(token, "wrong argument count"); return self.invalid(); }
         let values = Vec<Value>.new(); var i = 0;
-        while i < args.len() { values.push(self.coerce(self.expression(args.get(i)), expected.get(i), token)); i = i + 1; }
+        while i < args.len() { values.push(self.expression_as(args.get(i), expected.get(i), token)); i = i + 1; }
         if name.equals("len") { return self.value("i64", receiver + "->keys->length"); }
         if name.equals("clear") { return self.value("Void", "rl_dict_clear(" + receiver + ")"); }
         if name.equals("keys") { return self.value("Vec<" + key + ">", "rl_dict_snapshot(" + receiver + "->keys)"); }
