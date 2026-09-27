@@ -126,3 +126,24 @@ as a label. Explicit external labels (`to value: i32`) remain required. Argument
 follow declaration order; only trailing defaults may be omitted. Defaults run at
 each call that omits them and resolve in declaration scope. They cannot reference
 `self` or the callee's parameters. Function values do not carry labels/defaults.
+
+## Validation
+
+The added programs execute at both O0 and O3. Tests cover success paths, invalid
+program diagnostics, evaluation count, captures, optional propagation, and cleanup.
+Validation for this implementation includes:
+
+- 229 parser, HIR/MIR, monomorphization, contextual-literal, interpolation,
+  compiler-standard-library, collection, and iterator regression checks.
+
+- 21 switch-expression, guard-binding, raw/multiline-string, and named/default
+  parameter checks.
+- 14 range/destructuring, iterator-chain, and generic-alias/module checks with
+  AddressSanitizer and runtime payload validation. The module test removes the
+  source before importing the generated `.rlm`.
+- 15 contextual-callback, alias, chain, and collection-inference checks.
+- Two native CLI bootstrap checks, including three compiler generations and
+  identical generated C.
+
+The tiny compiler example also compiles its emitted C with `-Wall -Werror` and
+runs that executable, checking its exit value of 42.
