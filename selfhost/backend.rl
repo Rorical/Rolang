@@ -170,7 +170,10 @@ pub struct Backend {
         }
         if expr.kind == 6 {
             if let local = self.lookup(token.text) { self.fail(token, "local variable is not callable"); }
-            if let index = self.functions.get(token.text) { return self.call(index, expr.args, "", token); }
+            var name = token.text;
+            if !expr.type_name.is_empty() { name = expr.type_name; }
+            if name.starts_with("$ambiguous$") { self.fail(token, "ambiguous imported function"); return self.invalid(); }
+            if let index = self.functions.get(name) { return self.call(index, expr.args, "", token); }
             if !self.stdlib_module(token.text).is_empty() { return self.stdlib_call(token, expr.args); }
             self.fail(token, "unknown function '" + token.text + "'"); return self.invalid();
         }
@@ -501,13 +504,18 @@ pub struct Backend {
         let fields = self.program.declarations.get(index).fields;
         var i = 0;
         while i < fields.len() {
-            if fields.get(i).token.text.equals(token.text) { return i; }
+            if fields.get(i).token.text.equals(token.text) {
+                let field = fields.get(i);
+                if !field.modifiers.contains("pub ") && !field.token.source.equals(token.source) { self.fail(token, "field is private to its module"); return -1; }
+                return i;
+            }
             i = i + 1;
         }
         self.fail(token, "unknown field '" + token.text + "'"); return -1;
     }
     pub def call(index: i32, values: Vec<i32>, receiver: String, token: Token) -> Value {
         let function = self.program.functions.get(index);
+        if !function.modifiers.contains("pub ") && !function.token.source.equals(token.source) { self.fail(token, "function or method is private to its module"); return self.invalid(); }
         if function.modifiers.contains("unsafe") && self.unsafe_depth == 0 { self.fail(token, "unsafe function call requires unsafe"); }
         if function.params.len() != values.len() { self.fail(token, "wrong argument count"); }
         let args = StringBuilder.new(); args.append(receiver);
@@ -532,9 +540,14 @@ pub struct Backend {
             self.fail(receiver.token, "generic receiver unsupported by C backend"); return self.invalid();
         }
         var owner = ""; var code = ""; var static_call = false;
-        if receiver.kind == 3 && (self.structs.contains(receiver.token.text) || receiver.token.text.equals("StringBuilder")) {
+        var receiver_type = receiver.token.text;
+        if !receiver.type_name.is_empty() { receiver_type = receiver.type_name; }
+        if receiver.kind == 3 && (self.structs.contains(receiver_type) || receiver_type.equals("StringBuilder") || receiver_type.starts_with("$ambiguous$")) {
             if let local = self.lookup(receiver.token.text) { static_call = false; }
-            else { static_call = true; owner = receiver.token.text; }
+            else {
+                if receiver_type.starts_with("$ambiguous$") { self.fail(receiver.token, "ambiguous imported type"); return self.invalid(); }
+                static_call = true; owner = receiver_type;
+            }
         }
         if !static_call {
             let object = self.expression(member.left); owner = object.type_name; code = object.code;

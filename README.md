@@ -455,7 +455,8 @@ Its real CLI can now rebuild itself directly from `selfhost/main.rl` through
 three native generations with identical generated C; rebuilt executables also
 pass program, AST JSON, diagnostic, and output-preservation checks.
 
-The native module loader supports public exports with globally unique names.
+The native module loader supports module-scoped names, private declarations,
+and public exports through direct imports.
 Full module semantics, broader language coverage, and ownership lowering remain unfinished,
 so the existing Python compiler remains primary. Differential and sanitizer tests
 validate the native compiler as the rewrite progresses.

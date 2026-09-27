@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import random
+import re
 import subprocess
 
 import pytest
@@ -129,7 +130,7 @@ def test_errors_preserve_output(bootstrap, tmp_path, source, diagnostic):
     result, _, _ = emit(bootstrap, tmp_path, source)
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert diagnostic in result.stdout
-    assert ':1:' in result.stdout or ':2:' in result.stdout
+    assert re.search(r'(?:^|:)[1-9][0-9]*:[1-9][0-9]*:', result.stdout)
     assert output.read_text() == 'existing output'
 
 
@@ -1510,9 +1511,6 @@ def test_native_modules_merge_and_deduplicate(bootstrap, tmp_path):
     ('pub def value() -> i32 { return ; }', 'import "dep.rl"', 'expected i32, got Void'),
     ('pub def value() -> i32 { return ); }', 'import "dep.rl"', 'expected expression'),
     ('/*', 'import "dep.rl"', 'unterminated block comment'),
-    ('def value() -> i32 { return 1; }', 'import "dep.rl"', 'require public functions'),
-    ('struct Hidden { pub var x: i32; }', 'import "dep.rl"', 'require public structs'),
-    ('pub struct Hidden { var x: i32; }', 'import "dep.rl"', 'require public fields'),
     ('pub def main() -> i32 { return 1; }', 'import "dep.rl"', 'imported main unsupported'),
     ('pub def value() -> i32 { return 1; }', 'import "dep.rl" as D', 'aliases unsupported'),
     ('', 'import "missing.rl"', 'cannot open import'),
@@ -1547,7 +1545,7 @@ def test_native_module_duplicate_exports(bootstrap, tmp_path):
         (tmp_path / f'{name}.rl').write_text('pub def value() -> i32 { return 1; }')
     test_errors_preserve_output(bootstrap, tmp_path,
         'import "a.rl"\nimport "b.rl"\ndef main() -> i32 { return value(); }',
-        'duplicate function')
+        'ambiguous imported function')
 
 
 def test_native_module_depth_limit(bootstrap, tmp_path):
@@ -1555,3 +1553,114 @@ def test_native_module_depth_limit(bootstrap, tmp_path):
         (tmp_path / f'dep{index}.rl').write_text(f'import "dep{index + 1}.rl"' if index < 129 else '')
     test_errors_preserve_output(bootstrap, tmp_path,
         'import "dep0.rl"\ndef main() -> i32 { return 0; }', 'module nesting limit exceeded')
+
+
+def test_native_module_private_names_and_types(bootstrap, tmp_path):
+    for name, value in (('a', 20), ('b', 22)):
+        (tmp_path / f'{name}.rl').write_text(f'''struct Cell {{ var n: i32;
+            static def new(n: i32) -> Cell {{ return Cell {{ n: n }}; }}
+            def read() -> i32 {{ return self.n; }}
+        }}
+        def helper() -> Cell {{ return Cell.new({value}); }}
+        def unpack(xs: Vec<Cell?>) -> i32 {{ if let cell = xs[0] {{ return cell.read(); }} return 0; }}
+        pub def {name}() -> i32 {{ let xs = Vec<Cell?>.new(); xs.push(helper()); return unpack(xs); }}''')
+    source = 'import "a.rl"\nimport "b.rl"\ndef main() -> i32 { return a() + b(); }'
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        assert execute_c(output, level).returncode == 42
+    # The LLVM reference rejects this valid collision case ("Cannot assign Cell
+    # to Cell"); validate native behavior against the explicit expected result.
+
+
+
+def test_native_module_public_types_and_shadowing(bootstrap, tmp_path):
+    (tmp_path / 'dep.rl').write_text('''pub struct Box { var n: i32;
+        pub static def new(n: i32) -> Box { return Box { n: n }; }
+        pub def read() -> i32 { return self.n; }
+    }
+    pub def value() -> i32 { return 99; }
+    pub def boxes() -> Dict<String, Vec<Box?>> { let d = Dict<String, Vec<Box?>>.with_capacity(1, 1);
+        let xs = Vec<Box?>.new(); xs.push(Box.new(42)); d.set("box", xs); return d; }
+    ''')
+    source = '''import "dep.rl"
+    def value() -> i32 { return 42; }
+    def main() -> i32 { let Box = Box.new(value());
+        if Box.read() != 42 { return 1; }
+        if let xs = boxes().get("box") { if let box = xs[0] { return box.read(); } }
+        return 2;
+    }'''
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, 42)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('return hidden();', 'unknown function'),
+    ('let x: Hidden = nil; return 0;', 'declared non-generic structs'),
+    ('let x = Hidden { n: 1 }; return 0;', 'unknown struct'),
+    ('return Box.secret();', 'private to its module'),
+    ('let x = Box.new(); return x.n;', 'private to its module'),
+    ('let x = Box.new(); x.n = 1; return 0;', 'private to its module'),
+    ('let x = Box { n: 1 }; return 0;', 'private to its module'),
+    ('let x = Box.new(); return x.read();', 'private to its module'),
+])
+def test_native_module_private_access(bootstrap, tmp_path, body, diagnostic):
+    (tmp_path / 'dep.rl').write_text('''def hidden() -> i32 { return 1; }
+    struct Hidden { var n: i32; }
+    pub struct Box { var n: i32;
+        pub static def new() -> Box { return Box { n: 42 }; }
+        static def secret() -> i32 { return 1; }
+        def read() -> i32 { return self.n; }
+    }''')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "dep.rl"\ndef main() -> i32 {' + body + '}', diagnostic)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('return leaf();', 'unknown function'),
+    ('let x = Leaf.new(); return 0;', 'unknown variable'),
+    ('let x: Vec<Leaf> = Vec<Leaf>.new(); return 0;', 'declared non-generic structs'),
+])
+def test_native_module_no_transitive_exports(bootstrap, tmp_path, body, diagnostic):
+    (tmp_path / 'leaf.rl').write_text('''pub def leaf() -> i32 { return 42; }
+    pub struct Leaf { pub static def new() -> Leaf { return Leaf {}; } }''')
+    (tmp_path / 'bridge.rl').write_text('import "leaf.rl"\npub def bridge() -> i32 { return leaf(); }')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "bridge.rl"\ndef main() -> i32 {' + body + '}', diagnostic)
+
+
+@pytest.mark.parametrize('body, diagnostic', [
+    ('let x: Item = Item {}; return 0;', 'ambiguous imported type'),
+    ('return Item.number();', 'ambiguous imported type'),
+])
+def test_native_module_ambiguous_types(bootstrap, tmp_path, body, diagnostic):
+    for name in ('a', 'b'):
+        (tmp_path / f'{name}.rl').write_text('pub struct Item { pub static def number() -> i32 { return 42; } }')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "a.rl"\nimport "b.rl"\ndef main() -> i32 {' + body + '}', diagnostic)
+
+
+def test_native_module_local_shadows_ambiguous_type(bootstrap, tmp_path):
+    for name in ('a', 'b'):
+        (tmp_path / f'{name}.rl').write_text('pub struct Item { pub static def number() -> i32 { return 99; } }')
+    source = '''import "a.rl"
+    import "b.rl"
+    struct Local { def number() -> i32 { return 42; } }
+    def main() -> i32 { let Item = Local {}; return Item.number(); }'''
+    result, _, output = emit(bootstrap, tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert execute_c(output, 3).returncode == 42
+
+
+def test_native_module_reexports_explicitly_rejected(bootstrap, tmp_path):
+    (tmp_path / 'dep.rl').write_text('pub def answer() -> i32 { return 42; }')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'pub import "dep.rl"\ndef main() -> i32 { return 0; }', 'public re-exports unsupported')
+
+
+def test_native_module_distinct_type_identity(bootstrap, tmp_path):
+    (tmp_path / 'a.rl').write_text('''pub struct Item { pub var n: i32; }
+    pub def accept(x: Item) -> i32 { return x.n; }''')
+    (tmp_path / 'b.rl').write_text('''pub struct Item { pub var n: i32; }
+    pub def create() -> Item { return Item { n: 42 }; }''')
+    test_errors_preserve_output(bootstrap, tmp_path,
+        'import "a.rl"\nimport "b.rl"\ndef main() -> i32 { return accept(create()); }', 'expected')

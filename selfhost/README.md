@@ -30,14 +30,18 @@ dependencies, symlink aliases, and cycles are loaded once. Diagnostics carry the
 originating file and position. Compilation refuses to overwrite any loaded source;
 `--parse` remains a single-file syntax operation and does not read imports.
 
-The initial module subset requires public functions, methods, structs, and fields
-throughout a multi-file program, except its root `main`. Exports must have globally
-unique names; they are visible throughout the loaded graph. Private declarations,
-import aliases, escaped import paths, and imported entrypoints are rejected.
-Module-local namespaces and exact import visibility remain future work. Standard
-library free-function calls require their import in the calling file. Import depth
-is limited to 128. Output path protection uses canonical paths, not hard-link
-identity.
+Declarations have module-scoped identities: separate files can define the same
+private functions or structs, and public functions can use private implementation
+types. Unaliased imports expose only the directly imported module's public names.
+Local declarations take precedence; conflicting public imports are diagnosed when
+used. Standard library free-function calls also require their import in the calling
+file. Fields and methods without `pub` are accessible only within their source file.
+Type resolution preserves identity through nested vectors, dictionaries, optionals,
+parameters, return values, field types, constructors, and static receivers.
+
+Import aliases, public re-exports, escaped import paths, and imported entrypoints
+remain unsupported and are rejected. Import depth is limited to 128. Output path
+protection uses canonical paths, not hard-link identity.
 
 ## Build and run
 
@@ -123,7 +127,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-Local imports support the public-export subset above; type aliases are not lowered yet. String fields,
+Local imports support the module subset above; type aliases are not lowered yet. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -426,14 +430,13 @@ environment APIs, stdin, directory listing, and import aliases are not lowered y
 
 On Apple Silicon macOS, this milestone passed:
 
-- The **578-case bootstrap suite** completed in 689.26 seconds with 577 passes
-  and one depth-limit diagnostic failure in an O0 fixture built before its fix.
-  A fresh **10-check targeted run passed** in 71.86 seconds, including that case,
-  missing-entrypoint diagnostics, and direct rebuilds launched outside the repo.
-- **38 focused checks passed** in 73.15 seconds with the bootstrap runtime
-  instrumented using AddressSanitizer and payload checks. These cover module
-  loading, cycles, deduplication, depth limits, source diagnostics, compiler-core
-  compilation, and executable rebuilding.
+- **212 regression checks passed** in 372.45 seconds across O0/O3 bootstrap
+  builds, covering existing struct behavior, diagnostics, parsing the compiler's
+  own sources, and native frontend/core compilation.
+- **64 focused checks passed** in 89.32 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. These cover module-local
+  identities, direct-import visibility, private member rejection, ambiguity,
+  shadowing, nested type resolution, loader protections, and native self-rebuilds.
 - Rebuild tests compile the actual CLI through three C generations with identical
   C output and no Python/tools on the rebuilding executable's PATH. Stage 2 is
   compiled with AddressSanitizer and UndefinedBehaviorSanitizer and emits stage 3.
@@ -455,3 +458,10 @@ across every optimization level.
 The OS bridge tests also found and fixed primary-runtime truncation of file reads
 and printed strings at embedded NULs. Both now preserve explicit byte lengths;
 NUL-containing filenames are rejected before opening or truncating a file.
+
+The namespace tests also expose an unresolved limitation in the Python/LLVM
+compiler: two imported modules with private structs named `Cell` can produce
+`Cannot assign Cell to Cell`. The native compiler checks that collision case
+against an explicit expected result at C O0/O3; other module/type cases retain
+differential checks against LLVM. Import aliases and public re-exports remain
+next steps for native module coverage.
