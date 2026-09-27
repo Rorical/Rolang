@@ -131,34 +131,11 @@ def analyze_uses(
     # Traverse all blocks
     for block_id, block in func.blocks.items():
         for op_index, op in enumerate(block.ops):
-            # Check for definitions
-            if isinstance(op, Assign):
-                if not op.place.projections:
-                    record_def(op.place.base, block_id, op_index)
-                check_operand(op.value, block_id, op_index)
-            elif isinstance(op, CallStatic):
-                if op.result is not None:
-                    record_def(op.result, block_id, op_index)
-                for arg in op.args:
-                    check_operand(arg, block_id, op_index)
-            elif isinstance(op, (Retain, Release)):
-                check_operand(op.operand, block_id, op_index)
-            elif isinstance(op, Load):
-                record_def(op.result, block_id, op_index)
-            elif isinstance(op, Store):
-                check_operand(op.value, block_id, op_index)
-            elif isinstance(op, ExtractField):
-                check_operand(op.aggregate, block_id, op_index)
-                record_def(op.result, block_id, op_index)
-            elif isinstance(op, ExtractEnumPayload):
-                check_operand(op.enum_val, block_id, op_index)
-                record_def(op.result, block_id, op_index)
-            elif isinstance(op, ExistentialCheckType):
-                check_operand(op.existential, block_id, op_index)
-                record_def(op.result, block_id, op_index)
-            elif isinstance(op, ExistentialUnbox):
-                check_operand(op.existential, block_id, op_index)
-                record_def(op.result, block_id, op_index)
+            for local in ArcOptimizer._uses_in_op(op):
+                record_use(local, block_id, op_index)
+            defined = ArcOptimizer._def_in_op(op)
+            if defined is not None:
+                record_def(defined, block_id, op_index)
 
         # Check terminator
         if block.terminator:
@@ -236,12 +213,13 @@ class ArcOptimizer:
         if not ref_locals:
             return func
 
-        # Analyze uses
-        use_info = analyze_uses(func, ref_locals)
-
-        # Apply optimizations in order
+        # Operation indices change when a pass removes ARC pairs. Recompute
+        # use locations before the next pass consults them; stale indices can
+        # mistake a stored reference for a borrowed call argument.
         func = self._eliminate_adjacent_pairs(func, ref_locals)
+        use_info = analyze_uses(func, ref_locals)
         func = self._eliminate_borrowed_single_use(func, ref_locals, use_info)
+        use_info = analyze_uses(func, ref_locals)
         func = self._move_releases_to_last_use(func, ref_locals, use_info)
 
         # Count final ARC ops
@@ -404,7 +382,19 @@ class ArcOptimizer:
             if use.op_index < 0 or use.op_index >= len(block.ops):
                 continue
             op = block.ops[use.op_index]
-            if not isinstance(op, (CallStatic, CallVTable, CallClosure)):
+            # Arbitrary calls may replace the owner's field (including via
+            # another argument), destroying the borrowed object mid-call.
+            # Only these non-allocating runtime reads have a known safe contract.
+            if not isinstance(op, CallStatic) or op.func_name not in {
+                "rt_string_len", "rt_string_char_at", "rt_gvec_len",
+            }:
+                continue
+            definition_block = func.blocks.get(info.definition_block)
+            if definition_block is None or info.definition_op_index < 0:
+                continue
+            definition = definition_block.ops[info.definition_op_index]
+            if not isinstance(definition, (ExtractField, ExtractEnumPayload,
+                                           ExtractClosureCapture, ExistentialUnbox, Load)):
                 continue
             if getattr(op, 'result', None) == local_id:
                 continue
@@ -729,8 +719,7 @@ class ArcOptimizer:
 
         def add(operand: Operand) -> None:
             if isinstance(operand, (CopyOperand, MoveOperand)):
-                if not operand.place.projections:
-                    out.append(operand.place.base)
+                out.append(operand.place.base)
 
         if isinstance(op, Assign):
             add(op.value)
