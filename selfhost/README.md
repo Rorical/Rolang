@@ -1,4 +1,4 @@
-# Rolang-written bootstrap compiler — optional value code generation milestone
+# Rolang-written bootstrap compiler — dictionary code generation milestone
 
 This directory starts the compiler rewrite in Rolang. The frontend is native
 Rolang code: it reads source, lexes, parses, resolves names, checks types, and
@@ -8,10 +8,16 @@ or llvmlite.
 **This is not full self-hosting yet.** The existing Python compiler builds this
 compiler. Its frontend parses every `.rl` file in this directory and exposes the
 syntax tree as JSON. Its C backend cannot yet compile those files: generic
-specialization, imports, dictionaries, and some standard-library
-calls remain to be implemented. Non-generic structs, methods, core strings, and
-typed vectors and optional values now emit C. Here, “stage 0”
+specialization, imports, and some standard-library calls remain to be
+implemented. Non-generic structs, methods, core strings, typed vectors,
+dictionaries, and optional values now emit C. Here, “stage 0”
 names this initial subset compiler, not a successfully self-rebuilt compiler.
+
+The native backend can now compile the actual lexer, AST, and parser sources
+when assembled into one file with import declarations removed. That generated
+frontend parses its own source and matches the Python-built bootstrap's flat AST
+node counts; it also rejects malformed input. This checks native frontend code
+generation, while full compiler rebuilding still requires the dependencies above.
 
 ## Build and run
 
@@ -47,7 +53,7 @@ that resolve to the same path are rejected, including symlink aliases.
 | Expressions | Decimal i32 integers, Boolean/string literals, variables, calls, numeric casts, parentheses |
 | Operators | Unary `+ - !`; `* / % + -`; `< <= > >= == !=`; `&& ||` |
 | Objects | Non-generic structs, fields, labeled literals, static and instance methods, shared references |
-| Collections | Typed `Vec<T>`, nested vectors, indexed access/assignment, constructors and core methods |
+| Collections | Typed `Vec<T>` and `Dict<K,V>`, nested collections, indexed access/assignment, constructors and core methods |
 | Source | ASCII identifiers, whitespace, `//` and non-nested `/* */` comments; explicit statement semicolons |
 
 Function arguments are immutable. Conditions require Bool. Arguments, assignments,
@@ -82,7 +88,7 @@ structs without comparison support.
 Every stored field must be explicitly initialized exactly once. Field and method
 names, initializer types, receivers, call arity, and argument/return types are
 checked. Generic structs, default field values, and lifecycle hooks are rejected.
-Dictionaries, imports, and type aliases are not lowered yet. String fields,
+Imports and type aliases are not lowered yet. String fields,
 parameters, and return values use the built-in string representation.
 
 The standalone generated C tracks allocations in a program-wide arena and frees
@@ -130,7 +136,7 @@ and additional collection operations remain future work.
 ## Vectors and iteration
 
 `Vec<T>` is now a built-in typed collection in the C backend. Its element type can
-be `i32`, `i64`, `Bool`, `String`, a declared non-generic struct, or another vector.
+be any supported value type, including optional values and nested collections.
 Vector types are invariant: `Vec<i32>` and `Vec<i64>` are distinct types. Individual
 `i32` values can still widen when inserted into `Vec<i64>`.
 
@@ -259,8 +265,10 @@ Next steps toward actual self-compilation:
 1. **Done:** expand the frontend to parse its own source, verified against the
    existing frontend.
 2. **In progress:** non-generic structs/methods, core strings, signed widths,
-   typed vectors, and optional values now have C lowering. Add dictionaries,
-   imports, enums, and general generic specialization.
+   typed vectors, dictionaries, and optional values now have C lowering. Add
+   module loading, StringBuilder, byte casts, and filesystem/process/I/O support
+   needed by the compiler itself. Enums and general generic specialization
+   remain part of broader language coverage.
 3. Implement managed-object layouts, ownership lowering, and runtime linkage.
 4. Make this compiler compile its own source; rebuild again with that executable.
 5. Compare bootstrap generations and run the broader language regression suite.
@@ -289,21 +297,57 @@ The Python reference compiler currently fails LLVM code generation for
 The native C implementation is tested directly at O0/O3 and with sanitizers
 for this case; other optional programs are compared against the reference.
 
+## Dictionaries
+
+`Dict<K,V>` uses an insertion-ordered entry array with a linear-probe hash index.
+Keys can be supported numeric, Boolean, or reference types; optional keys are
+rejected. Values can be any supported type, including nested dictionaries,
+vectors, structs, and optionals. Dictionary types are invariant.
+
+Supported operations:
+
+- `with_capacity(capacity, key_kind)` and `new(capacity, key_kind, key_type_id, value_type_id)`.
+  As in the standard library, `new` evaluates its type-id arguments but derives
+  storage from its generic types.
+- `set`, `get`, indexed reads/writes, `contains`, and `len`.
+- `remove` and `clear`; removal preserves insertion order.
+- `keys` and `values`, returning independent ordered vector snapshots with shared
+  object references.
+- `entry_index`, `value_at`, and `set_value_at` for hash-free access by entry index.
+  Invalid indices read a zero slot or ignore a write, matching the current library.
+
+Key kind `1` compares String bytes by content, including UTF-8 and embedded NULs.
+Other kinds use scalar equality or reference identity. Passing kind `1` with a
+non-String key or a negative capacity exits with a runtime diagnostic.
+The native backend limits entry counts to `INT32_MAX` and checks allocation sizes.
+
+`get`, indexed reads, and `remove` return `V?`. A stored optional `nil` is still
+present: unwrapping the outer optional succeeds, then the inner optional is nil.
+`selfhost/examples/symbols.rl` demonstrates nested `Vec<Dict<String, Binding>>`
+scopes, shadowing, shared bindings, and missing-name lookup; it exits with 42.
+
+Entries and resized buffers follow the process-lifetime arena described above.
+`entries()` (which needs generic `DictEntry` objects), explicit `free`, raw handles,
+and dictionary iteration remain unsupported. The reference LLVM compiler's
+optional-collection limitation also affects optional-valued dictionaries; native
+execution tests cover those directly.
+
 ## Validation
 
-On Apple Silicon macOS, validation covered 398 bootstrap cases:
+On Apple Silicon macOS, this milestone passed:
 
-- The broad run completed **393 passing checks** in 445.82 seconds, with one
-  diagnostic-wording failure from an O0 compiler built before its correction.
-- After that correction, **66 checks passed** in 41.67 seconds: all struct
-  diagnostics at O0/O3 (including the failed case), plus four new optional
-  comparison checks. Together these runs cover all 398 current cases.
-- **28 focused optional checks passed** in 96.82 seconds with the bootstrap
-  runtime instrumented using AddressSanitizer and payload checks. Generated C
-  also runs with AddressSanitizer and UndefinedBehaviorSanitizer.
+- **452 bootstrap checks** in 516.94 seconds: O0/O3 bootstrap builds, frontend
+  syntax parity, differential execution, diagnostics, and generated-C sanitizers.
+- **2 additional native-frontend rebuild checks** in 44.18 seconds, added after
+  the broad run started. Both bootstrap optimization levels compile the actual
+  lexer/AST/parser sources; generated C at O0/O3 parses those same sources and
+  matches all four flat AST node counts. Malformed input is also checked.
+  Together these runs cover all **454 current cases**.
+- **86 dictionary/optional checks** in 192.22 seconds with the bootstrap runtime
+  instrumented using AddressSanitizer and payload checks. Generated dictionary C
+  also runs with AddressSanitizer and UndefinedBehaviorSanitizer, including
+  growth/removal, snapshots, nested collections, optional payloads, and errors.
   `detect_leaks=0` means these checks do not validate leaks.
-- The binding-lookup example independently matched the Python reference and
-  generated C at O0/O3, returning 42.
 
 See the test command above to reproduce the standard suite.
 

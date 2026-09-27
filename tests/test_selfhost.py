@@ -986,3 +986,216 @@ def test_optional_comparison_rejected(bootstrap, tmp_path, body):
     test_optional_errors_preserve_output(
         bootstrap, tmp_path, 'def main() -> i32 {' + body + '}',
         'optional comparison unsupported')
+
+
+DICT_PROGRAMS = [
+    ('''def main() -> i32 {
+        let d = Dict<String, i32>.with_capacity(1, 1);
+        d.set("zero", 0); d["answer"] = 42;
+        if d.len() != 2 || !d.contains("zero") || d.contains("missing") { return 1; }
+        if let n = d["zero"] { if n != 0 { return 2; } } else { return 3; }
+        if let n = d.get("missing") { return 4; }
+        if let n = d.get("answer") { return n; } return 5;
+    }''', 42),
+    ('''def main() -> i32 {
+        let d = Dict<i32, i64>.with_capacity(0, 0); var i = 0;
+        while i < 1000 { d.set(i - 500, i); i = i + 1; }
+        i = 0;
+        while i < 1000 {
+            if let n = d.get(i - 500) { if n != i { return 1; } } else { return 2; }
+            i = i + 1;
+        }
+        d.set(-500, 42); if d.len() != 1000 { return 3; }
+        i = 0;
+        while i < 1000 { if i % 3 == 0 { d.remove(i - 500); } i = i + 1; }
+        i = 0;
+        while i < 1000 {
+            if d.contains(i - 500) != (i % 3 != 0) { return 4; }
+            i = i + 1;
+        }
+        let keys = d.keys(); if keys[0] != -499 || keys[1] != -498 { return 5; }
+        if d.len() != 666 { return 6; }
+        d.clear(); if d.len() != 0 || d.contains(1) { return 7; }
+        d.set(7, 42); if let n = d.remove(7) { return n as i32; } return 8;
+    }''', 42),
+    ('''def main() -> i32 {
+        let d = Dict<String, String>.with_capacity(4, 1);
+        d.set("λ\\0中", "value"); d.set("λ", "prefix");
+        let same = "λ" + "\\0中";
+        if let text = d.get(same) { if !text.equals("value") { return 1; } } else { return 2; }
+        d.set(same, "updated");
+        if d.len() != 2 { return 3; }
+        let keys = d.keys(); let values = d.values();
+        d.remove("λ\\0中"); d.set("new", "last");
+        if !keys[0].equals("λ\\0中") || !values[0].equals("updated") { return 4; }
+        if !d.keys()[0].equals("λ") || !d.keys()[1].equals("new") { return 5; }
+        if let removed = d.remove("absent") { return 6; }
+        return 42;
+    }''', 42),
+    ('''struct Binding { var number: i32; }
+    def lookup(scopes: Vec<Dict<String, Binding>>, name: String) -> Binding? {
+        var i = scopes.len() - 1;
+        while i >= 0 { if let binding = scopes[i].get(name) { return binding; } i = i - 1; }
+        return nil;
+    }
+    def main() -> i32 {
+        let scopes = Vec<Dict<String, Binding>>.new();
+        let outer = Dict<String, Binding>.with_capacity(8, 1);
+        let inner = Dict<String, Binding>.with_capacity(8, 1);
+        outer.set("x", Binding { number: 5 }); inner.set("x", Binding { number: 20 });
+        scopes.push(outer); scopes.push(inner);
+        if let binding = lookup(scopes, "x") { binding.number = 42; } else { return 1; }
+        let snapshot = inner.values(); inner.clear();
+        if snapshot[0].number != 42 { return 2; }
+        if let binding = lookup(scopes, "x") { if binding.number != 5 { return 3; } } else { return 4; }
+        if let binding = lookup(scopes, "missing") { return 5; }
+        return snapshot[0].number;
+    }''', 42),
+    ('''def main() -> i32 {
+        let d = Dict<i64, Bool>.new(2, 0, 0, 0);
+        let wide: i64 = 2147483647; let key = wide + 100;
+        d.set(key, false); d.set(-key, true);
+        if let flag = d.get(key) { if flag { return 1; } } else { return 2; }
+        if let flag = d.get(-key) { if !flag { return 3; } } else { return 4; }
+        let flags = Dict<Bool, i32>.with_capacity(1, 0);
+        flags.set(false, 17); flags.set(true, 25);
+        if let a = flags.get(false) { if let b = flags.get(true) { return a + b; } }
+        return 5;
+    }''', 42),
+    ('''def main() -> i32 {
+        let d = Dict<String, i32>.with_capacity(0, 1);
+        let first = d.entry_index("a", 1); let again = d.entry_index("a", 99);
+        if first != again || d.value_at(first) != 1 { return 1; }
+        let second = d.entry_index("b", 20); d.set_value_at(first, 22);
+        if d.value_at(-1) != 0 || d.value_at(100) != 0 { return 2; }
+        d.set_value_at(-1, 7); d.set_value_at(100, 7);
+        return d.value_at(first) + d.value_at(second);
+    }''', 42),
+    ('''struct Key { var n: i32; }
+    def main() -> i32 {
+        let d = Dict<Key, i32>.with_capacity(2, 0);
+        let key = Key { n: 1 }; let alias = key; let other = Key { n: 1 };
+        d.set(key, 42); key.n = 2;
+        if d.contains(other) { return 1; }
+        if let n = d.get(alias) { return n; } return 2;
+    }''', 42),
+    ('''struct State { var n: i32; var dict: Dict<i32, i32>; }
+    def receiver(s: State) -> Dict<i32, i32> { s.n = s.n * 10 + 1; return s.dict; }
+    def key(s: State) -> i32 { s.n = s.n * 10 + 2; return 7; }
+    def value(s: State) -> i32 { s.n = s.n * 10 + 3; return 42; }
+    def main() -> i32 {
+        let s = State { n: 0, dict: Dict<i32, i32>.with_capacity(2, 0) };
+        s.dict[key(s)] = value(s);
+        if s.n != 23 { return 1; }
+        s.n = 0; receiver(s).set(key(s), value(s));
+        if s.n != 123 { return 2; }
+        if let n = s.dict[7] { return n; } return 3;
+    }''', 42),
+    ('''def main() -> i32 {
+        let outer = Dict<String, Dict<String, Vec<i32>>>.with_capacity(2, 1);
+        let inner = Dict<String, Vec<i32>>.with_capacity(2, 1);
+        let values = Vec<i32>.new(); values.push(42);
+        inner.set("values", values); outer.set("scope", inner);
+        if let scope = outer.get("scope") { if let list = scope["values"] { return list[0]; } }
+        return 1;
+    }''', 42),
+]
+
+
+@pytest.mark.parametrize('source, expected', DICT_PROGRAMS)
+def test_dict_matches_reference(bootstrap, tmp_path, source, expected):
+    test_bootstrap_matches_reference(bootstrap, tmp_path, source, expected)
+
+
+DICT_OPTIONAL_SOURCE = '''def main() -> i32 {
+    let d = Dict<String, i32?>.with_capacity(1, 1);
+    d.set("nil", nil); d.set("zero", 0); d.set("answer", 42);
+    if let outer = d.get("absent") { return 1; }
+    if let outer = d.get("nil") { if let inner = outer { return 2; } } else { return 3; }
+    if let outer = d.get("zero") { if let inner = outer { if inner != 0 { return 4; } } else { return 5; } } else { return 6; }
+    if let outer = d.remove("nil") { if let inner = outer { return 7; } } else { return 8; }
+    let snapshot = d.values(); d.clear();
+    if let n = snapshot[1] { return n; } return 9;
+}'''
+
+
+def test_dict_optional_values(bootstrap, tmp_path):
+    # The reference compiler cannot currently lower optional-valued collections.
+    result, _, output = emit(bootstrap, tmp_path, DICT_OPTIONAL_SOURCE)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level)
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
+
+
+@pytest.mark.parametrize('source, diagnostic', [
+    ('let d = Dict<String, i32>.with_capacity(1, 1); d.set(1, 2);', 'expected String'),
+    ('let d = Dict<String, i32>.with_capacity(1, 1); d["a"] = true;', 'expected i32'),
+    ('let d = Dict<i32, i32>.with_capacity(1, 0); d.get("x");', 'expected i32'),
+    ('let d = Dict<i32, i32>.with_capacity(1);', 'wrong argument count'),
+    ('let d = Dict<i32, i32>.new();', 'wrong argument count'),
+    ('let d = Dict<i32, i32>.with_capacity(1, 0); d.remove();', 'wrong argument count'),
+    ('let d = Dict<i32, i32>.with_capacity(1, 0); d.set_value_at(0, false);', 'expected i32'),
+    ('let d = Dict<i32, i32>.with_capacity(1, 0); d.unknown();', 'Dict method unsupported'),
+    ('let d = Dict<i32?, i32>.with_capacity(1, 0);', 'optional dictionary keys unsupported'),
+    ('let d = Dict<i32>.with_capacity(1, 0);', 'supports only'),
+    ('let d = Dict<i32, i32, i32>.with_capacity(1, 0);', 'supports only'),
+    ('let d = Dict<i32, Void>.with_capacity(1, 0);', 'supports only'),
+    ('let d = Dict<i32, i32>.with_capacity(1, 0); let x = d == d;', 'cannot compare struct values'),
+])
+def test_dict_errors_preserve_output(bootstrap, tmp_path, source, diagnostic):
+    test_optional_errors_preserve_output(
+        bootstrap, tmp_path, 'def main() -> i32 {' + source + ' return 0; }', diagnostic)
+
+
+def test_dict_generated_c_sanitizers(bootstrap, tmp_path):
+    for source, expected in DICT_PROGRAMS + [(DICT_OPTIONAL_SOURCE, 42)]:
+        result, _, output = emit(bootstrap, tmp_path, source)
+        assert result.returncode == 0, result.stdout
+        run = execute_c(output, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+        assert (run.returncode, run.stdout, run.stderr) == (expected, '', '')
+
+
+@pytest.mark.parametrize('capacity, key_kind, diagnostic', [
+    (-1, 0, 'negative Dict capacity\n'),
+    (1, 1, 'Dict string key kind requires String keys\n'),
+])
+def test_dict_constructor_runtime_errors(bootstrap, tmp_path, capacity, key_kind, diagnostic):
+    result, _, output = emit(bootstrap, tmp_path,
+        f'def main() -> i32 {{ let d = Dict<i32, i32>.with_capacity({capacity}, {key_kind}); return 0; }}')
+    assert result.returncode == 0, result.stdout
+    run = execute_c(output, 1, ('-fsanitize=address,undefined', '-fno-sanitize-recover=all'))
+    assert (run.returncode, run.stdout, run.stderr) == (1, '', diagnostic)
+
+
+def test_native_backend_compiles_its_frontend(bootstrap, tmp_path):
+    # Until module loading exists, assemble the actual frontend source files.
+    # No source implementation is substituted: only import declarations are removed.
+    source = '\n'.join('\n'.join(
+        line for line in (ROOT / 'selfhost' / name).read_text().splitlines()
+        if not line.startswith('import ')) for name in ('lexer.rl', 'ast.rl', 'parser.rl'))
+    input_path = tmp_path / 'frontend.rl'
+    input_path.write_text(source)
+    reference = parse_native(bootstrap, input_path)
+    assert reference.returncode == 0, reference.stdout
+    tree = json.loads(reference.stdout)
+    counts = {key: len(tree[key]) for key in ('functions', 'declarations', 'expressions', 'statements')}
+    driver = f'''def main() -> i32 {{
+        let scanned = lex({json.dumps(source, ensure_ascii=False)});
+        if !scanned.error.is_empty() {{ return 1; }}
+        let parser = Parser.new(scanned.tokens); parser.parse();
+        if !parser.error.is_empty() {{ return 2; }}
+        if parser.program.functions.len() != {counts['functions']} {{ return 3; }}
+        if parser.program.declarations.len() != {counts['declarations']} {{ return 4; }}
+        if parser.program.expressions.len() != {counts['expressions']} {{ return 5; }}
+        if parser.program.statements.len() != {counts['statements']} {{ return 6; }}
+        let bad = Parser.new(lex("def main( {{").tokens); bad.parse();
+        if bad.error.is_empty() {{ return 7; }}
+        if lex("/* unclosed").error.is_empty() {{ return 8; }}
+        return 42;
+    }}'''
+    result, _, output = emit(bootstrap, tmp_path, source + '\n' + driver)
+    assert result.returncode == 0, result.stdout
+    for level in (0, 3):
+        run = execute_c(output, level)
+        assert (run.returncode, run.stdout, run.stderr) == (42, '', '')
